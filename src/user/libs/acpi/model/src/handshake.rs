@@ -38,12 +38,14 @@ pub const PCI_CONTROL: u32 = osc::HOT_PLUG | osc::PME | osc::AER | osc::CAPABILI
 /// `_PPC` `_OST`, `_PR3` (power resources), hot-plug `_OST`, CPPC, CPPC v2, platform-coordinated `_LPI`.
 pub const PLATFORM_SUPPORT: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7);
 
-/// THE PROCESSOR FORMS: C1 as a halt, SMP C1 and C2/C3 power-down, software coordination of C states, C1 and C2/C3
-/// through MWAIT hints, hardware coordination of P states, and `_PPC` notification. NOT the P-state and T-state
-/// fixed-hardware forms - those are model-specific registers, which the kernel does not execute - and NOT software
-/// coordination of P and T states: the kernel decides each core's level alone, and refuses a `_PSD` domain of several
-/// processors that software would have to coordinate. Offering it asked the firmware for exactly such a domain.
-pub const PROCESSOR_SUPPORT: u32 = 0x0002 | 0x0008 | 0x0010 | 0x0040 | 0x0100 | 0x0200 | 0x0800 | 0x1000;
+/// THE PROCESSOR FORMS: C1 as a halt, SMP C1 and C2/C3 power-down, C1 and C2/C3 through MWAIT hints, and hardware
+/// coordination of P states. NOT the P-state and T-state fixed-hardware forms - those are model-specific registers,
+/// which the kernel does not execute - and NOT software coordination of P, C or T states: the kernel decides each
+/// core's level and idle state alone, reads no `_CSD`, and refuses a `_PSD` domain of several processors that software
+/// would have to coordinate. Offering it asked the firmware for exactly such a domain. And NOT collaborative processor
+/// performance control (bit 12), which is how firmware is asked for the hardware-managed form whose `_CPC` registers
+/// are model-specific: CPPC is negotiated by the platform-wide `_OSC` above, and executed through registers in memory.
+pub const PROCESSOR_SUPPORT: u32 = 0x0002 | 0x0008 | 0x0010 | 0x0100 | 0x0200 | 0x0800;
 
 /// The dwords a host bridge's `_OSC` is called with: status, support, control.
 pub fn pci_request() -> [u32; 3] {

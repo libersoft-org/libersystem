@@ -2710,15 +2710,13 @@ impl<'a> KernelTransport<'a> {
 	}
 
 	/// A capability a later request hands over, under the number to pass the client for it.
-	#[allow(dead_code, reason = "used by the oracles whose requests carry a capability, compiled only when their gadget is")]
-	fn offer(&mut self, object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> u64 {
+	pub(super) fn offer(&mut self, object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> u64 {
 		let number = 0x1000 + self.offered.len() as u64;
 		self.offered.push((number, object, rights));
 		number
 	}
 
-	#[allow(dead_code, reason = "used by the oracles whose contracts hand streams over, compiled only when their gadget is")]
-	fn take(&mut self, handle: u64) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
+	pub(super) fn take(&mut self, handle: u64) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
 		let at = self.received.iter().position(|(number, _)| *number == handle)?;
 		Some(self.received.remove(at).1)
 	}
@@ -5307,7 +5305,7 @@ const GPIO_QUIET: u64 = 30;
 #[cfg(not(target_arch = "x86_64"))]
 const GPIO_QUIET: u64 = 30 * 13;
 
-tagged_test!(virtio_crypto_serves_aes_through_sessions_that_stay_with_their_connection, [Drivers, Pci], id = "kernel.hardware.virtio_crypto_serves_aes_through_sessions_that_stay_with_their_connection", covers = ["kernel", "bin.virtio_crypto", "crypto-device-proto"]);
+tagged_test!(virtio_crypto_serves_aes_through_sessions_that_stay_with_their_connection, [Drivers, Pci, ArchX86_64], id = "kernel.hardware.virtio_crypto_serves_aes_through_sessions_that_stay_with_their_connection", covers = ["kernel", "bin.virtio_crypto", "crypto-device-proto"]);
 // THE HOST'S CIPHER ENGINE, THROUGH THE DRIVER AND ITS CONTRACT. QEMU's `cryptodev-backend-builtin` does AES in the
 // host process; the driver serves it as `crypto-device`, and this drives that contract through the generated client.
 //
@@ -5318,6 +5316,13 @@ tagged_test!(virtio_crypto_serves_aes_through_sessions_that_stay_with_their_conn
 // device, which is proved by opening more than the backend's 256 sessions in all and never being refused.
 fn virtio_crypto_serves_aes_through_sessions_that_stay_with_their_connection() {
 	use crypto_device_proto::generated::liber::crypto_device::v1::{Cipher, Direction, Error, crypto_device::Client};
+
+	// THE ENGINE IS THE x86_64 TEST MACHINE'S ALONE: the other two attach no `virtio-crypto-pci`, so there is nothing
+	// there to bind, and the run says so rather than failing on a device it was never given.
+	if !cfg!(target_arch = "x86_64") {
+		crate::serial_println!("virtio-crypto: NOT RUN - only the x86_64 test machine carries a virtio-crypto engine");
+		return;
+	}
 
 	fn hex(text: &str) -> alloc::vec::Vec<u8> {
 		(0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hex")).collect()
@@ -5727,8 +5732,13 @@ fn nvdimm_serves_persistent_memory_as_blocks_and_a_module_that_will_not_save_rea
 //
 // THE KERNEL'S HALF, through the syscalls its driver uses, on the test machine's `virtio-balloon-pci` - which asks for
 // nothing here, so the driver's half is the balloon gate's, where a host asks.
-tagged_test!(a_balloon_is_minted_for_the_balloon_device_alone_and_gives_everything_back_with_its_handle, [Drivers, Memory, Pci], id = "kernel.hardware.a_balloon_is_minted_for_the_balloon_device_alone_and_gives_everything_back_with_its_handle", covers = ["kernel"]);
+tagged_test!(a_balloon_is_minted_for_the_balloon_device_alone_and_gives_everything_back_with_its_handle, [Drivers, Memory, Pci, ArchX86_64], id = "kernel.hardware.a_balloon_is_minted_for_the_balloon_device_alone_and_gives_everything_back_with_its_handle", covers = ["kernel"]);
 fn a_balloon_is_minted_for_the_balloon_device_alone_and_gives_everything_back_with_its_handle() {
+	// THE BALLOON IS THE x86_64 TEST MACHINE'S ALONE, as the engine above is.
+	if !cfg!(target_arch = "x86_64") {
+		crate::serial_println!("balloon: NOT RUN - only the x86_64 test machine carries a virtio-balloon device");
+		return;
+	}
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
 	extern "C" fn body(_: u64) {

@@ -134,7 +134,7 @@ impl text_pipeline::Faces for Installed<'_> {
 }
 
 /// Shape one case the way the host gate does: the buffer from the `cmap` and from nothing else, then
-/// the shaper, in the default language.
+/// the shaper, in the default language and in the direction the case's one run reads.
 pub fn shape(installed: &Installed<'_>, case: &Case<'_>) -> Result<Buffer, String> {
 	let face = &installed.face;
 	let characters: Vec<char> = case.text.chars().collect();
@@ -146,7 +146,8 @@ pub fn shape(installed: &Installed<'_>, case: &Case<'_>) -> Result<Buffer, Strin
 		buffer.positions.push(font_shape::Position::default());
 		at += character.len_utf8() as u32;
 	}
-	font_shape::shape_run(face, &mut buffer, &characters, *b"dflt").map_err(|error| format!("shaping refused the run: {error:?}"))?;
+	let right_to_left = paragraph_level(case.text)? % 2 == 1;
+	font_shape::shape_run(face, &mut buffer, &characters, *b"dflt", right_to_left).map_err(|error| format!("shaping refused the run: {error:?}"))?;
 	Ok(buffer)
 }
 
@@ -286,7 +287,16 @@ pub fn draw_case(installed: &Installed<'_>, case: &Case<'_>, buffer: &Buffer, si
 /// right-to-left one, drawn with the mark before its base, it is not, and a reversal that kept the
 /// authored offset would draw the mark a whole base away from its anchor. This is computed from the
 /// authored expectations alone, so it judges `font-run`'s correction rather than repeating it.
+///
+/// A MARK ON A MARK IS DRAWN FROM WHERE ITS PARENT IS DRAWN. Its authored offset carries its parent's,
+/// so the anchors' own difference is that offset less the parent's, plus what the pen crossed between
+/// them - and the mark lands at the parent's drawn place plus that difference.
 fn drawn_offset(case: &Case<'_>, logical: usize, right_to_left: bool) -> Result<i32, String> {
+	i32::try_from(drawn(case, logical, right_to_left, case.expect.len())?).map_err(|_| format!("{}'s drawn offset does not fit", case.expect[logical].glyph))
+}
+
+/// The drawn offset of one glyph, following what it hangs from at most `links` deep.
+fn drawn(case: &Case<'_>, logical: usize, right_to_left: bool, links: usize) -> Result<i64, String> {
 	let expect = &case.expect[logical];
 	// The pen a glyph is drawn at: everything drawn before it, which is what precedes it in the text
 	// for a left-to-right run and what follows it for a right-to-left one. Summed rather than stored,
@@ -295,15 +305,15 @@ fn drawn_offset(case: &Case<'_>, logical: usize, right_to_left: bool) -> Result<
 		let before = if right_to_left { &case.expect[at + 1..] } else { &case.expect[..at] };
 		before.iter().map(|glyph| i64::from(glyph.x_advance)).sum()
 	};
-	let offset = match expect.base.map(usize::from) {
-		Some(base) if base < logical => {
-			let anchors = i64::from(expect.x_offset) + case.expect[base..logical].iter().map(|glyph| i64::from(glyph.x_advance)).sum::<i64>();
-			pen(base) + anchors - pen(logical)
+	match expect.base.map(usize::from) {
+		Some(base) if base < logical && links > 0 => {
+			let crossed: i64 = case.expect[base..logical].iter().map(|glyph| i64::from(glyph.x_advance)).sum();
+			let anchors = i64::from(expect.x_offset) - i64::from(case.expect[base].x_offset) + crossed;
+			Ok(pen(base) + drawn(case, base, right_to_left, links - 1)? + anchors - pen(logical))
 		}
-		Some(base) => return Err(format!("the corpus attaches {} to glyph {base}, which does not precede it", expect.glyph)),
-		None => i64::from(expect.x_offset),
-	};
-	i32::try_from(offset).map_err(|_| format!("{}'s drawn offset does not fit", expect.glyph))
+		Some(base) => Err(format!("the corpus attaches {} to glyph {base}, which does not precede it", expect.glyph)),
+		None => Ok(i64::from(expect.x_offset)),
+	}
 }
 
 /// THE RUN ITSELF, before its picture: the `GlyphRun` the seam hands a renderer, compared with the

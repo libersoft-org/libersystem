@@ -71,7 +71,7 @@ fn shape_and_place(face: &Face<'_>, bytes: &[u8], size: f64) -> Result<(render2d
 		buffer.positions.push(font_shape::Position::default());
 		at += character.len_utf8() as u32;
 	}
-	font_shape::shape_run(face, &mut buffer, &characters, *b"dflt").map_err(|error| format!("shaping refused the corpus: {error:?}"))?;
+	font_shape::shape_run(face, &mut buffer, &characters, *b"dflt", false).map_err(|error| format!("shaping refused the corpus: {error:?}"))?;
 
 	let identity = font_contract::FaceRef { face: font_contract::FaceIdentity { file: font_contract::face::FileIdentity(raster::digest_of(bytes)), index: 0 }, generation: font_contract::face::Generation(1) };
 	let request = Request { face, identity, size: fixed(size), variation: font_contract::VariationCoordinates::default(), script: font_contract::ScriptTag::from_bytes(*b"latn"), direction: font_contract::Direction::LeftToRight, mode: font_contract::glyph::RasterisationMode::Grayscale, origin: (fixed(TARGET.origin_x), fixed(TARGET.baseline)), text: CORPUS, start: 0, end: CORPUS.len() };

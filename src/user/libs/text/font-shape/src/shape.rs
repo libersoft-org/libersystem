@@ -12,10 +12,10 @@
 //! would kern correctly around zero.
 
 use alloc::vec::Vec;
-use font_parse::{Error, Face};
+use font_parse::{Error, Face, Reader};
 
 use crate::buffer::{Buffer, GLOBAL, RTLM};
-use crate::layout::{LayoutTable, class_of};
+use crate::layout::{LayoutTable, MarkSets, class_of};
 use crate::{Table, context, gpos, gsub};
 
 /// How many lookups one shaping pass will apply. A font that asks for more is refused rather than
@@ -65,8 +65,9 @@ fn shape_in_stages(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], langua
 	if input > opentype_profile::limits::RUN_INPUT as usize {
 		return Err(Error::Unsupported(opentype_profile::Unsupported::Exceeded { limit: "run input", ceiling: opentype_profile::limits::RUN_INPUT, asked: input as u64 }));
 	}
+	let gdef = Gdef::of(face)?;
 	let substitution = match face.table(b"GSUB")? {
-		Some(table) => Some(LayoutTable::new(table, *b"GSUB")?),
+		Some(table) => Some(LayoutTable::new(table, *b"GSUB")?.with_mark_sets(gdef.sets)),
 		None => None,
 	};
 	for (index, stage) in stages.iter().enumerate() {
@@ -76,11 +77,16 @@ fn shape_in_stages(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], langua
 		// THE CLASSES ARE READ BEFORE EVERY STAGE, because the stage before it changed the glyphs: a
 		// reph formed from a consonant and a virama is a mark, and a lookup that skips marks has to
 		// know that before it runs.
-		classify(face, buffer)?;
+		gdef.classify(buffer)?;
 		if let Some(table) = &substitution {
 			// THE REQUIRED FEATURE BELONGS TO THE FIRST STAGE, which is where a face expects it.
 			for (lookup, mask) in selected_lookups(table, script, language, stage, index == 0)? {
-				apply_lookup(Table::Substitution, table, lookup, buffer, mask)?;
+				// AND AGAIN AFTER EVERY LOOKUP THAT CHANGED SOMETHING: the next lookup's flags are read
+				// against what the glyphs ARE now, and a ligature this one formed is not the base it was
+				// formed from.
+				if apply_lookup(Table::Substitution, table, lookup, buffer, mask)? {
+					gdef.classify(buffer)?;
+				}
 			}
 		}
 	}
@@ -98,32 +104,53 @@ fn shape_in_stages(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], langua
 	if output > input.saturating_mul(opentype_profile::limits::OUTPUT_EXPANSION as usize) {
 		return Err(Error::Unsupported(opentype_profile::Unsupported::Exceeded { limit: "output expansion", ceiling: opentype_profile::limits::OUTPUT_EXPANSION, asked: (output / input.max(1)) as u64 }));
 	}
-	classify(face, buffer)?;
+	gdef.classify(buffer)?;
 	advances(face, buffer)?;
 	let mut features: Vec<([u8; 4], u32)> = Vec::new();
 	features.try_reserve_exact(count).map_err(|_| Error::Allocation)?;
 	for stage in stages {
 		features.extend_from_slice(stage);
 	}
-	position(face, buffer, script, language, &features)
+	position(face, buffer, script, language, &features, gdef.sets)
 }
 
-/// Give every glyph its `GDEF` class. A font with no `GDEF` leaves them all zero, which is not an
-/// error - it is a font that says nothing about which of its glyphs are marks.
-fn classify(face: &Face<'_>, buffer: &mut Buffer) -> Result<(), Error> {
-	let Some(gdef) = face.table(b"GDEF")? else { return Ok(()) };
-	let mut reader = gdef;
-	let _major = reader.u16();
-	let _minor = reader.u16();
-	let Some(offset) = reader.u16().map(|offset| offset as usize) else { return Ok(()) };
-	if offset == 0 {
-		return Ok(());
+/// What `GDEF` says about the glyphs, read once per run: their classes, the attachment class of each
+/// mark, and the mark glyph sets a lookup can name.
+#[derive(Clone, Copy, Default)]
+struct Gdef<'a> {
+	classes: Option<Reader<'a>>,
+	mark_classes: Option<Reader<'a>>,
+	sets: MarkSets<'a>,
+}
+
+impl<'a> Gdef<'a> {
+	/// A FONT WITH NO `GDEF` SAYS NOTHING about which of its glyphs are marks, which is not an error.
+	fn of(face: &Face<'a>) -> Result<Self, Error> {
+		let Some(table) = face.table(b"GDEF")? else { return Ok(Self::default()) };
+		let at = |offset_at: usize| -> Option<Reader<'a>> {
+			let offset = table.u16_at(offset_at / 2)? as usize;
+			if offset == 0 {
+				return None;
+			}
+			table.slice(offset, table.len().checked_sub(offset)?)
+		};
+		// THE MARK GLYPH SETS ARRIVED IN VERSION 1.2, and before it the bytes there are something else.
+		let minor = table.u16_at(1).unwrap_or(0);
+		Ok(Self { classes: at(4), mark_classes: at(10), sets: MarkSets::new(if minor >= 2 { at(12) } else { None }) })
 	}
-	let Some(classes) = gdef.slice(offset, gdef.len().saturating_sub(offset)) else { return Ok(()) };
-	for info in buffer.infos.iter_mut() {
-		info.class = class_of(classes, info.glyph)?;
+
+	/// Give every glyph its `GDEF` class and, for a mark, its attachment class.
+	fn classify(&self, buffer: &mut Buffer) -> Result<(), Error> {
+		for info in buffer.infos.iter_mut() {
+			if let Some(classes) = self.classes {
+				info.class = class_of(classes, info.glyph)?;
+			}
+			if let Some(classes) = self.mark_classes {
+				info.mark_class = class_of(classes, info.glyph)?;
+			}
+		}
+		Ok(())
 	}
-	Ok(())
 }
 
 /// The advance of every glyph, before anything adjusts it.
@@ -135,13 +162,14 @@ fn advances(face: &Face<'_>, buffer: &mut Buffer) -> Result<(), Error> {
 	Ok(())
 }
 
-fn position(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], language: [u8; 4], features: &[([u8; 4], u32)]) -> Result<(), Error> {
+fn position<'a>(face: &Face<'a>, buffer: &mut Buffer, script: [u8; 4], language: [u8; 4], features: &[([u8; 4], u32)], sets: MarkSets<'a>) -> Result<(), Error> {
 	let Some(table) = face.table(b"GPOS")? else { return Ok(()) };
-	let table = LayoutTable::new(table, *b"GPOS")?;
+	let table = LayoutTable::new(table, *b"GPOS")?.with_mark_sets(sets);
 	for (index, mask) in selected_lookups(&table, script, language, features, true)? {
 		apply_lookup(Table::Positioning, &table, index, buffer, mask)?;
 	}
-	Ok(())
+	// AND EVERY ATTACHMENT PLACED, once nothing can move what it hangs from any more.
+	gpos::propagate(buffer)
 }
 
 /// The lookups a script, a language and a set of feature tags select - IN LOOKUP-LIST ORDER, with
@@ -223,10 +251,10 @@ pub fn apply_lookup_at(table: Table, layout: &LayoutTable<'_>, index: u16, buffe
 		return Ok(false);
 	}
 	let lookup = layout.lookup(index)?;
-	// THE FLAGS DECIDE WHETHER THIS GLYPH PARTICIPATES AT ALL, and they are read here rather than in
-	// each subtable: a lookup that says it ignores marks and is applied to one attaches an accent to
+	// THE FLAGS DECIDE WHETHER THIS GLYPH PARTICIPATES AT ALL - and, below it, which of the glyphs after
+	// it a match sees: a lookup that says it ignores marks and is applied to one attaches an accent to
 	// an accent.
-	if lookup.skips(buffer.infos[at].class) {
+	if lookup.skips(&buffer.infos[at])? {
 		return Ok(false);
 	}
 	for subtable_index in 0..lookup.subtable_count() {
@@ -237,11 +265,11 @@ pub fn apply_lookup_at(table: Table, layout: &LayoutTable<'_>, index: u16, buffe
 			Table::Positioning => matches!(kind, 7 | 8),
 		};
 		let fired = if contextual {
-			context::apply(table, kind, subtable, buffer, at, layout, depth)?
+			context::apply(table, kind, subtable, buffer, at, layout, depth, &lookup)?
 		} else {
 			match table {
-				Table::Substitution => gsub::apply_subtable(kind, subtable, buffer, at)?,
-				Table::Positioning => gpos::apply_subtable(kind, subtable, buffer, at)?,
+				Table::Substitution => gsub::apply_subtable(kind, subtable, buffer, at, &lookup)?,
+				Table::Positioning => gpos::apply_subtable(kind, subtable, buffer, at, &lookup)?,
 			}
 		};
 		if fired {
@@ -297,8 +325,14 @@ fn unwrap_extension<'a>(table: Table, kind: u16, subtable: font_parse::Reader<'a
 /// A RIGHT-TO-LEFT RUN'S MIRRORED FORMS are the caller's half and this one's together: the caller maps
 /// a mirrored character to its mirror when the face has it, and marks every other glyph of the run
 /// with `RTLM` - so the face's own `rtlm` forms apply exactly where no mirror character did.
-pub fn shape_run(face: &Face<'_>, buffer: &mut Buffer, characters: &[char], language: [u8; 4]) -> Result<Vec<char>, Error> {
+///
+/// AND THE RUN'S DIRECTION IS THE CALLER'S TO SAY, because every rule is applied in the order the text
+/// was written and one of them is still not direction-free: a cursive join is made along the line by
+/// the advances of the glyph the pen meets first - in a right-to-left run, the later one.
+pub fn shape_run(face: &Face<'_>, buffer: &mut Buffer, characters: &[char], language: [u8; 4], right_to_left: bool) -> Result<Vec<char>, Error> {
 	use crate::scripts::{self, Shaper};
+
+	buffer.right_to_left = right_to_left;
 
 	// REFUSED BEFORE THE SHAPER'S OWN PASS RUNS, rather than after: the reordering below copies and
 	// rewrites the whole run, and doing that work in order to discover it was too long is the shape

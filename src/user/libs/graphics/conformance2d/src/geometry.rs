@@ -1,7 +1,7 @@
 //! GEOMETRY: what a path is, what a fill rule means, and the shapes the profile names.
 
 use crate::Outcome;
-use crate::harness::{draw, rect_path, solid, white};
+use crate::harness::{draw, rect_path, solid, white, white_where};
 use graphics_core::geom::{PointF, RectF};
 use render2d::path::{FillRule, PathBuilder, StrokeStyle};
 
@@ -42,29 +42,25 @@ fn two_squares(rule: FillRule) -> Result<crate::harness::Frame, crate::Trouble> 
 /// Under the non-zero rule a winding number of two is inside, so the inner square is filled.
 pub fn fill_non_zero() -> Outcome {
 	let frame = two_squares(FillRule::NonZero)?;
-	require!(frame.covered(16, 16), "a winding number of two is inside under the non-zero rule: {:?}", frame.pixel(16, 16));
-	require!(frame.covered(6, 6), "and so is the ring between the squares: {:?}", frame.pixel(6, 6));
-	Ok(())
+	// The inner square and the ring between the squares, every pixel of the outer one and none past it.
+	white_where(&frame, |x, y| (4..28).contains(&x) && (4..28).contains(&y))
 }
 
 // @covers: FillEvenOdd
 /// Under the even-odd rule the same drawing is a ring: two crossings is an even number.
 pub fn fill_even_odd() -> Outcome {
 	let frame = two_squares(FillRule::EvenOdd)?;
-	require!(frame.empty(16, 16), "two crossings is outside under the even-odd rule: {:?}", frame.pixel(16, 16));
-	require!(frame.covered(6, 6), "and one crossing is inside: {:?}", frame.pixel(6, 6));
-	Ok(())
+	// One crossing is inside and two is outside: the ring, and neither the inner square nor anything past it.
+	white_where(&frame, |x, y| (4..28).contains(&x) && (4..28).contains(&y) && !((10..22).contains(&x) && (10..22).contains(&y)))
 }
 
 // @covers: ShapeRect
 /// A rectangle is HALF-OPEN: it covers the pixel at its origin and not the one at its far edge.
 pub fn shape_rect() -> Outcome {
 	let frame = draw(16, 16, |canvas| canvas.fill_path(rect_path(RectF::new(4.0, 4.0, 8.0, 8.0)), white(), FillRule::NonZero))?;
-	require!(frame.covered(4, 4), "the pixel at the origin is covered: {:?}", frame.pixel(4, 4));
-	require!(frame.covered(11, 11), "and the last pixel inside it is: {:?}", frame.pixel(11, 11));
-	require!(frame.empty(12, 12), "the pixel at the far edge is NOT: {:?}", frame.pixel(12, 12));
-	require!(frame.empty(3, 3), "nor the one before the origin: {:?}", frame.pixel(3, 3));
-	Ok(())
+	// The pixel at the origin is covered and so is the last one inside; the one at the far edge is NOT, nor the
+	// one before the origin - and every other pixel is one or the other.
+	white_where(&frame, |x, y| (4..12).contains(&x) && (4..12).contains(&y))
 }
 
 // @covers: ShapeRoundedRect

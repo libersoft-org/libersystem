@@ -9,7 +9,7 @@ WHY A HEADER WITHOUT A SYMBOL IS THE FAILURE TO AVOID, stated here because it is
 directory invites: a header that declares a function the substrate has no symbol for produces a
 compile that succeeds and a link that fails. That is the general POSIX layer arriving through the
 include path instead of through the symbol list, one declaration at a time, and it is exactly what
-`P02M0135` forbids. Every declaration below is here because the pinned sources include the header it
+the foreign substrate's profile forbids. Every declaration below is here because the pinned sources include the header it
 lives in; whether the substrate will PROVIDE it is decided later, by the derived inventory, and a
 declaration here is not a promise that it will.
 

@@ -498,6 +498,20 @@ fn greet_shell() {
 	}
 }
 
+// ONE RECEIVED BYTE, READ AND QUEUED AS ONE STEP, with interrupts masked between the two: the console line's handler
+// does the same pair on this core, and one taken between this read and this queueing would put the rest of a burst
+// ahead of the byte read here. What `feed_serial` answered, or None when nothing was waiting.
+#[cfg(not(test))]
+fn take_serial_byte() -> Option<bool> {
+	let enabled = arch::interrupts_enabled();
+	arch::disable_interrupts();
+	let fed = arch::serial::read_byte().map(console_input::feed_serial);
+	if enabled {
+		arch::enable_interrupts();
+	}
+	fed
+}
+
 // Pump the serial UART into the console input and nudge the shell's first prompt.
 // Registered as the scheduler's idle hook (sched::set_idle_hook) so it runs on the
 // BSP's idle spin: a polling driver (virtio-gpu's display-resize timer) keeps the BSP
@@ -521,9 +535,7 @@ fn serial_console_pump() {
 	// (~100 Hz timer wakes) instead of busy-spinning, so polling one byte per pass could
 	// let a fast paste overrun the 16-byte UART FIFO. Reading until empty keeps serial
 	// input lossless at the lower poll rate.
-	while let Some(byte) = arch::serial::read_byte() {
-		console_input::feed_serial(byte);
-	}
+	while take_serial_byte().is_some() {}
 	// AND WHATEVER A BURST LEFT WAITING. A console channel has a bounded queue, so input that arrives
 	// faster than the shell reads it is held in the kernel rather than dropped; this is the pass that
 	// empties it once the shell has caught up, and without it a held byte would wait for the next
@@ -585,12 +597,8 @@ pub(crate) fn console_shell_loop() {
 		if !listening && ever_attached {
 			break;
 		}
-		if listening {
-			if let Some(byte) = arch::serial::read_byte() {
-				if !console_input::feed_serial(byte) {
-					break;
-				}
-			}
+		if listening && take_serial_byte() == Some(false) {
+			break;
 		}
 		// BOUNDED, AND THE BOUND IS WHAT MAKES THE HOUSEKEEPING BELOW REACHABLE (added 2026-09-02).
 		//

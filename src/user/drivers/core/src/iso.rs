@@ -240,11 +240,13 @@ impl IsoPipe {
 	}
 
 	pub(crate) fn release(&mut self, hc: &mut Xhci) {
-		self.ring.release();
-		if self.page != 0 {
-			close(self.page);
-			self.page = 0;
+		// THE STANDING TRANSFERS ABANDONED FIRST, as a class pipe's are: the page goes back for real.
+		if self.posted > 0 {
+			self.stop(hc, &mut Hids::new());
 		}
+		self.ring.release();
+		drivers::common::release_dma(self.page);
+		self.page = 0;
 		hc.class_rx.retain(|&(slot, dci)| (slot, dci) != (self.slot, self.dci));
 		hc.class_pending.retain(|&(_, _, control)| !(control >> 24 == self.slot && (control >> 16 & 0x1f) == self.dci));
 	}

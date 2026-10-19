@@ -1244,10 +1244,7 @@ pub fn buddy_metadata_bytes() -> usize {
 // The frame pool's totals: (total usable frames - fixed at init, and what a host plugged in since - and frames currently
 // free).
 pub fn totals() -> (usize, usize) {
-	let (total, free) = {
-		let allocator = ALLOCATOR.lock();
-		(allocator.total_count, allocator.free_count)
-	};
+	let (total, free) = boot_totals();
 	let (plugged, plugged_free) = super::hotplug::totals();
 	(total + plugged, free + plugged_free)
 }
@@ -1304,11 +1301,22 @@ pub fn balloon_room(free: usize, total: usize, want: usize) -> usize {
 	free.saturating_sub(balloon_floor(total)).min(want)
 }
 
+// THE BOOT POOLS' OWN COUNTS: (frames, free frames) of the memory the kernel's own allocations draw on. Plugged memory
+// is not in them - `totals` adds it - because nothing the kernel keeps for itself is ever served from it.
+pub fn boot_totals() -> (usize, usize) {
+	let allocator = ALLOCATOR.lock();
+	(allocator.total_count, allocator.free_count)
+}
+
 // ONE FREE FRAME TAKEN FOR A BALLOON, or None at the floor. Only a FREE frame is ever taken - never one a process, a
 // buffer or a device holds - so nothing maps it but the direct map, through which this kernel never reaches a frame it
 // has not allocated.
+//
+// THE FLOOR IS THE BOOT POOLS', because the frame comes from them: `allocate` never serves plugged memory. Judged
+// against `totals` instead, free plugged frames kept the room open while the boot pools drained, and one large host
+// target could take everything the heap, the page tables, the stacks and the DMA buffers draw on.
 pub fn balloon_take() -> Option<u64> {
-	let (total, free) = totals();
+	let (total, free) = boot_totals();
 	if balloon_room(free, total, 1) == 0 {
 		return None;
 	}
@@ -1640,10 +1648,7 @@ pub fn allocate() -> Option<u64> {
 // `kernel_reserve` of them are free, and from plugged memory below that - so a program that eats the machine's memory
 // does not take the page tables its own mappings need with it.
 pub fn allocate_movable() -> Option<u64> {
-	let (total, free) = {
-		let allocator = ALLOCATOR.lock();
-		(allocator.total_count, allocator.free_count)
-	};
+	let (total, free) = boot_totals();
 	if free > kernel_reserve(total) {
 		return allocate().or_else(super::hotplug::take);
 	}

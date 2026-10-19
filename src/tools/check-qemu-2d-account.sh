@@ -91,12 +91,18 @@ EOF
 	# whole against the name cut the same way; the whole name never appears there.
 	qemu_comm="qemu-system-$ARCH"
 	qemu_comm="${qemu_comm:0:15}"
+	# CAPTURED AGAIN UNTIL IT IS THE GUEST'S, or the run is over: the first QEMU a port boot starts is a short-lived
+	# probe of what the machine offers, and one capture taken against it - or in the moment it ended - failed the run.
+	captured=""
 	for _ in $(seq 1 600); do
-		ps -eo comm= | grep -qxF "$qemu_comm" && break
+		if ps -eo comm= | grep -qxF "$qemu_comm" && python3 "$SRC_DIR/harness/frame-account-conditions.py" "$ARCH" "$RESULTS/conditions-$ARCH.json" >"$RESULTS/conditions-$ARCH.log" 2>&1; then
+			captured=1
+			break
+		fi
 		kill -0 "$cold" 2>/dev/null || break
 		sleep 1
 	done
-	python3 "$SRC_DIR/harness/frame-account-conditions.py" "$ARCH" "$RESULTS/conditions-$ARCH.json" >"$RESULTS/conditions-$ARCH.log" 2>&1 || {
+	[[ -n "$captured" ]] || {
 		wait "$cold" || true
 		die "the $ARCH run's conditions could not be captured - see $RESULTS/conditions-$ARCH.log"
 	}

@@ -710,13 +710,49 @@ fn grown(rect: PixelRect, by: u32) -> PixelRect {
 }
 
 /// HOW FAR A GRAPH READS PAST THE PIXEL IT WRITES, in whole device pixels - the profile's bounds map asked
-/// about one pixel - and whether it reads the BACKDROP. Bounded by the profile's largest filter radius, as
-/// a layer's scratch always was.
+/// about one pixel and walked back to the graph's inputs - and whether it reads the BACKDROP.
+///
+/// TWO NODES ANSWER WITH WHERE THE PIXEL IS rather than with how far it reads, so they are asked differently.
+/// A `Crop` needs only what survives it, which a pixel outside its rectangle answers with nothing - so it is
+/// asked as the pixel itself, the most it reads anywhere. And a `Tile` reads its rectangle whatever pixel it
+/// writes, which may be the far side of the target - so a graph with one reaches everything.
+///
+/// NOTHING BOUNDS THE ANSWER BUT THE TARGET. An offset has no ceiling and the reach of a chain adds up, so the
+/// profile's largest radius bounds no graph; `margins` stops every need at the target's larger side, and a
+/// frame whose surfaces that makes too large for the prepared scratch is refused before it draws.
 fn graph_reach(graph: &render2d::filter::FilterGraph) -> (u32, bool) {
+	use render2d::filter::FilterNode;
+	let nodes = graph.nodes();
+	if nodes.iter().any(|node| matches!(node, FilterNode::Tile { .. })) {
+		return (u32::MAX, graph.reads_backdrop());
+	}
 	let probe = RectF::new(0.0, 0.0, 1.0, 1.0);
-	let needed = graph.required_input(probe);
-	let grow = (probe.x - needed.x).max(probe.y - needed.y).max(needed.right() - probe.right()).max(needed.bottom() - probe.bottom());
-	let reach = if grow.is_finite() && grow > 0.0 { (libm::ceilf(grow) as u32).min(graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_filter_radius) } else { 0 };
+	let mut needed: Vec<Option<RectF>> = alloc::vec![None; nodes.len()];
+	if let Some(last) = needed.last_mut() {
+		*last = Some(probe);
+	}
+	let mut grow = 0.0f32;
+	for index in (0..nodes.len()).rev() {
+		let Some(want) = needed[index] else { continue };
+		let node = nodes[index];
+		let input = if matches!(node, FilterNode::Crop { .. }) { want } else { node.required_input(want) };
+		if matches!(node, FilterNode::Source | FilterNode::Backdrop) {
+			grow = grow.max(probe.x - input.x).max(probe.y - input.y).max(input.right() - probe.right()).max(input.bottom() - probe.bottom());
+		}
+		for source in node.inputs() {
+			let slot = &mut needed[source as usize];
+			*slot = Some(match *slot {
+				Some(existing) => {
+					let (x, y) = (existing.x.min(input.x), existing.y.min(input.y));
+					RectF::new(x, y, existing.right().max(input.right()) - x, existing.bottom().max(input.bottom()) - y)
+				}
+				None => input,
+			});
+		}
+	}
+	// A REACH TOO LARGE TO STATE IS THE WHOLE TARGET, and never none: the cast saturates, and a sum that
+	// overflowed reaches everything.
+	let reach = if grow.is_nan() || grow > 0.0 { if grow.is_finite() { libm::ceilf(grow) as u32 } else { u32::MAX } } else { 0 };
 	(reach, graph.reads_backdrop())
 }
 

@@ -160,6 +160,10 @@ struct Fixture {
 	stop_delay: Option<u32>,
 	// A stop's answer being held: when to send it, on which connection, what.
 	held_stop: Option<(u64, u64, Vec<u8>)>,
+	negotiate_delay: Option<u32>,
+	// A NEGOTIATION'S ANSWER BEING HELD, the same three. Sent as it is when its time comes - unlike a held stop's, it
+	// releases nothing: the stream it answers for is the one it negotiated.
+	held_negotiation: Option<(u64, u64, Vec<u8>)>,
 	stats: CameraFixtureStats,
 }
 
@@ -195,6 +199,7 @@ impl Fixture {
 		}
 		self.session = Session::default();
 		self.held_stop = None;
+		self.held_negotiation = None;
 	}
 
 	fn device_time(&self) -> Option<DeviceTime> {
@@ -273,11 +278,17 @@ impl Fixture {
 	fn next_due(&self) -> u64 {
 		let frame = self.stream.as_ref().filter(|stream| stream.running).map(|stream| stream.next_frame);
 		let stop = self.held_stop.as_ref().map(|(release, _, _)| *release).filter(|&release| release != NEVER);
-		[frame, stop].into_iter().flatten().min().unwrap_or(0)
+		let negotiation = self.held_negotiation.as_ref().map(|(release, _, _)| *release);
+		[frame, stop, negotiation].into_iter().flatten().min().unwrap_or(0)
 	}
 
-	// A held stop's time came: every mapping released, and then - only then - the answer.
+	// A held stop's time came: every mapping released, and then - only then - the answer. A held negotiation's is sent.
 	fn release_due(&mut self) {
+		if self.held_negotiation.as_ref().is_some_and(|(release, _, _)| clock() >= *release)
+			&& let Some((_, chan, bytes)) = self.held_negotiation.take()
+		{
+			let _ = try_send(chan, &bytes, 0);
+		}
 		if let Some((release, chan, _)) = self.held_stop.as_ref()
 			&& clock() >= *release
 		{
@@ -296,6 +307,8 @@ struct CameraView<'a> {
 	fixture: &'a mut Fixture,
 	// A stop's answer to hold rather than send: until when.
 	hold: Option<u64>,
+	// A negotiation's answer to hold rather than send: until when.
+	hold_negotiation: Option<u64>,
 }
 
 impl CameraView<'_> {
@@ -336,6 +349,9 @@ impl camera_device::Service for CameraView<'_> {
 		let info = wire_format(format);
 		self.fixture.release_all();
 		self.fixture.stream = Some(Stream { generation, selection, slots: Vec::new(), running: false, sequence: 0, next_frame: 0, period: 1 });
+		if let Some(delay) = self.fixture.negotiate_delay.take() {
+			self.hold_negotiation = Some(clock() + u64::from(delay).div_ceil(10));
+		}
 		Ok(Negotiated { stream_generation: generation, format: selection.format, frame_type: info.frame_type, width: selection.width, height: selection.height, interval: request.interval, max_bytes: selection.max_bytes, stride: selection.stride, plane_offset: 0, range: info.range, matrix: info.matrix })
 	}
 
@@ -436,6 +452,14 @@ impl camera_fixture::Service for ControlView<'_> {
 		Ok(())
 	}
 
+	fn delay_negotiate(&mut self, delay_ms: u32) -> Result<(), Error> {
+		if delay_ms == 0 {
+			return Err(Error::Invalid);
+		}
+		self.fixture.negotiate_delay = Some(delay_ms);
+		Ok(())
+	}
+
 	fn withdraw(&mut self) -> Result<(), Error> {
 		let fixture = &mut *self.fixture;
 		if !fixture.live {
@@ -507,7 +531,7 @@ fn serve(fixture: &mut Fixture, serving: &mut common::Serving, bootstrap: u64, b
 	}
 	let op = u16::from_le_bytes([buf[0], buf[1]]);
 	if op == camera_device::OP_EVENTS {
-		let mut view = CameraView { fixture: &mut *fixture, hold: None };
+		let mut view = CameraView { fixture: &mut *fixture, hold: None, hold_negotiation: None };
 		let Some((corr, _)) = camera_device::events_open(&mut view, &buf[..len], &mut handles) else { return true };
 		let Some((producer, consumer)) = channel_with_depth(STREAM_DEPTH) else { return true };
 		if fixture.session.events != 0 {
@@ -518,18 +542,21 @@ fn serve(fixture: &mut Fixture, serving: &mut common::Serving, bootstrap: u64, b
 		send_caps_blocking(channel, &corr.to_le_bytes(), &[consumer]);
 		return true;
 	}
-	let mut view = CameraView { fixture: &mut *fixture, hold: None };
+	let mut view = CameraView { fixture: &mut *fixture, hold: None, hold_negotiation: None };
 	let written = camera_device::dispatch(&mut view, &buf[..len], &mut handles, &mut reply_buf, &mut reply_handles);
-	let hold = view.hold;
+	let (hold, hold_negotiation) = (view.hold, view.hold_negotiation);
 	for &handle in handles.as_slice() {
 		close(handle);
 	}
 	let Some(written) = written else { return true };
-	match hold {
-		Some(release) => {
+	match (hold, hold_negotiation) {
+		(Some(release), _) => {
 			fixture.held_stop = Some((release, channel, reply_buf[..written].to_vec()));
 		}
-		None => {
+		(None, Some(release)) => {
+			fixture.held_negotiation = Some((release, channel, reply_buf[..written].to_vec()));
+		}
+		(None, None) => {
 			send_caps_blocking(channel, &reply_buf[..written], reply_handles.as_slice());
 		}
 	}
@@ -551,7 +578,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	};
 	common::online_named(bootstrap, &bind, b"driver.camera-fixture: online (a camera with YUY2 and MJPEG formats, for the camera gate)", &[(driver_protocol::provider::CAMERA, camera_far, NAME), (driver_protocol::provider::FIXTURE_CONTROL, control_far, CONTROL_NAME)]);
 	let mut serving = common::Serving::from_offers(&[(CAMERA_TOKEN, camera), (CONTROL_TOKEN, control)]);
-	let mut fixture = Fixture { live: true, token: CAMERA_TOKEN, next_token: CONTROL_TOKEN + 1, normalized, connection: 0, session: Session::default(), stream: None, timing: true, clock_reset: 0, clock_zero: clock_ns(), drop_device: 0, gap_next: false, stop_delay: None, held_stop: None, stats: CameraFixtureStats { frames_written: 0, dropped_no_buffer: 0, dropped_device: 0, gaps: 0, mapped: 0, stops: 0 } };
+	let mut fixture = Fixture { live: true, token: CAMERA_TOKEN, next_token: CONTROL_TOKEN + 1, normalized, connection: 0, session: Session::default(), stream: None, timing: true, clock_reset: 0, clock_zero: clock_ns(), drop_device: 0, gap_next: false, stop_delay: None, held_stop: None, negotiate_delay: None, held_negotiation: None, stats: CameraFixtureStats { frames_written: 0, dropped_no_buffer: 0, dropped_device: 0, gaps: 0, mapped: 0, stops: 0 } };
 	let mut buf = alloc::vec![0u8; 8192];
 	loop {
 		let due = fixture.next_due();

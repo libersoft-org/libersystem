@@ -195,19 +195,28 @@ pub fn produce(request: &Request<'_>, buffer: &Buffer) -> Result<Run, Error> {
 /// offset puts the mark a whole base away from its anchor - a dagesh drawn off its letter. The change
 /// is exactly the difference of the pen between the two orders, and it is made here because this is
 /// where the order changes: the shaper's rules are all written about the order the text was typed.
+///
+/// AND IT IS MADE FOR EVERY LINK UP TO WHAT THE MARK FINALLY HANGS FROM. A mark on a mark carries its
+/// parent's offset, which was itself placed for the other order - so the second accent of a stack is
+/// moved by its own link's change and by every one below it, or it is drawn where the first accent
+/// would have been in the other order.
 fn drawn_x_offsets(buffer: &Buffer, direction: Direction) -> Result<Vec<i32>, Error> {
 	let mut offsets = Vec::new();
 	offsets.try_reserve_exact(buffer.len()).map_err(|_| Error::Allocation)?;
+	let advance = |range: core::ops::Range<usize>| buffer.positions[range].iter().map(|position| i64::from(position.x_advance)).sum::<i64>();
 	for at in 0..buffer.len() {
 		let mut offset = i64::from(buffer.positions[at].x_offset);
-		if direction == Direction::RightToLeft
-			&& let Some(base) = buffer.infos[at].attached_to.map(usize::from)
-			&& base < at
-		{
-			let advance = |range: core::ops::Range<usize>| buffer.positions[range].iter().map(|position| i64::from(position.x_advance)).sum::<i64>();
-			// Logically the pen crossed the base and what follows it before the mark; drawn, it crosses
-			// what follows the base and the mark itself before it reaches the base.
-			offset += advance(base..at) + advance(base + 1..at + 1);
+		if direction == Direction::RightToLeft {
+			// BOUNDED BY THE RUN, because each link points strictly backwards.
+			let mut node = at;
+			while let Some(base) = buffer.infos[node].attached_to.map(usize::from)
+				&& base < node
+			{
+				// Logically the pen crossed the base and what follows it before the mark; drawn, it
+				// crosses what follows the base and the mark itself before it reaches the base.
+				offset += advance(base..node) + advance(base + 1..node + 1);
+				node = base;
+			}
 		}
 		offsets.push(i32::try_from(offset).map_err(|_| font_contract::Overflow::Sum)?);
 	}

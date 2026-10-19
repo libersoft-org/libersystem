@@ -2591,6 +2591,120 @@ fn a_filtered_layer_is_the_same_picture_wherever_the_tiles_cut_it() {
 }
 
 #[test]
+// A GRAPH THAT REACHES FURTHER THAN ANY ONE NODE MAY, AND ONE THAT READS A FIXED RECTANGLE, are as right at a
+// tile boundary as one that reaches a pixel. An `Offset` has no ceiling, offsets in a chain add up and a blur
+// after them reaches past their sum - so a fill moved 300 pixels, or moved 150 twice and then blurred, lands in
+// tiles its own bounds are nowhere near. And a `Tile` reads its rectangle whatever pixel it writes, so a tile
+// of the target ten tiles from that rectangle needs the content inside it. Each is drawn against the same
+// picture with the movement taken away - the fill drawn where it lands, the repeated pattern drawn as the
+// stripes it makes - which is the same arithmetic per pixel over the same content, so the two agree to the bit
+// in a float target and to the byte in the eight-bit one.
+fn a_graph_that_reaches_past_any_one_node_is_right_at_every_tile_boundary() {
+	use render2d::filter::FilterNode;
+	type Scene = fn(&mut Canvas);
+	let (width, height) = (640u32, 192u32);
+	let scenes: [(&str, Scene, Scene); 3] = [
+		(
+			"an offset of 300 pixels",
+			|canvas| {
+				let handle = canvas
+					.resources()
+					.add_filter(graph(|graph| {
+						let source = graph.push(FilterNode::Source).expect("a node");
+						graph.push(FilterNode::Offset { input: source, dx: 300.0, dy: 20.0 }).expect("an offset");
+					}))
+					.expect("a graph");
+				canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+				fill(canvas, 100.0, 40.0, 100.0, 60.0, (0.2, 0.4, 1.0, 1.0));
+				fill(canvas, 120.0, 52.0, 30.0, 30.0, (1.0, 0.5, 0.0, 0.6));
+				canvas.end_layer().expect("closed");
+			},
+			|canvas| {
+				canvas.begin_layer(None, 1.0, BlendMode::Normal, None).expect("a layer");
+				fill(canvas, 400.0, 60.0, 100.0, 60.0, (0.2, 0.4, 1.0, 1.0));
+				fill(canvas, 420.0, 72.0, 30.0, 30.0, (1.0, 0.5, 0.0, 0.6));
+				canvas.end_layer().expect("closed");
+			},
+		),
+		(
+			"two offsets of 150 pixels and a blur",
+			|canvas| {
+				let handle = canvas
+					.resources()
+					.add_filter(graph(|graph| {
+						let source = graph.push(FilterNode::Source).expect("a node");
+						let first = graph.push(FilterNode::Offset { input: source, dx: 150.0, dy: 0.0 }).expect("an offset");
+						let second = graph.push(FilterNode::Offset { input: first, dx: 150.0, dy: 8.0 }).expect("an offset");
+						graph.push(FilterNode::Blur { input: second, x: 2.0, y: 2.0 }).expect("a blur");
+					}))
+					.expect("a graph");
+				canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+				fill(canvas, 100.0, 40.0, 100.0, 60.0, (0.9, 0.1, 0.3, 1.0));
+				canvas.end_layer().expect("closed");
+			},
+			|canvas| {
+				let handle = canvas
+					.resources()
+					.add_filter(graph(|graph| {
+						let source = graph.push(FilterNode::Source).expect("a node");
+						graph.push(FilterNode::Blur { input: source, x: 2.0, y: 2.0 }).expect("a blur");
+					}))
+					.expect("a graph");
+				canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+				fill(canvas, 400.0, 48.0, 100.0, 60.0, (0.9, 0.1, 0.3, 1.0));
+				canvas.end_layer().expect("closed");
+			},
+		),
+		(
+			"a tile of a rectangle at the corner",
+			|canvas| {
+				let handle = canvas
+					.resources()
+					.add_filter(graph(|graph| {
+						let source = graph.push(FilterNode::Source).expect("a node");
+						graph.push(FilterNode::Tile { input: source, rect: RectF::new(16.0, 16.0, 32.0, 32.0) }).expect("a tile");
+					}))
+					.expect("a graph");
+				canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+				fill(canvas, 16.0, 16.0, 16.0, 32.0, (0.1, 0.7, 0.3, 1.0));
+				fill(canvas, 32.0, 16.0, 16.0, 32.0, (0.8, 0.2, 0.9, 0.5));
+				canvas.end_layer().expect("closed");
+			},
+			|canvas| {
+				canvas.begin_layer(None, 1.0, BlendMode::Normal, None).expect("a layer");
+				for column in 0..20u32 {
+					let x = (column * 32) as f32;
+					fill(canvas, x + 16.0, 0.0, 16.0, 192.0, (0.1, 0.7, 0.3, 1.0));
+					fill(canvas, x, 0.0, 16.0, 192.0, (0.8, 0.2, 0.9, 0.5));
+				}
+				canvas.end_layer().expect("closed");
+			},
+		),
+	];
+	let mut failures = alloc::vec::Vec::new();
+	for (format, make) in [("float", float_target as fn(u32, u32) -> OwnedImage), ("eight-bit", target as fn(u32, u32) -> OwnedImage)] {
+		for (name, filtered, unmoved) in &scenes {
+			let mut drawn = Vec::new();
+			for scene in [filtered, unmoved] {
+				let mut canvas = Canvas::new();
+				scene(&mut canvas);
+				let list = canvas.finish().expect("a list");
+				let mut image = make(width, height);
+				let mut backend = Soft2d::new();
+				let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+				backend.render(&prepared, &mut image.view_mut()).expect("a frame");
+				drawn.push((list, image));
+			}
+			match first_difference(&drawn[0].1, &drawn[1].1) {
+				Some(difference) => failures.push(alloc::format!("{format} {name}: {difference}")),
+				None => every_schedule_agrees(&drawn[0].0, &make(width, height), &drawn[1].1, &target::NoImages, &crate::glyph::NoGlyphs),
+			}
+		}
+	}
+	assert!(failures.is_empty(), "{} of {} drawings differ from the one with the movement taken away:\n{}", failures.len(), scenes.len() * 2, failures.join("\n"));
+}
+
+#[test]
 // THE AUDIT'S OWN CASE, WITH ITS EXPECTED VALUES. An opaque 100-pixel square inside a `Blur { 4, 4 }` layer on
 // a 256-pixel target, which the tile boundaries at 128 and 192 cut through. Twelve pixels in from every edge
 // the kernel lies wholly inside the square, so the blurred alpha there is the kernel's sum - ONE, stored as

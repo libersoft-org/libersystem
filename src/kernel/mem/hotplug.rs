@@ -28,6 +28,10 @@ use crate::sync::SpinLock;
 // slot covers.
 pub const MAX_REGIONS: usize = 4;
 pub const MAX_ADDRESS: u64 = 1 << 39;
+// THE MOST BLOCKS ONE REGION HAS - what `SYS_MEMORY_PLUG_STATE` reports in one call, so a restarted driver always reads
+// the whole of its region's state. A larger region was taken and then reported in part: the rest read as offline, and
+// the driver asked its host to unplug blocks the kernel still had online. 64 GiB in 2 MiB blocks.
+pub const MAX_BLOCKS: u64 = 32768;
 const PAGE: u64 = 4096;
 
 // Why a region, or a change to one, is refused. Nothing changes on a refusal.
@@ -39,6 +43,7 @@ pub enum Refusal {
 	Overlap,
 	// Past what the direct map's shared slot reaches, or wrapping.
 	TooHigh,
+	// More regions than `MAX_REGIONS`, or a region of more blocks than `MAX_BLOCKS`.
 	TooMany,
 	// A block range outside the region.
 	Range,
@@ -54,11 +59,15 @@ pub enum Refusal {
 	Unsupported,
 }
 
-// A RANGE A REGION MAY BE: whole blocks of a power-of-two size of at least a page, inside the direct map's shared slot,
-// and over nothing in `taken` - the memory map, every device window and every other region. Pure, for its test.
+// A RANGE A REGION MAY BE: whole blocks of a power-of-two size of at least a page, at most `MAX_BLOCKS` of them, inside
+// the direct map's shared slot, and over nothing in `taken` - the memory map, every device window and every other
+// region. Pure, for its test.
 pub fn check(base: u64, size: u64, block: u64, taken: &[(u64, u64)]) -> Result<(), Refusal> {
 	if block < PAGE || !block.is_power_of_two() || size == 0 || base % block != 0 || size % block != 0 {
 		return Err(Refusal::Unaligned);
+	}
+	if size / block > MAX_BLOCKS {
+		return Err(Refusal::TooMany);
 	}
 	let end = base.checked_add(size).ok_or(Refusal::TooHigh)?;
 	if end > MAX_ADDRESS {

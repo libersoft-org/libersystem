@@ -40,7 +40,7 @@ def production(root, source_tree):
     main, le = main_path.read_text(), le_path.read_text()
     actual = item(le, 'pub(crate) struct LeState {')
     actual += '\nimpl LeState {\n' + '\n'.join(item(le, anchor) for anchor in (
-        'pub fn new() -> LeState {', 'pub fn local(', 'pub fn resolve(', 'pub fn own_type(')) + '\n}\n'
+        'pub fn new() -> LeState {', 'pub fn clear_rebuild(', 'pub fn local(', 'pub fn resolve(', 'pub fn own_type(')) + '\n}\n'
     actual += '\n'.join(item(main, anchor) for anchor in (
         'fn advertised_kind(', 'fn peer_to_wire(', 'fn peer_from_wire(')) + '\n'
     actual += 'impl Stack {\n' + '\n'.join(item(main, anchor) for anchor in (
@@ -49,10 +49,11 @@ def production(root, source_tree):
         'pub(crate) fn start_le_pairing(', 'pub(crate) fn pair_le(', 'fn set_aside(')) + '\n}\n'
     actual += "impl OperatorView<'_> {\n" + item(main, 'fn forget(') + '\n}\n'
     actual += 'impl Controller {\n' + item(main, 'fn fail_attempt(') + '\n}\n'
-    constants = [line for line in main.splitlines() if line.startswith('const KIND_BREDR:')]
-    if len(constants) != 1:
-        raise ValueError('ambiguous production KIND_BREDR constant')
-    actual += constants[0] + '\n'
+    for name in ('KIND_BREDR', 'TICKS_PER_SECOND', 'REARM_TICKS', 'STATUS_UNKNOWN_CONNECTION'):
+        constants = [line for line in main.splitlines() if line.startswith(f'const {name}:')]
+        if len(constants) != 1:
+            raise ValueError(f'ambiguous production {name} constant')
+        actual += constants[0] + '\n'
     modules = []
     sources = [main_path, le_path]
     for name in ('aes', 'cmac', 'bt_keys', 'bt_bounds', 'hci', 'hci_codec'):

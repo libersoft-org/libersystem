@@ -32,6 +32,12 @@ impl Lookup {
 		Self { kind, flags: 0x0008, subtables: vec![subtable] }
 	}
 
+	/// A lookup with the flags given - `rightToLeft` on a cursive lookup, which roots a joined word on
+	/// its LAST glyph rather than its first.
+	pub fn with_flags(kind: u16, flags: u16, subtable: Vec<u8>) -> Self {
+		Self { kind, flags, subtables: vec![subtable] }
+	}
+
 	fn bytes(&self) -> Vec<u8> {
 		let mut out = Vec::new();
 		u16v(&mut out, self.kind);
@@ -348,6 +354,116 @@ pub fn mark_to_base(marks: &[(u16, u16, (i16, i16))], bases: &[(u16, Vec<(i16, i
 	out.extend_from_slice(&base_coverage);
 	out.extend_from_slice(&mark_array);
 	out.extend_from_slice(&base_array);
+	out
+}
+
+/// Mark-to-ligature attachment, format 1: `marks` as `(glyph, class, anchor)` and each ligature as
+/// `(glyph, per component the anchor for each class)`.
+///
+/// ONE ANCHOR PER COMPONENT IS THE POINT. A fatha written after the lam of a lam-alef belongs over the
+/// lam half and one written after the alef over the alef half, and only the component a mark followed
+/// - which the shaper records when the ligature forms - says which.
+pub fn mark_to_ligature(marks: &[(u16, u16, (i16, i16))], ligatures: &[(u16, Vec<Vec<(i16, i16)>>)], classes: u16) -> Vec<u8> {
+	let mut sorted_marks = marks.to_vec();
+	sorted_marks.sort_by_key(|(glyph, _, _)| *glyph);
+	let mut sorted_ligatures = ligatures.to_vec();
+	sorted_ligatures.sort_by_key(|(glyph, _)| *glyph);
+	let mark_coverage = coverage(&sorted_marks.iter().map(|(glyph, _, _)| *glyph).collect::<Vec<u16>>());
+	let ligature_coverage = coverage(&sorted_ligatures.iter().map(|(glyph, _)| *glyph).collect::<Vec<u16>>());
+
+	let mark_records: Vec<Vec<u8>> = sorted_marks
+		.iter()
+		.map(|(_, class, _)| {
+			let mut record = Vec::new();
+			u16v(&mut record, *class);
+			record
+		})
+		.collect();
+	let mark_anchors: Vec<Vec<u8>> = sorted_marks.iter().map(|(_, _, point)| anchor(*point)).collect();
+	let mut mark_array = Vec::new();
+	u16v(&mut mark_array, sorted_marks.len() as u16);
+	mark_array.extend_from_slice(&anchor_array(&mark_records, 2 + 4 * sorted_marks.len(), &mark_anchors));
+
+	// The ligature array: an offset per ligature to its attach table, which holds a component count and
+	// an anchor offset per component and class.
+	let mut attaches: Vec<Vec<u8>> = Vec::new();
+	for (_, components) in &sorted_ligatures {
+		let mut attach = Vec::new();
+		u16v(&mut attach, components.len() as u16);
+		let mut at = 2 + 2 * classes as usize * components.len();
+		let mut anchors = Vec::new();
+		for points in components {
+			for class in 0..classes as usize {
+				let bytes = anchor(points.get(class).copied().unwrap_or((0, 0)));
+				u16v(&mut attach, at as u16);
+				at += bytes.len();
+				anchors.push(bytes);
+			}
+		}
+		for bytes in anchors {
+			attach.extend_from_slice(&bytes);
+		}
+		attaches.push(attach);
+	}
+	let mut ligature_array = Vec::new();
+	u16v(&mut ligature_array, sorted_ligatures.len() as u16);
+	let mut at = 2 + 2 * attaches.len();
+	for attach in &attaches {
+		u16v(&mut ligature_array, at as u16);
+		at += attach.len();
+	}
+	for attach in &attaches {
+		ligature_array.extend_from_slice(attach);
+	}
+
+	let mark_coverage_at = 12usize;
+	let ligature_coverage_at = mark_coverage_at + mark_coverage.len();
+	let mark_array_at = ligature_coverage_at + ligature_coverage.len();
+	let ligature_array_at = mark_array_at + mark_array.len();
+	let mut out = Vec::new();
+	u16v(&mut out, 1);
+	u16v(&mut out, mark_coverage_at as u16);
+	u16v(&mut out, ligature_coverage_at as u16);
+	u16v(&mut out, classes);
+	u16v(&mut out, mark_array_at as u16);
+	u16v(&mut out, ligature_array_at as u16);
+	out.extend_from_slice(&mark_coverage);
+	out.extend_from_slice(&ligature_coverage);
+	out.extend_from_slice(&mark_array);
+	out.extend_from_slice(&ligature_array);
+	out
+}
+
+/// Cursive attachment, format 1: each covered glyph with its entry and exit anchors, either of which a
+/// glyph may lack - an initial form has nothing to join into it, and a final form joins to nothing.
+pub fn cursive(entries: &[(u16, Option<(i16, i16)>, Option<(i16, i16)>)]) -> Vec<u8> {
+	let mut sorted = entries.to_vec();
+	sorted.sort_by_key(|(glyph, _, _)| *glyph);
+	let coverage = coverage(&sorted.iter().map(|(glyph, _, _)| *glyph).collect::<Vec<u16>>());
+	let header = 6 + 4 * sorted.len();
+	let mut records = Vec::new();
+	let mut anchors = Vec::new();
+	let mut at = header + coverage.len();
+	for (_, entry, exit) in &sorted {
+		for point in [entry, exit] {
+			match point {
+				Some(point) => {
+					u16v(&mut records, at as u16);
+					let bytes = anchor(*point);
+					at += bytes.len();
+					anchors.extend_from_slice(&bytes);
+				}
+				None => u16v(&mut records, 0),
+			}
+		}
+	}
+	let mut out = Vec::new();
+	u16v(&mut out, 1);
+	u16v(&mut out, header as u16);
+	u16v(&mut out, sorted.len() as u16);
+	out.extend_from_slice(&records);
+	out.extend_from_slice(&coverage);
+	out.extend_from_slice(&anchors);
 	out
 }
 

@@ -409,6 +409,44 @@ fn a_namespace_row_s_ports_are_minted_from_its_claim_and_never_over_a_bar_or_a_b
 	in_thread(body, &DONE);
 }
 
+// AN EMBEDDED CONTROLLER AN ECDT DESCRIBES: the instance mints its two ports by address for early access, and the
+// walk then reports the controller's node as firmware-held over those same ports - which is published, because they
+// are the instance's own. The same ports as a claimable row are refused, and so is a firmware-held row over ports the
+// instance never minted.
+#[cfg(target_arch = "x86_64")]
+crate::tagged_test!(a_firmware_held_row_may_name_ports_its_instance_minted_and_no_other_row_may, [Drivers, Kernel, Syscall, ArchX86_64], id = "kernel.firmware.a_firmware_held_row_may_name_ports_its_instance_minted_and_no_other_row_may", covers = ["kernel"]);
+#[cfg(target_arch = "x86_64")]
+fn a_firmware_held_row_may_name_ports_its_instance_minted_and_no_other_row_may() {
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_: u64) {
+		let firmware = privilege(PrivilegeKind::FirmwareInterpreter);
+		let (_, _events) = attach(firmware);
+		// THE CONTROLLER'S DATA AND COMMAND PORTS, 0x62 and 0x66, which nothing on the test machine holds.
+		let data = invoke(abi::SYS_PORT_RANGE_FIRMWARE, firmware, 0x62, 1, 0);
+		let command = invoke(abi::SYS_PORT_RANGE_FIRMWARE, firmware, 0x66, 1, 0);
+		assert!(data > 0 && command > 0, "the instance mints the controller's ports by address ({data}, {command})");
+		let mut ec = namespace_description(b"acpi:\\_SB_.TST_.EC0_", abi::PLATFORM_STATE_FIRMWARE_HELD, b"PNP0C09");
+		assert!(ec.add_port(0x62, 1) && ec.add_port(0x66, 1), "the port ranges fit");
+		let row = device_report(firmware, ec);
+		assert!(row > 0, "the firmware-held node over its instance's own ports is published ({row})");
+		let mut claimable = namespace_description(b"acpi:\\_SB_.TST_.EC1_", abi::PLATFORM_STATE_CLAIMABLE, crate::dma_policy::SYNTHETIC_PLATFORM_HID);
+		assert!(claimable.add_port(0x62, 1));
+		assert_eq!(device_report(firmware, claimable), syscall::ERR_ACCESS_DENIED, "the instance's ports as a claimable row would be a driver's, and are refused");
+		// The test build's exit port, which the reserved set holds and no row describes.
+		let mut stranger = namespace_description(b"acpi:\\_SB_.TST_.EC2_", abi::PLATFORM_STATE_FIRMWARE_HELD, b"PNP0C09");
+		assert!(stranger.add_port(0xf4, 1));
+		assert_eq!(device_report(firmware, stranger), syscall::ERR_ACCESS_DENIED, "a firmware-held row over ports the instance never minted is refused");
+		assert!(withdraw_report(firmware, b"acpi:\\_SB_.TST_.EC0_") >= 0, "the node is withdrawn");
+		for handle in [data, command] {
+			assert_eq!(invoke(abi::SYS_HANDLE_CLOSE, handle as u64, 0, 0, 0), 0);
+		}
+		super::process_ended(koid());
+		super::forget_for_test();
+		DONE.store(true, Ordering::SeqCst);
+	}
+	in_thread(body, &DONE);
+}
+
 crate::tagged_test!(a_walk_is_reconciled_by_identity_and_loaded_withdraws_what_it_did_not_report, [Drivers, Kernel, Syscall], id = "kernel.firmware.a_walk_is_reconciled_by_identity_and_loaded_withdraws_what_it_did_not_report", covers = ["kernel"]);
 fn a_walk_is_reconciled_by_identity_and_loaded_withdraws_what_it_did_not_report() {
 	static DONE: AtomicBool = AtomicBool::new(false);

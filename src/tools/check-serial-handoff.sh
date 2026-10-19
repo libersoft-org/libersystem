@@ -157,11 +157,14 @@ all_counts_zero() {
 	fi
 }
 
-# `lab sh` round trip: the command's output came back.
+# `lab sh` round trip: the command's output came back - AS ITS OWN WHOLE LINE, and from a command the shell ran. The
+# word anywhere in the output passed a command the shell refused, whose error quotes it back: a round trip whose
+# first byte arrived after the line's end ("unknown command: cho ...") read as a pass.
 round_trip() {
 	local word="$1" how="$2" out
 	out="$(lab sh --timeout 60 echo "$word" 2>&1)" || fail "lab sh did not complete $how: $out"
-	grep -q -- "$word" <<<"$out" || fail "lab sh did not answer $how (got: $out)"
+	! grep -q -- "unknown command" <<<"$out" || fail "the shell refused the round trip $how (got: $out)"
+	grep -qx -- "$word" <<<"$(tr -d '\r' <<<"$out")" || fail "lab sh did not answer $how (got: $out)"
 	echo "serial-handoff: lab sh answered $how"
 }
 

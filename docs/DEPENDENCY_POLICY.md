@@ -57,7 +57,7 @@ A DOWNLOADED-AT-BUILD SOURCE. The build fetches nothing. Sources are fetched ONC
 are then vendored in the tree or content-addressed by digest. A build that downloads is a build
 whose output depends on what a remote server served at that moment, which makes it unreproducible
 and makes its licence audit a statement about a file nobody kept. This applies to the audit-only
-inputs of `P02M0135` exactly as it applies to anything shipped.
+inputs of the foreign substrate exactly as it applies to anything shipped.
 
 A COPIED IMPLEMENTATION WITH LOST ATTRIBUTION. Code that came from somewhere else and is presented
 as this project's own is refused, and the refusal is not about legal exposure. An implementation
@@ -79,7 +79,7 @@ an unreviewed licence, and fails the same way.
 ## Audit-only inputs
 
 An AUDIT-ONLY input is fetched, compiled, inspected and quarantine-staged for a gate, and nothing it
-produces is imported into a shipping image or named by a production manifest. `P02M0135`'s pinned
+produces is imported into a shipping image or named by a production manifest. The foreign substrate's pinned
 Vulkan loader configuration is the first of these.
 
 IT IS UNDER THE SAME LICENCE REVIEW AS ANYTHING ELSE THAT ENTERS THE TREE, and the reason is that

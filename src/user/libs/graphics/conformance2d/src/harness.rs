@@ -81,12 +81,6 @@ impl Frame {
 	pub fn empty(&self, x: u32, y: u32) -> bool {
 		self.alpha(x, y) == 0
 	}
-
-	/// Whether a pixel the drawing covers WHOLLY holds exactly a straight colour at an alpha - the frozen edge
-	/// policy, which compares such a pixel exactly. See `stored`.
-	pub fn holds(&self, x: u32, y: u32, colour: [f32; 3], alpha: f32) -> bool {
-		self.pixel(x, y) == [stored(colour[0], x, y), stored(colour[1], x, y), stored(colour[2], x, y), byte(alpha)]
-	}
 }
 
 /// THE FROZEN THRESHOLDS, as the numbers a comparison applies. Each is the `render2d` entry of
@@ -115,7 +109,7 @@ pub fn byte(value: f32) -> u8 {
 ///
 /// TWO PARTS IN 255 AND NOT ZERO, because that is the frozen per-pixel bound for a pixel whose analytic
 /// coverage is a fraction - and ONLY for such a pixel. A fully covered or an empty one is compared
-/// exactly, by `stored` and `Frame::holds`: a fully covered pixel that differs at all is a colour error
+/// exactly, by `stored` and `every_pixel`: a fully covered pixel that differs at all is a colour error
 /// wearing an antialiasing tolerance.
 pub fn near(seen: u8, expected: f32) -> bool {
 	let expected = byte(expected) as i32;
@@ -144,6 +138,12 @@ pub fn every_pixel(frame: &Frame, expected: impl Fn(u32, u32) -> [u8; 4]) -> Res
 		}
 	}
 	Ok(())
+}
+
+/// EVERY PIXEL OF A PICTURE THAT IS OPAQUE WHITE OR NOTHING, which is what a whole-pixel shape, clip or fill rule
+/// drawn in `white()` leaves: `covered` says which, and every pixel of the target is compared exactly.
+pub fn white_where(frame: &Frame, covered: impl Fn(u32, u32) -> bool) -> Result<(), crate::Trouble> {
+	every_pixel(frame, |x, y| if covered(x, y) { [255; 4] } else { [0; 4] })
 }
 
 /// A frame in the comparison space the thresholds NAME - linear Rec. 709, premultiplied, at f32 - for a scene

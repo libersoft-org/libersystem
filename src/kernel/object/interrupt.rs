@@ -9,7 +9,7 @@
 
 use alloc::sync::Arc;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::sched;
@@ -30,6 +30,9 @@ pub struct Interrupt {
 	// REVOKED: the claim this was derived from has been released, and this object's authority ended
 	// with it. Set by `revoke`, never cleared - a revoked interrupt does not come back.
 	revoked: AtomicBool,
+	// THE PCI FUNCTION WHOSE INTx PIN THIS LINE IS, for a claimed wired line of one: valid bit, bus, device, function -
+	// zero for none. Its pin is turned off before the line is given back, see `Drop`.
+	function: AtomicU32,
 	// Every delivery the dispatch path made, revoked or not - what lets the suite see a level line that
 	// was not masked re-fire, and a released line that was not silenced fire at all.
 	#[cfg(test)]
@@ -45,9 +48,15 @@ impl Interrupt {
 			pending: AtomicBool::new(false),
 			bound: AtomicBool::new(false),
 			revoked: AtomicBool::new(false),
+			function: AtomicU32::new(0),
 			#[cfg(test)]
 			signals: core::sync::atomic::AtomicU32::new(0),
 		})
+	}
+
+	// THE FUNCTION THIS WIRED LINE IS THE PIN OF, recorded when its claim acquires it.
+	pub fn set_function(&self, bus: u8, dev: u8, func: u8) {
+		self.function.store(1 << 24 | u32::from(bus) << 16 | u32::from(dev) << 8 | u32::from(func), Ordering::Release);
 	}
 
 	pub fn vector(&self) -> u32 {
@@ -185,6 +194,16 @@ impl Drop for Interrupt {
 		if self.bound.swap(false, Ordering::AcqRel) {
 			// AND ITS WAKE MARK WITH IT: the vector may be another binding's next.
 			crate::sleep::mark_wake(self.vector, false);
+			// A FUNCTION'S PIN IS TURNED OFF BEFORE ITS LINE IS GIVEN BACK. A driver that died or was killed leaves its
+			// claim - and with it the pin - live until DeviceManager's teardown reaches the release, and the unbind below
+			// unmasks a level line for whoever is left on it: a controller whose status was never serviced kept it
+			// asserted, and the boot core took the firing again and again - the kernel's hot-plug handler finding nothing,
+			// or every sibling driver woken for nothing - until the release came. A planned release has turned it off
+			// already, and turning it off twice is nothing.
+			let function = self.function.load(Ordering::Acquire);
+			if function != 0 {
+				crate::arch::pci::set_intx_disabled((function >> 16) as u8, (function >> 8) as u8, function as u8, true);
+			}
 			crate::arch::interrupts::unbind(self.vector, self.owner());
 		}
 	}

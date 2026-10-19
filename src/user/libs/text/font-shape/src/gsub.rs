@@ -12,7 +12,7 @@ use font_parse::{Error, Malformed, Reader};
 use opentype_profile::Unsupported;
 
 use crate::buffer::Buffer;
-use crate::layout::coverage_index;
+use crate::layout::{Lookup, coverage_index};
 
 fn bad() -> Error {
 	Error::Malformed(Malformed::InconsistentTable { table: *b"GSUB" })
@@ -23,13 +23,15 @@ fn bad() -> Error {
 /// THE CONTEXTUAL TYPES ARE NOT HERE. They apply OTHER lookups rather than substituting anything
 /// themselves, so they need the table they came from and the driver that bounds the nesting - see
 /// `context`. What is left here is every type that acts on the buffer directly.
-pub fn apply_subtable(kind: u16, subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Error> {
+///
+/// `lookup` is the lookup the subtable belongs to, whose flags say which glyphs a match passes over.
+pub fn apply_subtable(kind: u16, subtable: Reader<'_>, buffer: &mut Buffer, at: usize, lookup: &Lookup<'_>) -> Result<bool, Error> {
 	match kind {
 		1 => single(subtable, buffer, at),
 		2 => multiple(subtable, buffer, at),
 		3 => alternate(subtable, buffer, at),
-		4 => ligature(subtable, buffer, at),
-		8 => reverse_chain(subtable, buffer, at),
+		4 => ligature(subtable, buffer, at, lookup),
+		8 => reverse_chain(subtable, buffer, at, lookup),
 		other => Err(Error::Unsupported(Unsupported::GsubLookup(other))),
 	}
 }
@@ -131,7 +133,11 @@ fn alternate(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<boo
 }
 
 /// Type 4: several glyphs become one - a ligature.
-fn ligature(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Error> {
+///
+/// THE COMPONENTS AFTER THE FIRST ARE THE NEXT GLYPHS THE LOOKUP SEES, not the next buffer slots. A
+/// lookup that ignores marks forms lam-alef across a fatha written between the two letters, and the
+/// fatha stays - after the ligature, recording which component it followed.
+fn ligature(subtable: Reader<'_>, buffer: &mut Buffer, at: usize, lookup: &Lookup<'_>) -> Result<bool, Error> {
 	let mut reader = subtable;
 	let format = reader.u16().ok_or_else(bad)?;
 	if format != 1 {
@@ -160,23 +166,24 @@ fn ligature(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool
 		if components == 0 {
 			return Err(bad());
 		}
-		let tail = components - 1;
-		if at + tail >= buffer.len() + 1 && tail > 0 && at + tail > buffer.len() - 1 {
+		// MORE COMPONENTS THAN THE RUN HAS GLYPHS LEFT cannot match, whatever is skipped - and asking for
+		// the room to record them would be a font's count deciding an allocation.
+		if components > buffer.len() - at {
 			continue;
 		}
-		let mut matched = true;
-		for component in 0..tail {
+		let mut matched: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+		matched.try_reserve_exact(components).map_err(|_| Error::Allocation)?;
+		matched.push(at);
+		for component in 0..components - 1 {
 			let expected = table.u16_at(2 + component).ok_or_else(bad)?;
-			match buffer.infos.get(at + 1 + component) {
-				Some(info) if info.glyph == expected => {}
-				_ => {
-					matched = false;
-					break;
-				}
+			let last = matched[matched.len() - 1];
+			match lookup.next(buffer, last)? {
+				Some(next) if buffer.infos[next].glyph == expected => matched.push(next),
+				_ => break,
 			}
 		}
-		if matched {
-			buffer.ligate(at, components, glyph);
+		if matched.len() == components {
+			buffer.ligate_components(&matched, glyph);
 			return Ok(true);
 		}
 	}
@@ -189,7 +196,10 @@ fn ligature(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool
 /// contextual machinery: the whole point is that a substitution made at one position is visible to
 /// the rule applied at the position BEFORE it, which only holds if the buffer is walked backwards.
 /// It is what an Arabic font uses to pick a final form after everything else has settled.
-pub fn reverse_chain(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Error> {
+///
+/// THE BACKTRACK AND THE LOOKAHEAD ARE THE GLYPHS THE LOOKUP SEES on either side, passing over what its
+/// flags skip, as they are in every contextual rule.
+pub fn reverse_chain(subtable: Reader<'_>, buffer: &mut Buffer, at: usize, lookup: &Lookup<'_>) -> Result<bool, Error> {
 	let mut reader = subtable;
 	let format = reader.u16().ok_or_else(bad)?;
 	if format != 1 {
@@ -210,22 +220,25 @@ pub fn reverse_chain(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Re
 		return Err(bad());
 	}
 	// The backtrack is stored NEAREST-FIRST here as everywhere else.
+	let mut position = at;
 	for offset in 0..backtrack_count {
-		let Some(position) = at.checked_sub(offset + 1) else { return Ok(false) };
+		let Some(found) = lookup.previous(buffer, position)? else { return Ok(false) };
 		let at_coverage = subtable.u16_at(backtrack_at / 2 + offset).ok_or_else(bad)? as usize;
 		let table = subtable.slice(at_coverage, subtable.len().checked_sub(at_coverage).ok_or_else(bad)?).ok_or_else(bad)?;
-		let Some(info) = buffer.infos.get(position) else { return Ok(false) };
-		if coverage_index(table, info.glyph)?.is_none() {
+		if coverage_index(table, buffer.infos[found].glyph)?.is_none() {
 			return Ok(false);
 		}
+		position = found;
 	}
+	let mut position = at;
 	for offset in 0..lookahead_count {
+		let Some(found) = lookup.next(buffer, position)? else { return Ok(false) };
 		let at_coverage = subtable.u16_at(lookahead_at / 2 + offset).ok_or_else(bad)? as usize;
 		let table = subtable.slice(at_coverage, subtable.len().checked_sub(at_coverage).ok_or_else(bad)?).ok_or_else(bad)?;
-		let Some(info) = buffer.infos.get(at + offset + 1) else { return Ok(false) };
-		if coverage_index(table, info.glyph)?.is_none() {
+		if coverage_index(table, buffer.infos[found].glyph)?.is_none() {
 			return Ok(false);
 		}
+		position = found;
 	}
 	let replacement = subtable.u16_at(glyphs_at / 2 + index as usize).ok_or_else(bad)?;
 	buffer.substitute(at, replacement);

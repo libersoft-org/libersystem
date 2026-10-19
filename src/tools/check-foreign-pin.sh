@@ -1,5 +1,5 @@
 #!/bin/bash
-# P02M0135's lockfile, checked against the tree it pins.
+# The foreign substrate's lockfile, checked against the tree it pins.
 #
 # A LOCKFILE NOTHING READS IS A COMMENT. Its whole purpose is that a value cannot drift from what was
 # frozen without something failing, and "something" has to be a check rather than a reader's memory.

@@ -288,10 +288,8 @@ impl Ring {
 	// released nothing leaked a page per attach - which on a port somebody plugs and unplugs is a
 	// leak with a person operating it.
 	fn release(&mut self) {
-		if self.handle != 0 {
-			close(self.handle);
-			self.handle = 0;
-		}
+		common::release_dma(self.handle);
+		self.handle = 0;
 	}
 
 	// Push one TRB, following the link TRB (and toggling the cycle state) on wrap.
@@ -362,7 +360,7 @@ impl Streams {
 			let (handle, virt, phys) = dma_page()?;
 			// Sixteen bytes an entry, and the page bounds how many there can be.
 			if count as u64 * 16 > 4096 {
-				close(handle);
+				common::release_dma(handle);
 				return None;
 			}
 			// EVERY DRIVEN STREAM MUST HAVE AN ENTRY, and a device that advertises fewer entries than
@@ -370,7 +368,7 @@ impl Streams {
 			// rather than clamped, because a clamp silently gives back a transport with fewer tags than
 			// the caller was told it has.
 			if count <= DRIVEN_STREAMS {
-				close(handle);
+				common::release_dma(handle);
 				return None;
 			}
 			let mut rings: [Ring; DRIVEN_STREAMS as usize] = [const { Ring { virt: 0, phys: 0, index: 0, cycle: 1, handle: 0 } }; DRIVEN_STREAMS as usize];
@@ -382,7 +380,7 @@ impl Streams {
 					for ring in rings.iter_mut() {
 						ring.release();
 					}
-					close(handle);
+					common::release_dma(handle);
 					return None;
 				};
 				rings[slot] = built;
@@ -424,7 +422,7 @@ impl Streams {
 			ring.release();
 		}
 		if self.handle != 0 {
-			close(self.handle);
+			common::release_dma(self.handle);
 			self.handle = 0;
 			self.virt = 0;
 		}
@@ -562,10 +560,8 @@ impl UsbDevice {
 		}
 		self.ep0.release();
 		for handle in [&mut self.ctx_handle, &mut self.in_handle, &mut self.data_handle] {
-			if *handle != 0 {
-				close(*handle);
-				*handle = 0;
-			}
+			common::release_dma(*handle);
+			*handle = 0;
 		}
 	}
 }
@@ -1257,6 +1253,13 @@ fn command_and_wait(hc: &mut Xhci, param: u64, status: u32, control: u32) -> Opt
 		return None;
 	}
 	Some(ev_control >> 24)
+}
+
+// EVERY ENDPOINT BUT THE DEFAULT ONE DECONFIGURED: a Configure Endpoint with Deconfigure set. A binding that failed
+// after its transfers went out gives its rings and pages back for real while the device stays addressed, and until
+// this has completed a transfer still standing on one of them could complete into a page somebody else holds now.
+pub(crate) fn deconfigure(hc: &mut Xhci, dev: &UsbDevice) {
+	let _ = command_and_wait(hc, 0, 0, TRB_CONFIGURE_ENDPOINT << 10 | 1 << 9 | dev.slot << 24);
 }
 
 // Bring up the device on root-hub port `port`: reset the port if a device is
@@ -2449,6 +2452,10 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 		// holds it: the ones bound to a role live in their own structures, and the rest live
 		// in the inventory. Disabling the slot without closing the pages - which is what this
 		// did - leaks three pages per attach on a port somebody plugs and unplugs.
+		//
+		// THE SLOT GOES FIRST, THEN WHAT ITS ENDPOINTS NAMED. A class module's rings and pages are given back
+		// for real - unmapped, so their frames are free for the next owner - and until Disable Slot has completed
+		// the controller may still read a ring or write a page its endpoint context names.
 		let Hids { entries, pads } = hids;
 		for (dev, interfaces) in entries.iter_mut().filter(|(dev, _)| dev.port == port) {
 			// Stop retaining this generation before releasing pages or waiting for Disable Slot.
@@ -2457,10 +2464,10 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 			// EVERY GAMEPAD OF EVERY INTERFACE DEPARTS FIRST, before its rings and pages are released: the
 			// detach used to release the device and tell nobody.
 			depart(pads, interfaces);
+			dev.release(hc);
 			for hid in interfaces.iter_mut() {
 				hid.release();
 			}
-			dev.release(hc);
 			// AND THE CHARGE GOES BACK WITH THE PAGES, ONCE PER DEVICE. A release that gave the memory back
 			// and kept the budget would turn a port somebody plugs and unplugs into a controller that stops
 			// accepting keyboards.
@@ -2470,16 +2477,16 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 		if let Some((dev, st)) = storage.as_mut()
 			&& dev.port == port
 		{
-			st.release();
 			dev.release(hc);
+			st.release();
 			hc.budget.release(ClassKind::Storage);
 			*storage = None;
 		}
 		if let Some((dev, target)) = uas.as_mut()
 			&& dev.port == port
 		{
-			target.release();
 			dev.release(hc);
+			target.release();
 			hc.budget.release(ClassKind::Uas);
 			*uas = None;
 		}
@@ -2488,8 +2495,8 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 		{
 			hc.net_notify_rx = None;
 			hc.net_notify_pending = None;
-			net.release();
 			dev.release(hc);
+			net.release();
 			hc.budget.release(ClassKind::Network);
 			hc.net_rx = None;
 			hc.net_pending = None;
@@ -2503,6 +2510,8 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 		// ordinary adapter and two for a composite one.
 		if let Some(at) = serials.devices.iter().position(|device| device.port == port) {
 			let slot = serials.devices[at].slot;
+			let mut gone = serials.devices.remove(at);
+			gone.release(hc);
 			for index in (0..serials.ports.len()).rev() {
 				if serials.ports[index].slot() != slot {
 					continue;
@@ -2516,19 +2525,18 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 				hc.serial_rx[index] = None;
 				hc.serial_pending[index] = None;
 			}
-			let mut gone = serials.devices.remove(at);
-			gone.release(hc);
 			hc.budget.release(ClassKind::Serial);
 		}
 		// AND THE AUDIO SINK, on the same terms: its ring and its slot go back, and the
 		// class budget with them, or a device unplugged and plugged in again is refused by
 		// a budget still holding the first one's place.
-		for mut dev in audio.take_port(port) {
+		for (mut dev, mut gone) in audio.take_port(port) {
 			if hc.audio_rx.iter().any(|&(slot, _)| slot == dev.slot) {
 				hc.audio_rx.retain(|&(slot, _)| slot != dev.slot);
 				hc.audio_pending.clear();
 			}
 			dev.release(hc);
+			gone.release();
 			hc.budget.release(ClassKind::Audio);
 		}
 		// AND EVERY CLASS MODULE ON THIS PORT: its pipes, its device and its budget line now, and its

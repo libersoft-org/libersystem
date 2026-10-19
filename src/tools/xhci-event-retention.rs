@@ -5,6 +5,9 @@
 extern crate alloc;
 extern crate self as driver_protocol;
 extern crate self as drivers;
+// THE SHARED HID BINDING SAYS `use rt::*;`, and rt's output is this fixture's: its sends, prints and clock are the ones
+// modeled here, at the crate root.
+extern crate self as rt;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -15,10 +18,6 @@ use usb_class::ClassKind;
 /* EXACT_MODULES */
 
 static NOW: AtomicU64 = AtomicU64::new(100);
-static KEY_SINK: AtomicU64 = AtomicU64::new(0);
-static TRUSTED_KEY_SINK: AtomicU64 = AtomicU64::new(0);
-static PTR_SINK: AtomicU64 = AtomicU64::new(77);
-static TOUCH_SINK: AtomicU64 = AtomicU64::new(0);
 static SENT: Mutex<Vec<(u64, Vec<u8>)>> = Mutex::new(Vec::new());
 static PRINTED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static CLOSED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -74,6 +73,12 @@ mod common {
 	pub enum ProviderReady {
 		Consumer(usize),
 		Device(usize),
+	}
+	// A DMA buffer given back: the fixture's memory is its own, and the close is what it records.
+	pub fn release_dma(handle: u64) {
+		if handle != 0 {
+			super::close(handle);
+		}
 	}
 	pub struct Serving(pub Vec<(u32, u64)>);
 	impl Serving {
@@ -177,6 +182,11 @@ impl Fixture {
 		SENT.lock().unwrap().clear();
 		PRINTED.lock().unwrap().clear();
 		CLOSED.lock().unwrap().clear();
+		// The pointer reports go to sink 77, through the shared binding's own sinks; nothing else has one.
+		usb_input::PTR_SINK.store(77, Ordering::SeqCst);
+		for sink in [&usb_input::KEY_SINK, &usb_input::TRUSTED_KEY_SINK, &usb_input::TOUCH_SINK] {
+			sink.store(0, Ordering::SeqCst);
+		}
 		let mut arena = Arena(Vec::new());
 		let evt = arena.page();
 		let hc = Xhci { op: arena.page(), ir0: arena.page(), db: arena.page(), cmd: arena.ring(), evt_virt: evt, evt_phys: evt, evt_index: 0, evt_cycle: 1, dcbaa_virt: arena.page(), ports_changed: port::PortSignal::new(), budget: usb_class::Budget::new(), net_rx: None, net_pending: None, net_notify_rx: None, net_notify_pending: None, hid_rx: Vec::new(), hid_pending: Vec::new(), serial_rx: [None; usb_serial::MAX_PORTS], serial_pending: [None; usb_serial::MAX_PORTS], class_rx: Vec::new(), class_pending: Vec::new(), audio_rx: Vec::new(), audio_pending: Vec::new() };
@@ -254,7 +264,7 @@ impl Fixture {
 		}
 		let layout = hid::parse(&descriptor);
 		assert_eq!(layout.report_bytes(), 3);
-		Hid { iface: 0, dci, ring: self.arena.ring(), page: Page { handle: page, virt: page, phys: page }, layout, posted: false, prevs: Vec::new(), mods: Mods::default(), x: 0, y: 0, buttons: 0, pads: Vec::new() }
+		Hid { dci, ring: self.arena.ring(), page: Page { handle: page, virt: page, phys: page }, posted: false, input: Input::new(0, layout, b"driver.xhci") }
 	}
 	fn hids(&mut self, slot: u32, port: u32) -> Hids {
 		let dev = self.dev(slot, port);
@@ -301,9 +311,10 @@ fn assert_ring_consumed(f: &Fixture, count: u64) {
 }
 fn assert_pointer_once(hids: &Hids, message: &str) {
 	assert_eq!(SENT.lock().unwrap().as_slice(), &[(77, vec![4, 0, 5, 0, 1, 0])], "{message}");
+	// The decoded state is the shared binding's own; what it decoded is the report above, and the next report TRB is
+	// posted behind the one consumed.
 	let h = &hids.entries[0].1[0];
-	assert_eq!((h.x, h.y, h.buttons, h.ring.index), (4, 5, 1, 2));
-	assert_eq!(h.prevs[0].1[..3], [1, 4, 5]);
+	assert_eq!(h.ring.index, 2);
 }
 
 fn command_cdc() {

@@ -194,6 +194,61 @@ impl Fault {
 	}
 }
 
+/// WHAT ONE RECOVERED I/O COMMAND ASKS OF ITS CONTROLLER: the driver's own, and a model of one in the host tests -
+/// the recovery is decided once, in `recovered`, and the driver only issues, resets and says.
+pub trait Recover {
+	/// The request, issued as often as the recovery needs: a read or a write of the same blocks from the same span, or a
+	/// flush, is the same request twice.
+	type Io: Copy;
+	/// Issue it once, and wait for its completion inside the I/O bound.
+	fn issue(&mut self, io: Self::Io) -> Result<(), Fault>;
+	/// Reset the controller - which ends whatever it was doing - and make its queues again: whether it came back.
+	fn reset(&mut self) -> bool;
+	/// Whether a reset failed and none has succeeded since.
+	fn down(&self) -> bool;
+	/// A line of what happened, for the log.
+	fn say(&mut self, line: &[u8]);
+}
+
+/// ONE I/O COMMAND, RECOVERED.
+///
+/// A command the controller answered is answered with its status. One that never came back, or came back as another
+/// command's, may still be running against the data span (`Fault::needs_reset`): the controller is reset, which ends
+/// it, its queues are made again, and the command is issued once more. NOTHING IS ANSWERED WHILE A COMMAND THE DRIVER
+/// GAVE UP ON MAY STILL BE MOVING BYTES, so a second failure of that kind resets the controller again before it is
+/// reported. A controller that could not be reset is tried again at the next request, and nothing is issued to it
+/// until a reset succeeds.
+pub fn recovered<R: Recover>(controller: &mut R, io: R::Io) -> Result<(), Fault> {
+	if controller.down() {
+		if !controller.reset() {
+			return Err(Fault::Down);
+		}
+		controller.say(b"driver.nvme: the controller is back from its reset and its queues are made again\n");
+	}
+	let first = controller.issue(io);
+	let Err(fault) = first else { return first };
+	if !fault.needs_reset() || !recover(controller) {
+		return first;
+	}
+	let again = controller.issue(io);
+	if let Err(fault) = again
+		&& fault.needs_reset()
+	{
+		recover(controller);
+	}
+	again
+}
+
+// Reset after a command that did not come back as itself, and say so.
+fn recover<R: Recover>(controller: &mut R) -> bool {
+	controller.say(b"driver.nvme: a command did not come back as itself - the controller is reset before anyone is answered\n");
+	let back = controller.reset();
+	if !back {
+		controller.say(b"driver.nvme: the controller did not come back from its reset - requests are refused until it does\n");
+	}
+	back
+}
+
 // What a completion turned out to be. THE UNEXPECTED ID IS ITS OWN ARM and not an error, because
 // the two call for opposite actions: a failed command is reported to the caller that made it, and a
 // completion carrying an id nobody is waiting for means the controller and this driver disagree

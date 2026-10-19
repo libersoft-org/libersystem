@@ -392,7 +392,13 @@ impl Ehci {
 			print(line.as_bytes());
 			return;
 		}
-		line.push(b" device - handed to its companion controller\n");
+		// A SHIPPING IMAGE CARRIES NO COMPANION DRIVER - the OHCI and UHCI drivers are development-only until a target
+		// needs them - so there the hand-over is said as what it is: the device is on a controller nothing drives.
+		if cfg!(feature = "development") {
+			line.push(b" device - handed to its companion controller\n");
+		} else {
+			line.push(b" device - handed to its companion controller, which this image does not drive: it is left unbound\n");
+		}
 		print(line.as_bytes());
 		let value = self.portsc(port);
 		self.set_portsc(port, (value & !PORT_WC) | PORT_OWNER);

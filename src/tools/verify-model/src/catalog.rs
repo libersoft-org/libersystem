@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 194] = [
+const GATES: [(&str, &str); 195] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -404,6 +404,10 @@ const GATES: [(&str, &str); 194] = [
 	// services they reach - with QMP's input events, device_del and device_add as the oracles' hands. Its subject is the
 	// drivers and the kernel mechanism they stand on.
 	("usb-legacy", "kernel"),
+	// WHAT A DEPARTED USB DEVICE HELD, GIVEN BACK, on the ordinary development machine's xHCI: the stick out, one of the
+	// gate's own in, read and out again, with the driver's Domain's DMA memory read through DeviceManager before and
+	// after. Its subject is the driver and the kernel's DMA accounting it is read against.
+	("usb-release", "kernel"),
 	// MODEMSERVICE AND NETWORKSERVICE'S RAW-IP LINK, against the in-guest modem fixture: four separate
 	// authorities, PIN handling without replay, traffic through ordinary network calls, context loss,
 	// rollback, uplink replacement and fallback and reclamation, on a machine with no NIC and one with.
@@ -964,7 +968,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 93] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 94] = [
 	"dma-mode-x86_64",
 	// The lab machine the audio device model is driven on, with a card hot-plugged under a playing stream.
 	"audio-routing",
@@ -989,6 +993,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 93] = [
 	"balloon",
 	"memory-hotplug",
 	"usb-legacy",
+	"usb-release",
 	"qemu-modem-service",
 	"qemu-camera-service",
 	"qemu-midi-service",
@@ -1103,6 +1108,7 @@ pub const EXCLUSIVE_GUEST_GATES: &[&str] = &[
 	"balloon",
 	"memory-hotplug",
 	"usb-legacy",
+	"usb-release",
 	"qemu-modem-service",
 	"qemu-camera-service",
 	"qemu-midi-service",

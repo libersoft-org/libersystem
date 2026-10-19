@@ -196,10 +196,10 @@ impl Audio {
 				sink.waiting = 0;
 			}
 			sink.ring.release();
-			close(sink.page);
+			common::release_dma(sink.page);
 			if let Some(feedback) = sink.feedback.as_mut() {
 				feedback.ring.release();
-				close(feedback.page);
+				common::release_dma(feedback.page);
 			}
 		}
 		if let Some(source) = self.source.as_mut() {
@@ -209,7 +209,7 @@ impl Audio {
 				source.waiting = 0;
 			}
 			source.ring.release();
-			close(source.page);
+			common::release_dma(source.page);
 		}
 	}
 }
@@ -246,14 +246,14 @@ impl Devices {
 
 	/// Take every audio device on `port` off the bus: its streams released and its device handed back to the
 	/// caller, which releases its slot and its budget line.
-	pub fn take_port(&mut self, port: u32) -> Vec<UsbDevice> {
+	/// The devices on `port`, with their audio: the caller releases the device - its slot disabled - before the audio's
+	/// rings and pages, which the slot's endpoints name until then.
+	pub fn take_port(&mut self, port: u32) -> Vec<(UsbDevice, Audio)> {
 		let mut gone = Vec::new();
 		let mut at = 0;
 		while at < self.list.len() {
 			if self.list[at].0.port == port {
-				let (dev, mut audio) = self.list.remove(at);
-				audio.release();
-				gone.push(dev);
+				gone.push(self.list.remove(at));
 			} else {
 				at += 1;
 			}

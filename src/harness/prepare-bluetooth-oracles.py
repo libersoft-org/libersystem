@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare pinned host-only P02M0194 dependencies; never install into the guest image."""
+"""Prepare the Bluetooth gates' pinned host-only dependencies; never install them into the guest image."""
 import argparse
 import hashlib
 import io

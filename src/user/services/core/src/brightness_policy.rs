@@ -42,6 +42,10 @@ include!(concat!(env!("OUT_DIR"), "/roles_brightness_policy.rs"));
 
 // How long one question to DisplayService, ConfigService, PowerService, InputService or a sensor may take.
 const ASK_TICKS: u64 = TICKS_PER_SECOND * 2;
+// HOW LONG A SET MAY TAKE: longer than DisplayService gives the backlight it forwards to - two seconds - so its answer,
+// a level or `timed-out`, always comes before this gives up. The two were equal, and a set the backlight missed left
+// DisplayService's answer queued for the next set to read as its own.
+const SET_TICKS: u64 = ASK_TICKS + TICKS_PER_SECOND;
 // How long a level must hold before it is stored.
 const SETTLE_TICKS: u64 = TICKS_PER_SECOND * logic::SETTLE_SECONDS;
 // The most `CONTROL` connections at once.
@@ -229,7 +233,15 @@ impl Service {
 		if self.control == 0 {
 			return Err(Error::Closed);
 		}
-		match display_brightness_control::Client::with_deadline(ChannelTransport { chan: self.control }, clock() + ASK_TICKS).set(key, target, &allow_zero) {
+		// AN ANSWER NOBODY WAITS FOR ANY MORE goes first. Every call here starts its correlation afresh, so a reply left
+		// by one that gave up would read as this one's - and every later set would read its predecessor's answer.
+		let mut stale = [0u8; 256];
+		while let PolledCaps::Message { handles, .. } = try_recv_caps(self.control, &mut stale) {
+			for &handle in handles.as_slice() {
+				close(handle);
+			}
+		}
+		match display_brightness_control::Client::with_deadline(ChannelTransport { chan: self.control }, clock() + SET_TICKS).set(key, target, &allow_zero) {
 			Some(answer) => answer,
 			None => Err(Error::TimedOut),
 		}

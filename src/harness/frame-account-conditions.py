@@ -39,10 +39,13 @@ def running_qemu(arch):
             args = (proc / "cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
         except (OSError, UnicodeDecodeError):
             continue
-        if args and pathlib.Path(args[0]).name == "qemu-system-" + arch:
+        # THE GUEST'S QEMU, and only it: the one the cold runner staged a boot ESP for. Every port boot first runs a
+        # short-lived QEMU of its own to ask the machine what it offers (`port_iommu_probe`), and one caught here had
+        # no ESP - the capture failed on it, and with it the whole run.
+        if args and pathlib.Path(args[0]).name == "qemu-system-" + arch and (ROOT / f".build/boot/esp-{arch}.{proc.name}.img").exists():
             found.append((proc, args))
     if len(found) != 1:
-        raise SystemExit(f"frame-account-conditions: expected one {arch} QEMU, found {len(found)}")
+        raise SystemExit(f"frame-account-conditions: expected one {arch} guest QEMU with its boot ESP, found {len(found)}")
     return found[0]
 
 

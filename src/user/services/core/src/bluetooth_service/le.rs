@@ -51,11 +51,28 @@ pub(crate) struct LeState {
 	pub rotate: bool,
 	// The private address asked for and not yet confirmed: it becomes `own` only when the controller accepts it.
 	pub pending_own: Option<[u8; 6]>,
+	// THE STANDING ATTEMPT'S REBUILD, fed to the controller's queue as it has room: the resolving switch, the two lists
+	// cleared and filled with every absent bonded peripheral, and - once all of it is queued - the attempt (`arming`).
+	// In one burst it overran the sixteen-command queue past five or six such peers, and the attempt, queued last, was
+	// the command refused: none of them reconnected at all.
+	pub rebuild: VecDeque<(u16, Vec<u8>)>,
+	pub arming: bool,
+	// THE STANDING ATTEMPT TAKEN UP AGAIN AT THIS TICK, after one that ended on its own without a link.
+	pub rearm_at: Option<u64>,
 }
 
 impl LeState {
 	pub fn new() -> LeState {
-		LeState { irk: None, own: None, rotate_at: 0, irks: Vec::new(), accepting: false, legacy: None, relist: false, rotate: false, pending_own: None }
+		LeState { irk: None, own: None, rotate_at: 0, irks: Vec::new(), accepting: false, legacy: None, relist: false, rotate: false, pending_own: None, rebuild: VecDeque::new(), arming: false, rearm_at: None }
+	}
+
+	// The rebuild given up: its resolving entries carry keys, and each is zeroed first.
+	pub fn clear_rebuild(&mut self) {
+		for (_, params) in self.rebuild.iter_mut() {
+			scrub(params);
+		}
+		self.rebuild.clear();
+		self.arming = false;
 	}
 
 	// THE ADDRESS THIS HOST USES on a new LE link, as SMP's derivations take it.
@@ -89,6 +106,8 @@ impl LeState {
 		self.relist = false;
 		self.rotate = false;
 		self.pending_own = None;
+		self.clear_rebuild();
+		self.rearm_at = None;
 	}
 }
 
@@ -221,24 +240,26 @@ impl Stack {
 		let own_irk = self.controllers[at].le.irk.unwrap_or([0; 16]);
 		let irks = self.controllers[at].le.irks.clone();
 		let controller = &mut self.controllers[at];
-		controller.command(opcode::LE_SET_ADDRESS_RESOLUTION_ENABLE, &[0]);
-		controller.command(opcode::LE_CLEAR_FILTER_ACCEPT_LIST, &[]);
-		controller.command(opcode::LE_CLEAR_RESOLVING_LIST, &[]);
+		// A REBUILD STILL BEING FED is replaced: this one clears both lists first and lists what is wanted now.
+		controller.le.clear_rebuild();
+		controller.le.rearm_at = None;
+		let rebuild = &mut controller.le.rebuild;
+		rebuild.push_back((opcode::LE_SET_ADDRESS_RESOLUTION_ENABLE, alloc::vec![0]));
+		rebuild.push_back((opcode::LE_CLEAR_FILTER_ACCEPT_LIST, Vec::new()));
+		rebuild.push_back((opcode::LE_CLEAR_RESOLVING_LIST, Vec::new()));
 		for peer in &wanted {
 			let mut address = [0u8; 6];
 			address.copy_from_slice(&peer[1..]);
-			controller.command(opcode::LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, &hci_codec::accept_list_entry(peer[0], &address));
+			rebuild.push_back((opcode::LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, hci_codec::accept_list_entry(peer[0], &address).to_vec()));
 			if let Some((_, irk)) = irks.iter().find(|(held, _)| held == peer) {
 				let mut entry = hci_codec::resolving_list_entry(peer[0], &address, irk, &own_irk);
-				controller.command(opcode::LE_ADD_DEVICE_TO_RESOLVING_LIST, &entry);
+				rebuild.push_back((opcode::LE_ADD_DEVICE_TO_RESOLVING_LIST, entry.to_vec()));
 				scrub(&mut entry);
 			}
 		}
-		controller.command(opcode::LE_SET_ADDRESS_RESOLUTION_ENABLE, &[1]);
-		let own = controller.le.own_type();
-		if controller.le_create_connection(&hci_codec::create_connection_accepted(own)) {
-			controller.le.accepting = true;
-		}
+		rebuild.push_back((opcode::LE_SET_ADDRESS_RESOLUTION_ENABLE, alloc::vec![1]));
+		controller.le.arming = true;
+		controller.feed_rebuild();
 	}
 
 	// THE ACCEPT LIST FOLLOWS THE BONDS: a peer trusted, no longer trusted or forgotten changes what the standing attempt
@@ -255,9 +276,15 @@ impl Stack {
 		self.reconnect_bonded(at);
 	}
 
-	// SET THE STANDING ATTEMPT ASIDE for one the operator asked for; it is taken up again when that one ends.
+	// SET THE STANDING ATTEMPT ASIDE for one the operator asked for; it is taken up again when that one ends. A rebuild
+	// still being fed goes too, and so do the marks a cancellation already out was for: the attempt taken up again
+	// lists what is wanted then, and an address whose time is up is rotated by the next timer pass.
 	fn set_aside(&mut self, at: usize) {
 		let controller = &mut self.controllers[at];
+		controller.le.clear_rebuild();
+		controller.le.rearm_at = None;
+		controller.le.relist = false;
+		controller.le.rotate = false;
 		if controller.le.accepting {
 			controller.command(opcode::LE_CREATE_CONNECTION_CANCEL, &[]);
 			controller.le.accepting = false;

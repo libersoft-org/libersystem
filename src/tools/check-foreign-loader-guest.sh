@@ -39,6 +39,12 @@
 #                               The refusals - drivers answering 0, 1 or 7 - need drivers no image
 #                               stages; the discovery crate's host suite asserts them through the same
 #                               entry point.
+#   NO SECOND WAY TO LOAD A   `VK_LUNARG_direct_driver_loading` hands the loader a driver's own lookup
+#     DRIVER                    in the create info, and upstream negotiates with it directly - at 7, with
+#                               no substrate between them - and takes the physical-device function out of
+#                               it. The port removes the path: the extension is not listed, and an
+#                               instance enabling it with the bound ICD's own lookup is refused with
+#                               `VK_ERROR_EXTENSION_NOT_PRESENT` without that lookup being called once.
 #   AND THE INSTANCE FAILS    with `VK_ERROR_INCOMPATIBLE_DRIVER`, which is the honest outcome and
 #                               not a shortfall: the synthetic ICD implements no Vulkan entry point,
 #                               because this milestone exports no Vulkan ABI. The loader found a
@@ -101,6 +107,10 @@ expect "enabled layer refused by name" "a query naming a layer must be refused r
 expect "instance with a layer refused by name" "an instance creation enabling a layer must be refused by name"
 expect "loader lookup address" "the loader must answer out of its own table, which is its own code running"
 expect "instance result=4294967287" "with a driver that implements nothing, VK_ERROR_INCOMPATIBLE_DRIVER is the honest answer"
+expect "direct driver loading not advertised" "the port removes VK_LUNARG_direct_driver_loading, so the loader must not list it"
+expect "direct driver instance result=4294967289" "an instance enabling VK_LUNARG_direct_driver_loading must be refused with VK_ERROR_EXTENSION_NOT_PRESENT"
+expect "direct driver lookups=0" "the driver lookup handed to the loader in the create info must never be called"
+expect "direct driver loading refused" "a driver handed to the loader in the create info must not be loaded"
 # THE NEGOTIATION'S LINE, read from the whole log: the probe's filtered lines stop at a colon, and this one has three.
 interface="vkprobe: foreign: icd interface: loader asked 7, substrate offered 6, driver answered 6 - agreed 6"
 grep -a -qF "$interface" "$GUEST_LOG" || {

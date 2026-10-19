@@ -1,4 +1,4 @@
-# THE BOOTSTRAP PART OF P02M0135's LOCKFILE. Frozen after the bootstrap inputs exist, and it gates
+# THE BOOTSTRAP PART OF THE FOREIGN SUBSTRATE'S LOCKFILE. Frozen after the bootstrap inputs exist, and it gates
 # pass 1.
 #
 # WHAT BELONGS IN THIS PART AND WHAT DOES NOT. Everything here has its CONTENT decided independently
@@ -177,8 +177,10 @@ riscv64 = { path = "src/foreign/cross/riscv64.cmake", target = "riscv64-unknown-
 # REFROZEN 2026-09-11, for a README change and nothing else. The profile sysroot now exists, so this
 # one-s README says where it is and what the difference between them is; no header moved, which is
 # what the archives prove independently - they reproduce bit for bit under both sysroots.
+# REFROZEN 2026-10-19, for a README change and nothing else: it names the profile it serves rather than
+# a planning identifier. No header moved.
 path = "src/foreign/bootstrap-sysroot"
-digest = "7dfc0825994fa2843d444dbde830e7b35ad776a40f05b82ed62d20d570cc31fd"
+digest = "9851480c1421eea977bf9d43cee1ff472a5e961d42094b7ca46e16d72d59002c"
 headers = [
 	"alloca.h",
 	"assert.h",

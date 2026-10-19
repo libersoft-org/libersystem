@@ -829,7 +829,13 @@ def run_step(step, guest, lab, limit, index):
 		answer = lab.serial_sh(step['command'], int(limit))
 		if answer is None:
 			raise ScenarioError(f'{where}: the serial console did not answer {step["command"]!r} at a prompt within {int(limit)} s - or this run has no serial broker (`scenario-cold --serial-broker`)')
-		if step['contains'] not in answer:
+		# WHAT THE COMMAND PRINTED, AFTER ITS ECHO, from a command the shell ran. The echo carries the command's own
+		# words - an `echo` step's whole text - so the answer read as given when the shell had refused the command and
+		# quoted it back ("unknown command: cho ...").
+		if 'unknown command' in answer:
+			raise ScenarioError(f'{where}: the serial console refused {step["command"]!r}: {answer[-300:]!r}')
+		printed = '\n'.join(line for line in answer.replace('\r', '').split('\n') if step['command'] not in line)
+		if step['contains'] not in printed:
 			raise ScenarioError(f'{where}: the serial console answered {step["command"]!r} without {step["contains"]!r}: {answer[-300:]!r}')
 	elif kind == 'kernel-console':
 		if not lab.kernel_console(step['request'], int(limit)):

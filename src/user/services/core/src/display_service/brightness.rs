@@ -65,6 +65,9 @@ struct Backlight {
 	battery_default: Option<u32>,
 	level: Option<u32>,
 	failed: bool,
+	// THE SET THAT EXPIRED while it is failed: its correlation and cause. Its client was told it timed out, but the
+	// provider may still carry it out, and its late answer is applied then as a timely one would have been.
+	late: Option<(u32, BrightnessCause)>,
 	// Whether anything has moved the level since the backlight appeared.
 	touched: bool,
 }
@@ -207,8 +210,11 @@ impl Brightness {
 
 	fn cancel(&mut self, pending: Pending, error: Error) {
 		match pending.call {
-			Call::Set { client, .. } => {
+			Call::Set { client, cause } => {
 				if let Some(at) = self.backlights.iter().position(|backlight| backlight.chan == pending.chan) {
+					if error == Error::TimedOut {
+						self.backlights[at].late = Some((pending.corr, cause));
+					}
 					self.fail(at);
 				}
 				self.answer(client, Err(error));
@@ -283,114 +289,134 @@ impl Brightness {
 			print(b"DisplayService: backlight ");
 			print(self.backlights[at].key.as_bytes());
 			print(b" answered again; it is back in the join\n");
+			// THE ANSWER TO THE SET THAT EXPIRED is applied as a timely one would have been: the level it answers is what
+			// the panel holds now, and the change is published - it answers nobody, its client was told it timed out.
+			// Dropped, the service went on reporting the old level, and the next key stepped from it.
+			if let Some((expired, cause)) = self.backlights[at].late.take()
+				&& Some(expired) == corr
+			{
+				let mut reader = wire::Reader::with_handle_list(&buf[..len], &handles);
+				let _ = reader.u32();
+				let level = (|| {
+					if !reader.tag()? {
+						return None;
+					}
+					let level = reader.u32()?;
+					reader.finish()?;
+					Some(level)
+				})();
+				if let Some(level) = level.filter(|&level| self.backlights[at].scale.contains(level)) {
+					self.backlights[at].level = Some(level);
+					self.backlights[at].touched = true;
+					let _ = self.change(at, cause);
+				}
+			}
 			self.rejoin();
 		}
 		if let Some(at) = self.pending.iter().position(|pending| pending.chan == channel && Some(pending.corr) == corr) {
+			// AN ANSWER THAT ARRIVED IS AN ANSWER, read in its deadline's own tick or not: taken as the timeout it was
+			// consumed, and nothing let the backlight back into the join.
 			let pending = self.pending.remove(at);
-			if clock() >= pending.deadline {
-				self.cancel(pending, Error::TimedOut);
-			} else {
-				let mut reader = wire::Reader::with_handle_list(&buf[..len], &handles);
-				let _ = reader.u32();
-				match pending.call {
-					Call::Open(info) => {
-						let opened = (|| {
-							if !reader.tag()? {
-								return None;
-							}
-							let _ = reader.u32()?;
-							let channel = reader.take_handle()?;
-							reader.finish()?;
-							Some(channel)
-						})();
-						if let Some(channel) = opened {
-							handles.clear();
-							self.issue(channel, backlight::OP_DESCRIBE, Call::Describe(info), |_| Some(()));
-						} else {
-							// A REFUSED OPEN is asked again too: the provider admits one consumer, and the refusal can be
-							// a predecessor's connection it has not yet seen close.
-							self.admission_failed(info);
+			let mut reader = wire::Reader::with_handle_list(&buf[..len], &handles);
+			let _ = reader.u32();
+			match pending.call {
+				Call::Open(info) => {
+					let opened = (|| {
+						if !reader.tag()? {
+							return None;
 						}
+						let _ = reader.u32()?;
+						let channel = reader.take_handle()?;
+						reader.finish()?;
+						Some(channel)
+					})();
+					if let Some(channel) = opened {
+						handles.clear();
+						self.issue(channel, backlight::OP_DESCRIBE, Call::Describe(info), |_| Some(()));
+					} else {
+						// A REFUSED OPEN is asked again too: the provider admits one consumer, and the refusal can be
+						// a predecessor's connection it has not yet seen close.
+						self.admission_failed(info);
 					}
-					Call::Describe(info) => {
-						let description = (|| {
-							if !reader.tag()? {
-								return None;
-							}
-							let description = BacklightDescription::read(&mut reader)?;
-							reader.finish()?;
-							Some(description)
-						})();
-						if let Some(description) = description {
-							if description.source == BacklightSource::Firmware {
-								self.issue(channel, backlight::OP_FIRMWARE_DISPLAY_ID, Call::DisplayId(info, description), |_| Some(()));
-							} else {
-								self.issue(channel, backlight::OP_GET, Call::Get(info, description, None), |_| Some(()));
-							}
-						} else {
-							close(channel);
+				}
+				Call::Describe(info) => {
+					let description = (|| {
+						if !reader.tag()? {
+							return None;
 						}
+						let description = BacklightDescription::read(&mut reader)?;
+						reader.finish()?;
+						Some(description)
+					})();
+					if let Some(description) = description {
+						if description.source == BacklightSource::Firmware {
+							self.issue(channel, backlight::OP_FIRMWARE_DISPLAY_ID, Call::DisplayId(info, description), |_| Some(()));
+						} else {
+							self.issue(channel, backlight::OP_GET, Call::Get(info, description, None), |_| Some(()));
+						}
+					} else {
+						close(channel);
 					}
-					Call::DisplayId(info, description) => {
-						let id = (|| {
-							if !reader.tag()? {
-								return None;
+				}
+				Call::DisplayId(info, description) => {
+					let id = (|| {
+						if !reader.tag()? {
+							return None;
+						}
+						let value = if reader.tag()? { Some(reader.u32()?) } else { None };
+						reader.finish()?;
+						Some(value)
+					})()
+					.flatten();
+					self.issue(channel, backlight::OP_GET, Call::Get(info, description, id), |_| Some(()));
+				}
+				Call::Get(info, description, display_id) => {
+					let level = (|| {
+						if !reader.tag()? {
+							let _ = Error::read(&mut reader)?;
+							reader.finish()?;
+							return Some(None);
+						}
+						let level = reader.u32()?;
+						reader.finish()?;
+						Some(Some(level))
+					})();
+					if let Some(level) = level {
+						self.issue(channel, backlight::OP_EVENTS, Call::Events(info, description, level, display_id), |_| Some(()));
+					} else {
+						close(channel);
+					}
+				}
+				Call::Events(info, description, level, display_id) => {
+					if len == 4 && handles.len() == 1 {
+						let events = handles.take_first();
+						self.admitted(info, channel, description, level, events, display_id);
+					} else {
+						close(channel);
+					}
+				}
+				Call::Set { client, cause } => {
+					let result = (|| {
+						let result = if reader.tag()? { Ok(reader.u32()?) } else { Err(Error::read(&mut reader)?) };
+						reader.finish()?;
+						Some(result)
+					})();
+					if let Some(at) = self.backlights.iter().position(|backlight| backlight.chan == channel) {
+						let result = match result {
+							Some(Ok(level)) if self.backlights[at].scale.contains(level) => {
+								self.backlights[at].level = Some(level);
+								self.backlights[at].touched = true;
+								Ok(BrightnessSet { level, serial: self.change(at, cause) })
 							}
-							let value = if reader.tag()? { Some(reader.u32()?) } else { None };
-							reader.finish()?;
-							Some(value)
-						})()
-						.flatten();
-						self.issue(channel, backlight::OP_GET, Call::Get(info, description, id), |_| Some(()));
-					}
-					Call::Get(info, description, display_id) => {
-						let level = (|| {
-							if !reader.tag()? {
-								let _ = Error::read(&mut reader)?;
-								reader.finish()?;
-								return Some(None);
+							Some(Err(error)) => Err(error),
+							_ => {
+								self.fail(at);
+								Err(Error::Io)
 							}
-							let level = reader.u32()?;
-							reader.finish()?;
-							Some(Some(level))
-						})();
-						if let Some(level) = level {
-							self.issue(channel, backlight::OP_EVENTS, Call::Events(info, description, level, display_id), |_| Some(()));
-						} else {
-							close(channel);
-						}
-					}
-					Call::Events(info, description, level, display_id) => {
-						if len == 4 && handles.len() == 1 {
-							let events = handles.take_first();
-							self.admitted(info, channel, description, level, events, display_id);
-						} else {
-							close(channel);
-						}
-					}
-					Call::Set { client, cause } => {
-						let result = (|| {
-							let result = if reader.tag()? { Ok(reader.u32()?) } else { Err(Error::read(&mut reader)?) };
-							reader.finish()?;
-							Some(result)
-						})();
-						if let Some(at) = self.backlights.iter().position(|backlight| backlight.chan == channel) {
-							let result = match result {
-								Some(Ok(level)) if self.backlights[at].scale.contains(level) => {
-									self.backlights[at].level = Some(level);
-									self.backlights[at].touched = true;
-									Ok(BrightnessSet { level, serial: self.change(at, cause) })
-								}
-								Some(Err(error)) => Err(error),
-								_ => {
-									self.fail(at);
-									Err(Error::Io)
-								}
-							};
-							self.answer(client, result);
-						} else {
-							self.answer(client, Err(Error::Closed));
-						}
+						};
+						self.answer(client, result);
+					} else {
+						self.answer(client, Err(Error::Closed));
 					}
 				}
 			}
@@ -531,7 +557,7 @@ impl Brightness {
 		print(b"DisplayService: backlight ");
 		print(description.key.as_bytes());
 		print(b" appeared\n");
-		self.backlights.push(Backlight { info, chan, events, key: description.key, kind, target, firmware_display_id, scale, ac_default: description.ac_default, battery_default: description.battery_default, level, failed: false, touched: false });
+		self.backlights.push(Backlight { info, chan, events, key: description.key, kind, target, firmware_display_id, scale, ac_default: description.ac_default, battery_default: description.battery_default, level, failed: false, late: None, touched: false });
 		self.rejoin();
 		let at = self.backlights.len() - 1;
 		self.change(at, BrightnessCause::Appeared);
@@ -692,9 +718,11 @@ impl Brightness {
 				close(handle);
 			}
 			let Some(event) = event else { continue };
-			// A STREAM THAT SPEAKS IS A PROVIDER THAT ANSWERS again.
+			// A STREAM THAT SPEAKS IS A PROVIDER THAT ANSWERS again - and its level is the panel's from here, whatever an
+			// expired set's late answer would say.
 			if self.backlights[at].failed {
 				self.backlights[at].failed = false;
+				self.backlights[at].late = None;
 				self.rejoin();
 			}
 			match event {

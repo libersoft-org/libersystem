@@ -3,6 +3,7 @@
 // mocks. The companion production-pair regression must prove HCI/SMP dispatch.
 extern crate alloc;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 /* EXACT_MODULES */
 mod service_logic {
 	pub use crate::bt_keys;

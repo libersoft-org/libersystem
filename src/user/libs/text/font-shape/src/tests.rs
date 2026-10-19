@@ -666,6 +666,327 @@ mod build {
 		tables.push((*b"maxp", maxp(glyphs)));
 		font(&tables)
 	}
+
+	/// A lookup with the flags given and one subtable - and, when the flags name one, the mark filtering
+	/// set, which the format puts after the subtable offsets.
+	pub fn flagged(kind: u16, flags: u16, subtable: std::vec::Vec<u8>, set: Option<u16>) -> std::vec::Vec<u8> {
+		let mut out = std::vec::Vec::new();
+		u16(&mut out, kind);
+		u16(&mut out, flags);
+		u16(&mut out, 1);
+		u16(&mut out, if set.is_some() { 10 } else { 8 });
+		if let Some(set) = set {
+			u16(&mut out, set);
+		}
+		out.extend_from_slice(&subtable);
+		out
+	}
+
+	fn anchor_bytes((x, y): (i16, i16)) -> std::vec::Vec<u8> {
+		let mut out = std::vec::Vec::new();
+		u16(&mut out, 1);
+		u16(&mut out, x as u16);
+		u16(&mut out, y as u16);
+		out
+	}
+
+	/// A ligature subtable: `first` and then `rest` become `result`.
+	pub fn ligature_subtable(first: u16, rest: &[u16], result: u16) -> std::vec::Vec<u8> {
+		let mut ligature = std::vec::Vec::new();
+		u16(&mut ligature, result);
+		u16(&mut ligature, rest.len() as u16 + 1);
+		for glyph in rest {
+			u16(&mut ligature, *glyph);
+		}
+		let mut set = std::vec::Vec::new();
+		u16(&mut set, 1);
+		u16(&mut set, 4);
+		set.extend_from_slice(&ligature);
+		let coverage = coverage(&[first]);
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, 8);
+		u16(&mut subtable, 1);
+		u16(&mut subtable, 8 + coverage.len() as u16);
+		subtable.extend_from_slice(&coverage);
+		subtable.extend_from_slice(&set);
+		subtable
+	}
+
+	/// A single substitution subtable, format 2.
+	pub fn single_subtable(from: u16, to: u16) -> std::vec::Vec<u8> {
+		let coverage = coverage(&[from]);
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 2);
+		u16(&mut subtable, 8);
+		u16(&mut subtable, 1);
+		u16(&mut subtable, to);
+		subtable.extend_from_slice(&coverage);
+		subtable
+	}
+
+	/// A pair subtable, format 1: `first` before `second` changes the first's advance by `kern`.
+	pub fn pair_subtable(first: u16, second: u16, kern: i16) -> std::vec::Vec<u8> {
+		let mut pair_set = std::vec::Vec::new();
+		u16(&mut pair_set, 1);
+		u16(&mut pair_set, second);
+		u16(&mut pair_set, kern as u16);
+		let coverage = coverage(&[first]);
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, 12);
+		u16(&mut subtable, 0x0004);
+		u16(&mut subtable, 0x0000);
+		u16(&mut subtable, 1);
+		u16(&mut subtable, 12 + coverage.len() as u16);
+		subtable.extend_from_slice(&coverage);
+		subtable.extend_from_slice(&pair_set);
+		subtable
+	}
+
+	/// A single adjustment subtable, format 1: every covered glyph is PLACED `(x, y)` off its pen.
+	pub fn placement_subtable(glyph: u16, (x, y): (i16, i16)) -> std::vec::Vec<u8> {
+		let coverage = coverage(&[glyph]);
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, 10);
+		u16(&mut subtable, 0x0003);
+		u16(&mut subtable, x as u16);
+		u16(&mut subtable, y as u16);
+		subtable.extend_from_slice(&coverage);
+		subtable
+	}
+
+	/// A mark-to-base or mark-to-mark subtable - the two share one layout: `marks` as `(glyph, class,
+	/// anchor)` and what they attach to as `(glyph, one anchor per class, or none)`.
+	pub fn mark_subtable(marks: &[(u16, u16, (i16, i16))], bases: &[(u16, std::vec::Vec<Option<(i16, i16)>>)], classes: u16) -> std::vec::Vec<u8> {
+		let mut sorted_marks = marks.to_vec();
+		sorted_marks.sort_by_key(|(glyph, _, _)| *glyph);
+		let mut sorted_bases = bases.to_vec();
+		sorted_bases.sort_by_key(|(glyph, _)| *glyph);
+		let mark_coverage = coverage(&sorted_marks.iter().map(|(glyph, _, _)| *glyph).collect::<std::vec::Vec<u16>>());
+		let base_coverage = coverage(&sorted_bases.iter().map(|(glyph, _)| *glyph).collect::<std::vec::Vec<u16>>());
+		let mut mark_array = std::vec::Vec::new();
+		u16(&mut mark_array, sorted_marks.len() as u16);
+		let mut at = 2 + 4 * sorted_marks.len();
+		let mut anchors = std::vec::Vec::new();
+		for (_, class, point) in &sorted_marks {
+			u16(&mut mark_array, *class);
+			u16(&mut mark_array, at as u16);
+			let bytes = anchor_bytes(*point);
+			at += bytes.len();
+			anchors.extend_from_slice(&bytes);
+		}
+		mark_array.extend_from_slice(&anchors);
+		let mut base_array = std::vec::Vec::new();
+		u16(&mut base_array, sorted_bases.len() as u16);
+		let mut at = 2 + 2 * classes as usize * sorted_bases.len();
+		let mut anchors = std::vec::Vec::new();
+		for (_, points) in &sorted_bases {
+			for class in 0..classes as usize {
+				match points.get(class).copied().flatten() {
+					Some(point) => {
+						u16(&mut base_array, at as u16);
+						let bytes = anchor_bytes(point);
+						at += bytes.len();
+						anchors.extend_from_slice(&bytes);
+					}
+					None => u16(&mut base_array, 0),
+				}
+			}
+		}
+		base_array.extend_from_slice(&anchors);
+		let mark_coverage_at = 12usize;
+		let base_coverage_at = mark_coverage_at + mark_coverage.len();
+		let mark_array_at = base_coverage_at + base_coverage.len();
+		let base_array_at = mark_array_at + mark_array.len();
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, mark_coverage_at as u16);
+		u16(&mut subtable, base_coverage_at as u16);
+		u16(&mut subtable, classes);
+		u16(&mut subtable, mark_array_at as u16);
+		u16(&mut subtable, base_array_at as u16);
+		subtable.extend_from_slice(&mark_coverage);
+		subtable.extend_from_slice(&base_coverage);
+		subtable.extend_from_slice(&mark_array);
+		subtable.extend_from_slice(&base_array);
+		subtable
+	}
+
+	/// A mark-to-ligature subtable, one mark class: `marks` as `(glyph, anchor)` and one ligature with
+	/// an anchor per component.
+	pub fn mark_ligature_subtable(marks: &[(u16, (i16, i16))], ligature: u16, components: &[(i16, i16)]) -> std::vec::Vec<u8> {
+		let mark_coverage = coverage(&marks.iter().map(|(glyph, _)| *glyph).collect::<std::vec::Vec<u16>>());
+		let ligature_coverage = coverage(&[ligature]);
+		let mut mark_array = std::vec::Vec::new();
+		u16(&mut mark_array, marks.len() as u16);
+		let mut at = 2 + 4 * marks.len();
+		let mut anchors = std::vec::Vec::new();
+		for (_, point) in marks {
+			u16(&mut mark_array, 0);
+			u16(&mut mark_array, at as u16);
+			let bytes = anchor_bytes(*point);
+			at += bytes.len();
+			anchors.extend_from_slice(&bytes);
+		}
+		mark_array.extend_from_slice(&anchors);
+		// The ligature attach table: a component count and one anchor offset per component.
+		let mut attach = std::vec::Vec::new();
+		u16(&mut attach, components.len() as u16);
+		let mut at = 2 + 2 * components.len();
+		let mut anchors = std::vec::Vec::new();
+		for point in components {
+			u16(&mut attach, at as u16);
+			let bytes = anchor_bytes(*point);
+			at += bytes.len();
+			anchors.extend_from_slice(&bytes);
+		}
+		attach.extend_from_slice(&anchors);
+		let mut ligature_array = std::vec::Vec::new();
+		u16(&mut ligature_array, 1);
+		u16(&mut ligature_array, 4);
+		ligature_array.extend_from_slice(&attach);
+		let mark_coverage_at = 12usize;
+		let ligature_coverage_at = mark_coverage_at + mark_coverage.len();
+		let mark_array_at = ligature_coverage_at + ligature_coverage.len();
+		let ligature_array_at = mark_array_at + mark_array.len();
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, mark_coverage_at as u16);
+		u16(&mut subtable, ligature_coverage_at as u16);
+		u16(&mut subtable, 1);
+		u16(&mut subtable, mark_array_at as u16);
+		u16(&mut subtable, ligature_array_at as u16);
+		subtable.extend_from_slice(&mark_coverage);
+		subtable.extend_from_slice(&ligature_coverage);
+		subtable.extend_from_slice(&mark_array);
+		subtable.extend_from_slice(&ligature_array);
+		subtable
+	}
+
+	/// A cursive subtable: each covered glyph with its entry and exit anchors, either of which may be
+	/// absent. The glyphs must be given in ascending order.
+	pub fn cursive_subtable(entries: &[(u16, Option<(i16, i16)>, Option<(i16, i16)>)]) -> std::vec::Vec<u8> {
+		let coverage = coverage(&entries.iter().map(|(glyph, _, _)| *glyph).collect::<std::vec::Vec<u16>>());
+		let header = 6 + 4 * entries.len();
+		let mut records = std::vec::Vec::new();
+		let mut anchors = std::vec::Vec::new();
+		let mut at = header + coverage.len();
+		for (_, entry, exit) in entries {
+			for point in [entry, exit] {
+				match point {
+					Some(point) => {
+						u16(&mut records, at as u16);
+						let bytes = anchor_bytes(*point);
+						at += bytes.len();
+						anchors.extend_from_slice(&bytes);
+					}
+					None => u16(&mut records, 0),
+				}
+			}
+		}
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, header as u16);
+		u16(&mut subtable, entries.len() as u16);
+		subtable.extend_from_slice(&records);
+		subtable.extend_from_slice(&coverage);
+		subtable.extend_from_slice(&anchors);
+		subtable
+	}
+
+	/// A chaining contextual subtable, format 3: a backtrack, an input and a lookahead, each glyph a
+	/// coverage of the glyphs given, and the nested lookups as `(sequence index, lookup index)`.
+	pub fn chain_subtable(backtrack: &[&[u16]], input: &[&[u16]], lookahead: &[&[u16]], nested: &[(u16, u16)]) -> std::vec::Vec<u8> {
+		let coverages: std::vec::Vec<std::vec::Vec<u8>> = backtrack.iter().chain(input).chain(lookahead).map(|glyphs| coverage(glyphs)).collect();
+		let header = 2 + 2 + 2 * backtrack.len() + 2 + 2 * input.len() + 2 + 2 * lookahead.len() + 2 + 4 * nested.len();
+		let mut offsets = std::vec::Vec::new();
+		let mut at = header;
+		for bytes in &coverages {
+			offsets.push(at as u16);
+			at += bytes.len();
+		}
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 3);
+		let mut next = offsets.iter();
+		for count in [backtrack.len(), input.len(), lookahead.len()] {
+			u16(&mut subtable, count as u16);
+			for _ in 0..count {
+				u16(&mut subtable, *next.next().expect("an offset per coverage"));
+			}
+		}
+		u16(&mut subtable, nested.len() as u16);
+		for (sequence, lookup) in nested {
+			u16(&mut subtable, *sequence);
+			u16(&mut subtable, *lookup);
+		}
+		for bytes in &coverages {
+			subtable.extend_from_slice(bytes);
+		}
+		subtable
+	}
+
+	/// `GDEF` version 1.2: the glyph classes, the mark attachment classes, and the mark glyph sets.
+	pub fn gdef_full(classes: &[(u16, u16, u16)], mark_classes: &[(u16, u16, u16)], sets: &[&[u16]]) -> std::vec::Vec<u8> {
+		let class_def = |ranges: &[(u16, u16, u16)]| {
+			let mut out = std::vec::Vec::new();
+			u16(&mut out, 2);
+			u16(&mut out, ranges.len() as u16);
+			for (first, last, class) in ranges {
+				u16(&mut out, *first);
+				u16(&mut out, *last);
+				u16(&mut out, *class);
+			}
+			out
+		};
+		let glyph_classes = class_def(classes);
+		let attach_classes = class_def(mark_classes);
+		let mut mark_sets = std::vec::Vec::new();
+		u16(&mut mark_sets, 1);
+		u16(&mut mark_sets, sets.len() as u16);
+		let coverages: std::vec::Vec<std::vec::Vec<u8>> = sets.iter().map(|glyphs| coverage(glyphs)).collect();
+		let mut at = 4 + 4 * sets.len();
+		for bytes in &coverages {
+			u32(&mut mark_sets, at as u32);
+			at += bytes.len();
+		}
+		for bytes in &coverages {
+			mark_sets.extend_from_slice(bytes);
+		}
+		let header = 14usize;
+		let mut out = std::vec::Vec::new();
+		u16(&mut out, 1);
+		u16(&mut out, 2);
+		u16(&mut out, header as u16);
+		u16(&mut out, 0);
+		u16(&mut out, 0);
+		u16(&mut out, (header + glyph_classes.len()) as u16);
+		u16(&mut out, (header + glyph_classes.len() + attach_classes.len()) as u16);
+		out.extend_from_slice(&glyph_classes);
+		out.extend_from_slice(&attach_classes);
+		out.extend_from_slice(&mark_sets);
+		out
+	}
+
+	/// A face whose glyphs have the advances given, carrying whichever layout tables are given.
+	pub fn with_advances(gsub: Option<std::vec::Vec<u8>>, gpos: Option<std::vec::Vec<u8>>, gdef: Option<std::vec::Vec<u8>>, advances: &[u16]) -> std::vec::Vec<u8> {
+		let mut tables: std::vec::Vec<([u8; 4], std::vec::Vec<u8>)> = std::vec::Vec::new();
+		if let Some(gdef) = gdef {
+			tables.push((*b"GDEF", gdef));
+		}
+		if let Some(gpos) = gpos {
+			tables.push((*b"GPOS", gpos));
+		}
+		if let Some(gsub) = gsub {
+			tables.push((*b"GSUB", gsub));
+		}
+		tables.push((*b"head", head()));
+		tables.push((*b"hhea", hhea(advances.len() as u16)));
+		tables.push((*b"hmtx", hmtx(advances)));
+		tables.push((*b"maxp", maxp(advances.len() as u16)));
+		font(&tables)
+	}
 }
 
 /// A buffer of the glyphs given, each its own cluster.
@@ -946,24 +1267,24 @@ fn shaping_a_run_picks_the_shaper_and_runs_its_pass_first() {
 	// the last letter alone - and none of that is expressible as a feature list.
 	let characters = ['\u{0628}', '\u{0628}', '\u{0628}'];
 	let mut buffer = glyphs(&[1, 1, 1]);
-	let out = shape_run(&face, &mut buffer, &characters, *b"dflt").expect("shaping");
+	let out = shape_run(&face, &mut buffer, &characters, *b"dflt", false).expect("shaping");
 	assert_eq!(out.len(), 3, "no composition happens in Arabic");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![1, 1, 4]);
 	// A Hangul run: the characters THEMSELVES change, which is why the call answers them.
 	let characters = ['\u{1112}', '\u{1161}', '\u{11AB}'];
 	let mut buffer = glyphs(&[1, 2, 3]);
-	let out = shape_run(&face, &mut buffer, &characters, *b"dflt").expect("shaping");
+	let out = shape_run(&face, &mut buffer, &characters, *b"dflt", false).expect("shaping");
 	assert_eq!(out, std::vec!['\u{D55C}']);
 	assert_eq!(buffer.len(), 1);
 	// A Devanagari run: the buffer is reordered before any lookup sees it.
 	let characters = ['\u{0915}', '\u{093F}'];
 	let mut buffer = glyphs(&[1, 2]);
-	shape_run(&face, &mut buffer, &characters, *b"dflt").expect("shaping");
+	shape_run(&face, &mut buffer, &characters, *b"dflt", false).expect("shaping");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![2, 1]);
 	// And a Latin run is untouched by any of it, which is the case that proves nothing on its own.
 	let characters = ['a', 'b'];
 	let mut buffer = glyphs(&[1, 2]);
-	shape_run(&face, &mut buffer, &characters, *b"dflt").expect("shaping");
+	shape_run(&face, &mut buffer, &characters, *b"dflt", false).expect("shaping");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![1, 2]);
 }
 
@@ -993,14 +1314,14 @@ fn a_run_past_the_frozen_input_ceiling_is_refused_before_any_work_is_done() {
 	let ceiling = opentype_profile::limits::RUN_INPUT as usize;
 	let characters: std::vec::Vec<char> = core::iter::repeat_n('a', ceiling + 1).collect();
 	let mut buffer = Buffer::new();
-	assert_eq!(crate::shape::shape_run(&face, &mut buffer, &characters, *b"dflt").err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::Exceeded { limit: "run input", ceiling: opentype_profile::limits::RUN_INPUT, asked: ceiling as u64 + 1 })));
+	assert_eq!(crate::shape::shape_run(&face, &mut buffer, &characters, *b"dflt", false).err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::Exceeded { limit: "run input", ceiling: opentype_profile::limits::RUN_INPUT, asked: ceiling as u64 + 1 })));
 	// AND EXACTLY AT THE CEILING IT IS NOT REFUSED, which is what makes the number a ceiling.
 	let characters: std::vec::Vec<char> = core::iter::repeat_n('a', ceiling).collect();
 	let mut buffer = Buffer::new();
 	for (index, _) in characters.iter().enumerate() {
 		buffer.push(1, index as u32).expect("room for a glyph");
 	}
-	assert!(crate::shape::shape_run(&face, &mut buffer, &characters, *b"dflt").is_ok());
+	assert!(crate::shape::shape_run(&face, &mut buffer, &characters, *b"dflt", false).is_ok());
 }
 
 #[test]
@@ -1050,11 +1371,11 @@ fn a_layout_table_corrupted_anywhere_is_refused_rather_than_read_past() {
 				for (index, _) in ['a', 'b', 'c'].iter().enumerate() {
 					buffer.push(index as u16 + 1, index as u32).expect("room for a glyph");
 				}
-				let _ = crate::shape::shape_run(&face, &mut buffer, &['a', 'b', 'c'], *b"dflt");
+				let _ = crate::shape::shape_run(&face, &mut buffer, &['a', 'b', 'c'], *b"dflt", false);
 				// AND THROUGH THE INDIC PLAN, which asks the face's `GSUB` about pairs of glyphs
 				// before any lookup runs - another walk of the same offsets.
 				let mut buffer = glyphs(&[1, 2, 3]);
-				let _ = crate::shape::shape_run(&face, &mut buffer, &['\u{0930}', '\u{094D}', '\u{0915}'], *b"dflt");
+				let _ = crate::shape::shape_run(&face, &mut buffer, &['\u{0930}', '\u{094D}', '\u{0915}'], *b"dflt", false);
 			}
 		}
 	}
@@ -1151,7 +1472,7 @@ fn shaped_buffer(face: &Face<'_>, text: &str, language: [u8; 4]) -> Buffer {
 		let glyph = face.glyph_for(character).expect("a readable cmap").expect("a character the fixture face maps");
 		buffer.push(glyph, offset as u32).expect("room for a glyph");
 	}
-	shape_run(face, &mut buffer, &characters, language).expect("shaping");
+	shape_run(face, &mut buffer, &characters, language, false).expect("shaping");
 	buffer
 }
 
@@ -1168,10 +1489,10 @@ fn the_local_forms_of_a_language_apply_under_that_language_only() {
 	let bytes = build::sample(Some(gsub), None, None);
 	let face = Face::open(&bytes, 0).expect("a font this tree built");
 	let mut buffer = glyphs(&[1]);
-	shape_run(&face, &mut buffer, &['i'], *b"TRK ").expect("shaping");
+	shape_run(&face, &mut buffer, &['i'], *b"TRK ", false).expect("shaping");
 	assert_eq!(glyph_ids(&buffer), std::vec![4], "Turkish selects its local form");
 	let mut buffer = glyphs(&[1]);
-	shape_run(&face, &mut buffer, &['i'], *b"dflt").expect("shaping");
+	shape_run(&face, &mut buffer, &['i'], *b"dflt", false).expect("shaping");
 	assert_eq!(glyph_ids(&buffer), std::vec![1], "and the default language does not");
 }
 
@@ -1185,7 +1506,7 @@ fn text_in_a_script_the_profile_does_not_name_is_refused() {
 	let face = Face::open(&bytes, 0).expect("a font this tree built");
 	for (text, name) in [(&['\u{1E900}', '\u{1E901}'][..], "Adlam"), (&['\u{0840}'][..], "Mandaic"), (&['\u{13A0}'][..], "Cherokee"), (&['a', ' ', '\u{1E900}'][..], "Adlam")] {
 		let mut buffer = glyphs(&std::vec![1; text.len()]);
-		assert_eq!(shape_run(&face, &mut buffer, text, *b"dflt").err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::TextScript(name))), "{name} text was shaped");
+		assert_eq!(shape_run(&face, &mut buffer, text, *b"dflt", false).err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::TextScript(name))), "{name} text was shaped");
 	}
 	assert_eq!(shaper_for(&['\u{1E900}']), Shaper::Default, "no engine is chosen for a script the profile does not name");
 	// TEXT THAT DECIDES NO SCRIPT IS NEVER REFUSED - digits, a mark with nothing before it, a
@@ -1193,7 +1514,7 @@ fn text_in_a_script_the_profile_does_not_name_is_refused() {
 	// shaper had no tag for.
 	for text in [&['1', '2'][..], &['\u{0301}'][..], &['\u{E000}'][..], &['\u{3105}'][..], &['a', '1'][..]] {
 		let mut buffer = glyphs(&std::vec![1; text.len()]);
-		assert!(shape_run(&face, &mut buffer, text, *b"dflt").is_ok(), "{text:?} was refused");
+		assert!(shape_run(&face, &mut buffer, text, *b"dflt", false).is_ok(), "{text:?} was refused");
 	}
 	assert_eq!(profile_script(&['\u{3105}']), Ok(*b"bopo"));
 	assert_eq!(profile_script(&[' ', '\u{E000}']), Ok(*b"DFLT"), "nothing to decide by");
@@ -1207,7 +1528,7 @@ fn a_cursive_run_is_kerned() {
 	let bytes = build::sample(None, Some(gpos), None);
 	let face = Face::open(&bytes, 0).expect("a font this tree built");
 	let mut buffer = glyphs(&[1, 2]);
-	shape_run(&face, &mut buffer, &['\u{0628}', '\u{0628}'], *b"dflt").expect("shaping");
+	shape_run(&face, &mut buffer, &['\u{0628}', '\u{0628}'], *b"dflt", false).expect("shaping");
 	assert_eq!(buffer.positions[0].x_advance, 300 - 50, "300 from hmtx, less the pair the face declares");
 }
 
@@ -1222,7 +1543,7 @@ fn the_faces_mirrored_forms_apply_where_the_caller_marked_them() {
 	let face = Face::open(&bytes, 0).expect("a font this tree built");
 	let mut buffer = glyphs(&[1, 1]);
 	buffer.infos[0].mask |= crate::buffer::RTLM;
-	shape_run(&face, &mut buffer, &['\u{0628}', '\u{0628}'], *b"dflt").expect("shaping");
+	shape_run(&face, &mut buffer, &['\u{0628}', '\u{0628}'], *b"dflt", false).expect("shaping");
 	assert_eq!(glyph_ids(&buffer), std::vec![4, 1]);
 }
 
@@ -1417,10 +1738,285 @@ fn storage_the_run_cannot_have_is_refused_rather_than_fatal() {
 	let face = Face::open(&bytes, 0).expect("a font this tree built");
 	let characters: std::vec::Vec<char> = core::iter::repeat_n('a', 2000).collect();
 	let mut buffer = glyphs(&std::vec![1; characters.len()]);
-	let refused = limited::within(1024, || crate::shape::shape_run(&face, &mut buffer, &characters, *b"dflt").err());
+	let refused = limited::within(1024, || crate::shape::shape_run(&face, &mut buffer, &characters, *b"dflt", false).err());
 	assert_eq!(refused, Some(font_parse::Error::Allocation));
 	// And the buffer refuses to grow past what it can have, rather than ending the process.
 	let mut buffer = Buffer::new();
 	let refused = limited::within(1024, || (0..2000u32).try_for_each(|index| buffer.push(1, index)).err());
 	assert_eq!(refused, Some(font_parse::Error::Allocation));
+}
+
+// -------------------------------------------------------------------------------------------------
+// THE LOOKUP FLAGS, THE STACKED MARKS AND THE CURSIVE JOINS. Every lookup above has flags 0, which is
+// the case where every glyph after a match's first is simply the next buffer slot - and the case a
+// shaper that ignores the flags passes.
+// -------------------------------------------------------------------------------------------------
+
+/// The glyphs of the fixtures below, by role.
+mod roles {
+	pub const LAM: u16 = 1;
+	pub const ALEF: u16 = 2;
+	pub const FATHA: u16 = 3;
+	pub const LAM_ALEF: u16 = 4;
+	pub const OTHER_MARK: u16 = 5;
+	pub const LIGATURE: u16 = 6;
+}
+
+/// The one-feature-per-lookup table the fixtures below build their layout tables from.
+fn features(entries: &[([u8; 4], std::vec::Vec<u8>)]) -> std::vec::Vec<u8> {
+	let indices: std::vec::Vec<u16> = (0..entries.len() as u16).collect();
+	build::layout_features(entries, &indices, &[])
+}
+
+/// A buffer of glyphs with the clusters given.
+fn clustered(glyphs: &[(u16, u32)]) -> Buffer {
+	let mut buffer = Buffer::new();
+	for (glyph, cluster) in glyphs {
+		buffer.push(*glyph, *cluster).expect("room for a glyph");
+	}
+	buffer
+}
+
+#[test]
+// A LIGATURE THAT IGNORES MARKS FORMS ACROSS ONE, and the mark stays - on the component it followed. A
+// lam, a fatha and an alef are a lam-alef and the fatha, and the fatha goes over the LAM half: the
+// mark-to-ligature rule takes the component the substitution recorded rather than guessing it from the
+// clusters' bytes. A mark that followed the whole ligature takes its last component.
+fn a_ligature_ignoring_marks_forms_across_a_mark_and_keeps_it_on_its_component() {
+	use crate::layout::IGNORE_MARKS;
+	use roles::*;
+	let gsub = features(&[(*b"rlig", build::flagged(4, IGNORE_MARKS, build::ligature_subtable(LAM, &[ALEF], LAM_ALEF), None))]);
+	let gpos = features(&[(*b"mark", build::flagged(5, 0, build::mark_ligature_subtable(&[(FATHA, (50, 0))], LAM_ALEF, &[(100, 700), (450, 650)]), None))]);
+	let gdef = build::gdef_full(&[(LAM, ALEF, 1), (FATHA, FATHA, 3), (LAM_ALEF, LAM_ALEF, 2), (OTHER_MARK, OTHER_MARK, 3)], &[], &[]);
+	let bytes = build::with_advances(Some(gsub), Some(gpos), Some(gdef), &[500, 400, 300, 0, 600, 0, 700]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+
+	let mut buffer = clustered(&[(LAM, 0), (FATHA, 2), (ALEF, 4)]);
+	shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"rlig", *b"mark"]).expect("shaping");
+	assert_eq!(glyph_ids(&buffer), std::vec![LAM_ALEF, FATHA], "the ligature formed across the mark, and kept it");
+	assert_eq!(buffer.infos[1].cluster, 2, "the mark keeps its own cluster");
+	assert!(buffer.infos[0].ligature != 0 && buffer.infos[1].ligature == buffer.infos[0].ligature, "the mark records the ligature it sat in");
+	assert_eq!(buffer.infos[1].component, 1, "after the first component");
+	assert_eq!(buffer.infos[1].attached_to, Some(0));
+	// Over the lam half: its anchor, less the fatha's, less the ligature's advance the pen crossed.
+	assert_eq!((buffer.positions[1].x_offset, buffer.positions[1].y_offset), (100 - 50 - 600, 700));
+
+	let mut buffer = clustered(&[(LAM, 0), (ALEF, 2), (FATHA, 4)]);
+	shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"rlig", *b"mark"]).expect("shaping");
+	assert_eq!(glyph_ids(&buffer), std::vec![LAM_ALEF, FATHA]);
+	assert_eq!(buffer.infos[1].component, 0, "a mark after the ligature sat in no part of it");
+	assert_eq!((buffer.positions[1].x_offset, buffer.positions[1].y_offset), (450 - 50 - 600, 650), "and takes the last component");
+}
+
+#[test]
+// A PAIR THAT IGNORES MARKS IS KERNED ACROSS ONE, and the mark still attaches to the first of the two -
+// measured back over the KERNED advance, because the pen crosses the advance positioning left. The
+// same pair without the flag sees the mark as the second glyph, and kerns nothing.
+fn a_kerning_pair_ignoring_marks_is_kerned_across_a_mark() {
+	use crate::layout::IGNORE_MARKS;
+	let (a, v, acute) = (1u16, 2u16, 3u16);
+	let gdef = build::gdef_full(&[(a, v, 1), (acute, acute, 3)], &[], &[]);
+	for (flags, kerned) in [(IGNORE_MARKS, 700 - 80), (0, 700)] {
+		let gpos = features(&[
+			(*b"kern", build::flagged(2, flags, build::pair_subtable(a, v, -80), None)),
+			(*b"mark", build::flagged(4, 0, build::mark_subtable(&[(acute, 0, (60, 0))], &[(a, std::vec![Some((350, 700))])], 1), None)),
+		]);
+		let bytes = build::with_advances(None, Some(gpos), Some(gdef.clone()), &[500, 700, 700, 0]);
+		let face = Face::open(&bytes, 0).expect("a font this tree built");
+		let mut buffer = glyphs(&[a, acute, v]);
+		shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"kern", *b"mark"]).expect("shaping");
+		assert_eq!(buffer.positions[0].x_advance, kerned, "flags {flags:#06x}");
+		assert_eq!(buffer.infos[1].attached_to, Some(0));
+		assert_eq!((buffer.positions[1].x_offset, buffer.positions[1].y_offset), (350 - 60 - kerned, 700), "flags {flags:#06x}");
+	}
+}
+
+#[test]
+// A CONTEXTUAL RULE THAT IGNORES MARKS MATCHES ACROSS THEM - in its input, its backtrack and its
+// lookahead - and applies its nested lookup to the glyph its sequence index FOUND, not to the slot that
+// many places after the start: here the second input glyph is two slots on, past a mark.
+fn a_contextual_rule_ignoring_marks_matches_across_them_and_applies_where_it_matched() {
+	use crate::layout::IGNORE_MARKS;
+	let (first, second, mark, before, after, replaced) = (1u16, 2u16, 3u16, 4u16, 5u16, 6u16);
+	let chain = build::flagged(6, IGNORE_MARKS, build::chain_subtable(&[&[before]], &[&[first], &[second]], &[&[after]], &[(1, 1)]), None);
+	let gsub = build::layout_many(b"calt", &[chain, build::flagged(1, 0, build::single_subtable(second, replaced), None)]);
+	let gdef = build::gdef_full(&[(first, second, 1), (mark, mark, 3), (before, replaced, 1)], &[], &[]);
+	let bytes = build::with_advances(Some(gsub), None, Some(gdef), &[500, 300, 300, 0, 300, 300, 300]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[before, mark, first, mark, second, mark, after]);
+	shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"calt"]).expect("shaping");
+	assert_eq!(glyph_ids(&buffer), std::vec![before, mark, first, mark, replaced, mark, after], "the rule matched across every mark and substituted the glyph it found");
+}
+
+#[test]
+// THE TWO FLAGS THAT NAME MARKS. A lookup restricted to a mark glyph set sees only the marks in it, and
+// one restricted to a mark attachment class sees only the marks of that class: every other mark is
+// passed over as though it were not there - so the pair is kerned across it - while a mark it names is
+// a glyph like any other, and a pair across that one is no pair at all.
+fn a_mark_set_or_an_attachment_class_names_the_marks_a_lookup_sees() {
+	use crate::layout::USE_MARK_FILTERING_SET;
+	use roles::{FATHA, OTHER_MARK};
+	let (a, v) = (1u16, 2u16);
+	let gdef = build::gdef_full(&[(a, v, 1), (FATHA, FATHA, 3), (OTHER_MARK, OTHER_MARK, 3)], &[(FATHA, FATHA, 1), (OTHER_MARK, OTHER_MARK, 2)], &[&[FATHA]]);
+	for (name, kern) in [
+		("the mark set", build::flagged(2, USE_MARK_FILTERING_SET, build::pair_subtable(a, v, -80), Some(0))),
+		("the attachment class", build::flagged(2, 0x0100, build::pair_subtable(a, v, -80), None)),
+	] {
+		let bytes = build::with_advances(None, Some(features(&[(*b"kern", kern)])), Some(gdef.clone()), &[500, 700, 700, 0, 0, 0]);
+		let face = Face::open(&bytes, 0).expect("a font this tree built");
+		let mut passed = glyphs(&[a, OTHER_MARK, v]);
+		shape(&face, &mut passed, *b"DFLT", *b"dflt", &[*b"kern"]).expect("shaping");
+		assert_eq!(passed.positions[0].x_advance, 620, "{name}: a mark it does not name is passed over");
+		let mut seen = glyphs(&[a, FATHA, v]);
+		shape(&face, &mut seen, *b"DFLT", *b"dflt", &[*b"kern"]).expect("shaping");
+		assert_eq!(seen.positions[0].x_advance, 700, "{name}: a mark it names is a glyph of the match");
+	}
+}
+
+#[test]
+// AND THE TWO THAT IGNORE A CLASS OTHER THAN MARKS: a lookup ignoring base glyphs pairs two marks across
+// the letter between them, and one ignoring ligatures pairs two letters across a ligature.
+fn a_lookup_ignoring_bases_or_ligatures_matches_across_them() {
+	use crate::layout::{IGNORE_BASE_GLYPHS, IGNORE_LIGATURES};
+	use roles::{FATHA, LIGATURE, OTHER_MARK};
+	let (a, v) = (1u16, 2u16);
+	let gdef = build::gdef_full(&[(a, v, 1), (FATHA, OTHER_MARK, 3), (LIGATURE, LIGATURE, 2)], &[], &[]);
+	let advances = [500, 700, 700, 0, 0, 0, 900];
+	let bytes = build::with_advances(None, Some(features(&[(*b"kern", build::flagged(2, IGNORE_BASE_GLYPHS, build::pair_subtable(FATHA, OTHER_MARK, -30), None))])), Some(gdef.clone()), &advances);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[FATHA, a, OTHER_MARK]);
+	shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"kern"]).expect("shaping");
+	assert_eq!(buffer.positions[0].x_advance, -30, "the two marks are a pair across the letter");
+	let bytes = build::with_advances(None, Some(features(&[(*b"kern", build::flagged(2, IGNORE_LIGATURES, build::pair_subtable(a, v, -80), None))])), Some(gdef), &advances);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[a, LIGATURE, v]);
+	shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"kern"]).expect("shaping");
+	assert_eq!(buffer.positions[0].x_advance, 620, "the two letters are a pair across the ligature");
+}
+
+#[test]
+// A MARK ON A MARK IS PLACED WHERE ITS PARENT IS DRAWN. The second accent's anchors meet the first's,
+// and the first was itself moved onto the letter - so the second carries that whole move: placed from
+// the first accent's pen it lands a letter's width off, toward the next one.
+fn a_mark_on_a_mark_is_placed_where_its_parent_is_drawn() {
+	let (base, first, second) = (1u16, 2u16, 3u16);
+	let gpos = features(&[
+		(*b"mark", build::flagged(4, 0, build::mark_subtable(&[(first, 0, (40, 0))], &[(base, std::vec![Some((300, 600))])], 1), None)),
+		(*b"mkmk", build::flagged(6, 0, build::mark_subtable(&[(second, 0, (30, 0))], &[(first, std::vec![Some((45, 120))])], 1), None)),
+	]);
+	let gdef = build::gdef_full(&[(base, base, 1), (first, second, 3)], &[], &[]);
+	let bytes = build::with_advances(None, Some(gpos), Some(gdef), &[500, 500, 0, 0]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[base, first, second]);
+	shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"mark", *b"mkmk"]).expect("shaping");
+	assert_eq!((buffer.positions[1].x_offset, buffer.positions[1].y_offset), (300 - 40 - 500, 600), "the first accent on the letter");
+	assert_eq!(buffer.infos[2].attached_to, Some(1));
+	assert_eq!((buffer.positions[2].x_offset, buffer.positions[2].y_offset), (45 - 30 + (300 - 40 - 500), 120 + 600), "the second on the first, where the first is drawn");
+}
+
+#[test]
+// A MARK THAT FOLLOWS A LETTER DOES NOT HANG FROM THE LETTER BEFORE'S ACCENT. The mark-to-mark search
+// looks at the one glyph before the mark, and that is a base: it ends there, rather than walking on
+// past the letter to an accent the rule happens to cover.
+fn a_mark_after_a_base_does_not_hang_from_the_previous_letters_mark() {
+	let (base, other_base, first, second) = (1u16, 2u16, 3u16, 4u16);
+	let gpos = features(&[
+		(*b"mark", build::flagged(4, 0, build::mark_subtable(&[(first, 0, (40, 0))], &[(base, std::vec![Some((300, 600))])], 1), None)),
+		(*b"mkmk", build::flagged(6, 0, build::mark_subtable(&[(second, 0, (30, 0))], &[(first, std::vec![Some((45, 120))])], 1), None)),
+	]);
+	let gdef = build::gdef_full(&[(base, other_base, 1), (first, second, 3)], &[], &[]);
+	let bytes = build::with_advances(None, Some(gpos), Some(gdef), &[500, 500, 500, 0, 0]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[base, first, other_base, second]);
+	shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"mark", *b"mkmk"]).expect("shaping");
+	assert_eq!(buffer.infos[3].attached_to, None, "the accent after the second letter hangs from nothing the face offers it");
+	assert_eq!((buffer.positions[3].x_offset, buffer.positions[3].y_offset), (0, 0));
+}
+
+#[test]
+// A BASE MOVED BY A PLACEMENT CARRIES ITS MARK. The accent's anchors meet the letter's where the letter
+// is DRAWN, and a single adjustment that moves the letter moves the point the accent hangs from.
+fn a_base_moved_by_a_placement_carries_its_mark() {
+	let (base, mark) = (1u16, 2u16);
+	let gpos = features(&[
+		(*b"kern", build::flagged(1, 0, build::placement_subtable(base, (30, 10)), None)),
+		(*b"mark", build::flagged(4, 0, build::mark_subtable(&[(mark, 0, (40, 0))], &[(base, std::vec![Some((300, 600))])], 1), None)),
+	]);
+	let gdef = build::gdef_full(&[(base, base, 1), (mark, mark, 3)], &[], &[]);
+	let bytes = build::with_advances(None, Some(gpos), Some(gdef), &[500, 500, 0]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[base, mark]);
+	shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"kern", *b"mark"]).expect("shaping");
+	assert_eq!((buffer.positions[0].x_offset, buffer.positions[0].y_offset), (30, 10));
+	assert_eq!((buffer.positions[1].x_offset, buffer.positions[1].y_offset), (300 - 40 - 500 + 30, 600 + 10));
+}
+
+/// Where each glyph of a shaped run is DRAWN - its origin in visual order, from a pen starting at zero
+/// and moving the way the run is read - by logical index.
+fn drawn_origins(buffer: &Buffer) -> std::vec::Vec<(i32, i32)> {
+	let mut origins = std::vec![(0, 0); buffer.len()];
+	let mut pen = 0;
+	let order: std::vec::Vec<usize> = if buffer.right_to_left { (0..buffer.len()).rev().collect() } else { (0..buffer.len()).collect() };
+	for at in order {
+		let position = buffer.positions[at];
+		origins[at] = (pen + position.x_offset, position.y_offset);
+		pen += position.x_advance;
+	}
+	origins
+}
+
+/// A cursive face of three glyphs and the run they make, shaped in the direction and with the flags
+/// given: `(entry, exit)` per glyph, and the three advances.
+fn joined(right_to_left: bool, flags: u16, anchors: &[(Option<(i16, i16)>, Option<(i16, i16)>); 3], advances: [u16; 3]) -> Buffer {
+	let entries: std::vec::Vec<(u16, Option<(i16, i16)>, Option<(i16, i16)>)> = anchors.iter().enumerate().map(|(index, (entry, exit))| (index as u16 + 1, *entry, *exit)).collect();
+	let gpos = features(&[(*b"curs", build::flagged(3, flags, build::cursive_subtable(&entries), None))]);
+	let bytes = build::with_advances(None, Some(gpos), None, &[500, advances[0], advances[1], advances[2]]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[1, 2, 3]);
+	buffer.right_to_left = right_to_left;
+	shape(&face, &mut buffer, *b"DFLT", *b"dflt", &[*b"curs"]).expect("shaping");
+	buffer
+}
+
+/// Every join of a three-glyph run meets: the exit anchor of each glyph, where it is drawn, is the entry
+/// anchor of the next in the text, where that one is drawn.
+fn every_join_meets(buffer: &Buffer, anchors: &[(Option<(i16, i16)>, Option<(i16, i16)>); 3]) {
+	let origins = drawn_origins(buffer);
+	for pair in 0..2 {
+		let exit = anchors[pair].1.expect("an exit");
+		let entry = anchors[pair + 1].0.expect("an entry");
+		let left = (origins[pair].0 + i32::from(exit.0), origins[pair].1 + i32::from(exit.1));
+		let right = (origins[pair + 1].0 + i32::from(entry.0), origins[pair + 1].1 + i32::from(entry.1));
+		assert_eq!(left, right, "the join after glyph {pair} does not meet: {:?}", buffer.positions);
+	}
+}
+
+#[test]
+// A RIGHT-TO-LEFT CURSIVE WORD JOINS, LETTER TO LETTER, WITH ITS LAST LETTER ON THE BASELINE. Drawn right
+// to left, a letter starts at its exit and the one after it in the text ends at its entry - which is
+// the arithmetic the other direction has the other way round - and under the `rightToLeft` flag each
+// letter hangs from the one after it, so the middle letter's lift is carried to the first.
+fn a_right_to_left_cursive_word_joins_letter_to_letter() {
+	use crate::layout::RIGHT_TO_LEFT;
+	let anchors = [(None, Some((40, 120))), (Some((430, 60)), Some((30, 160))), (Some((560, 40)), None)];
+	let buffer = joined(true, RIGHT_TO_LEFT, &anchors, [520, 460, 600]);
+	let placed: std::vec::Vec<(i32, i32, i32)> = buffer.positions.iter().map(|position| (position.x_advance, position.x_offset, position.y_offset)).collect();
+	assert_eq!(placed, std::vec![(480, -40, -180), (400, -30, -120), (560, 0, 0)]);
+	every_join_meets(&buffer, &anchors);
+	// WITHOUT THE FLAG THE FIRST LETTER STAYS ON THE BASELINE and each later one hangs from the one before.
+	let buffer = joined(true, 0, &anchors, [520, 460, 600]);
+	assert_eq!(buffer.positions.iter().map(|position| position.y_offset).collect::<std::vec::Vec<_>>(), std::vec![0, 60, 180]);
+	every_join_meets(&buffer, &anchors);
+}
+
+#[test]
+// AND A LEFT-TO-RIGHT ONE CARRIES EACH LETTER'S SHIFT TO THE NEXT. The second letter is moved back to
+// meet the first and its advance shortened by the same amount, so the third follows from where the
+// second really ends - and the lift across the line accumulates along the chain.
+fn a_left_to_right_cursive_word_carries_each_shift_to_the_next() {
+	let anchors = [(None, Some((500, 120))), (Some((20, 60)), Some((440, 160))), (Some((30, 40)), None)];
+	let buffer = joined(false, 0, &anchors, [520, 460, 600]);
+	let placed: std::vec::Vec<(i32, i32, i32)> = buffer.positions.iter().map(|position| (position.x_advance, position.x_offset, position.y_offset)).collect();
+	assert_eq!(placed, std::vec![(500, 0, 0), (420, -20, 60), (570, -30, 180)]);
+	every_join_meets(&buffer, &anchors);
 }

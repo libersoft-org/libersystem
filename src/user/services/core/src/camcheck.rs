@@ -472,6 +472,40 @@ fn again(probe: &Probe) {
 	say(b"PASS again: a new grant captured into its own buffer while an old client kept its own");
 }
 
+// A NEGOTIATION ANSWERED AFTER ITS GRANT ENDED: the fixture holds the provider's answer, the grant asks and ends
+// before the answer comes, and once it has come the provider must have been told to stop what it negotiated - for
+// nobody. `free`, the next run, asks the camera for a stream of its own.
+fn retired(probe: &Probe) {
+	let before = match probe.fixture().stats() {
+		Some(Ok(stats)) => stats,
+		_ => fail(b"retired: the fixture's counters could not be read"),
+	};
+	probe.fixture_ok(probe.fixture().delay_negotiate(&1500), b"retired: the fixture could not hold its negotiation's answer");
+	// SENT AND NOT WAITED FOR: a deadline already reached takes the request out and gives up on the answer at once.
+	let request = StreamRequest { format: 1, size: 1, interval: Interval { numerator: 333_333, denominator: 10_000_000 } };
+	let _ = camera_capture::Client::with_deadline(ChannelTransport { chan: probe.capture }, 1).negotiate(&request);
+	sleep_until(clock() + TICKS / 2);
+	close(probe.capture);
+	// PAST THE HELD ANSWER, and the service's discard after it.
+	sleep_until(clock() + 3 * TICKS);
+	match probe.fixture().stats() {
+		Some(Ok(stats)) if stats.stops == before.stops + 1 && stats.mapped == 0 => {}
+		Some(Ok(_)) => fail(b"retired: the negotiation answered after its grant ended was not stopped at the provider"),
+		_ => fail(b"retired: the fixture's counters could not be read"),
+	}
+	say(b"PASS retired: a negotiation whose grant ended before the provider answered was stopped at the provider, and nothing is mapped");
+}
+
+// THE CAMERA IS NOBODY'S AFTER `retired`: this grant's negotiation is admitted, not answered busy.
+fn free(probe: &Probe) {
+	match probe.capture().negotiate(&StreamRequest { format: 1, size: 1, interval: Interval { numerator: 333_333, denominator: 10_000_000 } }) {
+		Some(Ok(_)) => {}
+		Some(Err(Error::Again)) => fail(b"free: the camera is still held for a grant that ended"),
+		_ => fail(b"free: the negotiation was refused or did not complete"),
+	}
+	say(b"PASS free: after a retired grant's late negotiation the next grant's was admitted");
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf = [0u8; 256];
@@ -496,7 +530,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		b"inherit" => inherit(&probe),
 		b"quarantine" => quarantine(&probe),
 		b"again" => again(&probe),
-		_ => fail(b"usage: camcheck capture | mjpeg | timing | busy | inherit | quarantine | again"),
+		b"retired" => retired(&probe),
+		b"free" => free(&probe),
+		_ => fail(b"usage: camcheck capture | mjpeg | timing | busy | inherit | quarantine | again | retired | free"),
 	}
 	exit();
 }

@@ -207,4 +207,7 @@ record modem-grant {
 /// connection is bound to the modem and SIM current at minting, and lives as long as `owner` does.
 interface modem-admin {
 	@op(1) mint: func(kind: grant-kind, @bound(32) alias: string, policy: data-policy, owner: handle<task>) -> result<modem-grant, error>;
+	/// Revoke every grant on one modem - data, identity and management alike: each ends as a closed connection's
+	/// would, its context torn down, and a client has to be granted again. Answers how many grants ended.
+	@op(2) revoke: func(modem: modem-id) -> result<u32, error>;
 }

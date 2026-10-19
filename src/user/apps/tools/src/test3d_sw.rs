@@ -1586,13 +1586,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// the surface and the scene's targets made, the most one made and all of them together.
 	let mut rebuild_allocations_max: u64 = 0;
 	let mut rebuild_allocations_total: u64 = 0;
-	/// How many acquires in a row may answer nothing before the display is taken to have gone.
+	/// How many acquires in a row may answer nothing - or presents be refused - with no frame presented
+	/// between them, before the display is taken to have gone.
 	///
 	/// A NUMBER AND NOT A DEADLINE, because what this counts is TURNS OF A LOOP THAT PACED ITSELF:
 	/// every pass through it either parks on an event with a deadline or draws, so a run of this many
 	/// refusals with nothing else happening is a service that is not going to answer.
 	const ACQUIRE_REFUSALS: u32 = 64;
 	let mut refusals: u32 = 0;
+	// PRESENTS REFUSED BECAUSE THE CONFIGURATION MOVED UNDER THEM - see the present below.
+	let mut superseded: u32 = 0;
 	// THE STAGE TIMES, AS SUMS. Each is the whole run's nanoseconds in one stage, divided by the
 	// frame count when it is reported - an average over a run rather than one frame's reading, which
 	// on a machine with other work on it is the only figure that means anything.
@@ -1845,7 +1848,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			continue;
 		};
 		let after_acquire = heap_allocation_count();
-		refusals = 0;
 		let stage_began = clock_ns();
 		// THE DESTINATION IS THE SURFACE'S CURRENT EXTENT AND NOT A REMEMBERED ONE, which is what
 		// makes a resize need nothing recreated on this side: the scene renders at a fixed size and
@@ -1867,8 +1869,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let rendering_allocations = heap_allocation_count().saturating_sub(after_acquire) + before_acquire.saturating_sub(render_allocations);
 		let stage_began = clock_ns();
 		if !frames.present_whole(frame) {
-			break;
+			// A REFUSED PRESENT IS NOT THE END OF THE RUN. A resize that lands between the acquire and the
+			// present makes this frame one of a generation that no longer exists: the service gave its
+			// images back with that generation and refuses a present of one, and the configuration that
+			// moved is already on its way here as the next step's rebuild. Leaving instead ended the demo
+			// on the screen's resize whenever the resize came while a frame was being composited. A run of
+			// refusals with nothing presented between them is a display that will not answer, and is
+			// counted with the acquires it refused.
+			superseded += 1;
+			refusals += 1;
+			if refusals > ACQUIRE_REFUSALS {
+				print(b"test3d-sw: the display stopped answering\n");
+				break;
+			}
+			continue;
 		}
+		refusals = 0;
 		let present_elapsed = clock_ns().saturating_sub(stage_began);
 		timing.present += present_elapsed;
 		timing.present_max = timing.present_max.max(present_elapsed);
@@ -1894,6 +1910,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	line.decimal(rebuilt as u64);
 	line.push(b"\n");
 	print(line.as_bytes());
+	if superseded != 0 {
+		let mut line = common_line::Line::new();
+		line.push(b"test3d-sw: ");
+		line.decimal(superseded as u64);
+		line.push(b" present(s) refused for a configuration that had moved, and the loop went on\n");
+		print(line.as_bytes());
+	}
 	if controls.report {
 		let mut line = common_line::Line::new();
 		line.push(b"test3d-sw: resize rebuilt ");

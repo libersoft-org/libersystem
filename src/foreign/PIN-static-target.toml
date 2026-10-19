@@ -1,4 +1,4 @@
-# THE STATIC-TARGET PART OF P02M0135's LOCKFILE. Frozen when the portable static target builds
+# THE STATIC-TARGET PART OF THE FOREIGN SUBSTRATE'S LOCKFILE. Frozen when the portable static target builds
 # reproducibly on all three targets, and it gates PASS 1.
 #
 # WHY IT IS ITS OWN PART. It is milestone OUTPUT, so it cannot sit in the bootstrap half, which holds

@@ -46,9 +46,26 @@ pub struct GlyphInfo {
 	/// The `GDEF` class - base, ligature, mark or component - which the mark rules and the lookup
 	/// flags both turn on. Zero when the font declares none.
 	pub class: u16,
+	/// A mark's `GDEF` mark attachment class, which a lookup's `markAttachmentType` selects marks by.
+	/// Zero where the face puts the glyph in none.
+	pub mark_class: u16,
 	/// For a mark attached to something, which buffer position it attached to. `None` while nothing
 	/// has attached it.
 	pub attached_to: Option<u16>,
+	/// THE LIGATURE A GLYPH BELONGS TO, numbered by the substitution that formed it: a ligature carries
+	/// its own number, and a mark that sat between the components it was formed from carries the same
+	/// one. Zero for every other glyph.
+	///
+	/// A MARK INSIDE A LIGATURE BELONGS TO ONE COMPONENT OF IT, and nothing else can say which: once
+	/// the components are one glyph, a lam-alef whose fatha was written after the lam has to put that
+	/// fatha over the lam half, which only the mark's own record of where it sat can tell.
+	pub ligature: u16,
+	/// For a mark that sat between a ligature's components, which one it followed, counted from one.
+	/// Zero for every other glyph.
+	pub component: u16,
+	/// For a glyph a cursive attachment hangs from another, that other's position: what its offset
+	/// across the line is measured from once positioning is done. `None` for every other glyph.
+	pub cursive: Option<u16>,
 	/// WHICH FEATURES MAY APPLY HERE, as a bitmask.
 	///
 	/// A FEATURE IS NOT ALWAYS GLOBAL, and that is the whole of complex-script shaping. `fina`
@@ -70,15 +87,22 @@ pub struct GlyphInfo {
 
 impl GlyphInfo {
 	pub const fn new(glyph: u16, cluster: u32) -> Self {
-		Self { glyph, cluster, class: 0, attached_to: None, mask: GLOBAL, syllable: 0, position: SyllablePosition::None }
+		Self { glyph, cluster, class: 0, mark_class: 0, attached_to: None, ligature: 0, component: 0, cursive: None, mask: GLOBAL, syllable: 0, position: SyllablePosition::None }
 	}
 }
 
-/// The glyphs and their positions, in visual order for the run being shaped.
+/// The glyphs and their positions, in LOGICAL order - the order the text was written - for the run
+/// being shaped.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Buffer {
 	pub infos: Vec<GlyphInfo>,
 	pub positions: Vec<Position>,
+	/// WHETHER THE RUN IS DRAWN RIGHT TO LEFT. Every rule is applied in logical order whatever the
+	/// direction, and one is not direction-free: a cursive join moves the glyph its pen meets first,
+	/// which in a right-to-left run is the LATER one in the text. Set by whoever knows the run's level.
+	pub right_to_left: bool,
+	/// The number the last ligature formed here was given; see `GlyphInfo::ligature`.
+	pub ligatures: u16,
 }
 
 impl Buffer {
@@ -129,6 +153,35 @@ impl Buffer {
 		self.positions.drain(at + 1..at + count);
 	}
 
+	/// Replace the glyphs at `components` - ascending, the first the ligature's own place - with one,
+	/// KEEPING whatever the lookup skipped between them.
+	///
+	/// A LOOKUP THAT IGNORES MARKS FORMS ITS LIGATURE ACROSS THEM, and the marks are not components:
+	/// a lam, a fatha and an alef become a lam-alef and the fatha, still there to be attached. Each
+	/// kept mark records which component it followed, under the ligature's number, so the mark
+	/// positioning can put it on that component's anchor rather than on whichever one a guess picks.
+	pub fn ligate_components(&mut self, components: &[usize], glyph: u16) {
+		let (Some(&first), Some(&last)) = (components.first(), components.last()) else { return };
+		if last >= self.infos.len() || components.windows(2).any(|pair| pair[0] >= pair[1]) {
+			return;
+		}
+		self.ligatures = self.ligatures.wrapping_add(1).max(1);
+		let number = self.ligatures;
+		self.infos[first].glyph = glyph;
+		self.infos[first].ligature = number;
+		self.infos[first].component = 0;
+		for (followed, pair) in components.windows(2).enumerate() {
+			for kept in pair[0] + 1..pair[1] {
+				self.infos[kept].ligature = number;
+				self.infos[kept].component = followed as u16 + 1;
+			}
+		}
+		for at in components[1..].iter().rev() {
+			self.infos.remove(*at);
+			self.positions.remove(*at);
+		}
+	}
+
 	/// Replace one glyph with several, as a decomposition does. All of them share its cluster.
 	///
 	/// THE ONLY PLACE A RUN GROWS, so it is where the run's absolute output ceiling is held as it
@@ -152,6 +205,7 @@ impl Buffer {
 			let mut info = source;
 			info.glyph = *glyph;
 			info.attached_to = None;
+			info.cursive = None;
 			self.infos.insert(at + 1 + offset, info);
 			self.positions.insert(at + 1 + offset, Position::default());
 		}

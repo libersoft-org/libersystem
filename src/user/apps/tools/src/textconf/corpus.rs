@@ -63,6 +63,11 @@ const fn attached(glyph: &'static str, cluster: u32, base: u16, x_offset: i32, y
 	Expect { glyph, cluster, x_advance: 0, x_offset, y_offset, base: Some(base) }
 }
 
+/// A letter a cursive join moved: the advance and the offsets the joins on either side of it leave.
+const fn joined(glyph: &'static str, cluster: u32, x_advance: i32, x_offset: i32, y_offset: i32) -> Expect {
+	Expect { glyph, cluster, x_advance, x_offset, y_offset, base: None }
+}
+
 pub static CASES: &[Case<'static>] = &[
 	// -----------------------------------------------------------------------------------------
 	// Latin: the case that proves nothing on its own, and is here because the rest is built on it.
@@ -76,13 +81,22 @@ pub static CASES: &[Case<'static>] = &[
 	Case { name: "a kerning pair narrows the first glyph", face: ALPHA, text: "AV", expect: &[at("A", 0, 700 - 80), at("V", 1, 700)] },
 	Case { name: "the other order is a different pair", face: ALPHA, text: "VA", expect: &[at("V", 0, 700 - 60), at("A", 1, 700)] },
 	Case { name: "a pair the face does not declare is not kerned", face: ALPHA, text: "TV", expect: &[at("T", 0, 660), at("V", 1, 700)] },
+	// THE PAIR IS KERNED ACROSS THE ACCENT BETWEEN THEM, because the face's kerning ignores marks - and the
+	// accent still sits on the A, measured back over the KERNED advance: 350 - 60 - 620.
+	Case { name: "a kerning pair is kerned across the accent between them", face: ALPHA, text: "A\u{0301}V", expect: &[at("A", 0, 700 - 80), attached("acute", 1, 0, -330, 0), at("V", 3, 700)] },
 	// -----------------------------------------------------------------------------------------
 	// Arabic: all four joining forms, from a face that carries them and a shaper that must decide
 	// which one each letter is in before any lookup runs.
 	// -----------------------------------------------------------------------------------------
 	Case { name: "an Arabic letter alone is isolated", face: ALPHA, text: "\u{0628}", expect: &[at("beh.isol", 0, 620)] },
 	Case { name: "two joining letters are initial and final", face: ALPHA, text: "\u{0628}\u{062C}", expect: &[at("beh.init", 0, 520), at("jeem.fina", 2, 580)] },
-	Case { name: "three give all four forms their turn", face: ALPHA, text: "\u{0628}\u{062C}\u{0628}", expect: &[at("beh.init", 0, 520), at("jeem.medi", 2, 460), at("beh.fina", 4, 600)] },
+	// AND THE THREE ARE JOINED, right to left, with the last letter on the baseline. Drawn right to left a
+	// letter starts at its exit and the next in the text ends at its entry: beh.init is moved by its exit
+	// 40 and its advance shortened by the same, jeem.medi's advance is its entry 430 less its own exit
+	// 30, and beh.fina's is its entry 560. Across the line each letter hangs from the one after it: the
+	// jeem 40 - 160 below the beh after it, and the first beh 60 - 120 below the jeem - and the jeem's
+	// own drop with it.
+	Case { name: "three give all four forms their turn", face: ALPHA, text: "\u{0628}\u{062C}\u{0628}", expect: &[joined("beh.init", 0, 480, -40, -180), joined("jeem.medi", 2, 400, -30, -120), at("beh.fina", 4, 560)] },
 	// ALEF JOINS ONLY TO ITS RIGHT, so it has no initial form and the letter AFTER it starts again.
 	// A shaper that decided forms by position rather than by joining type would give both letters
 	// here a form the face does not even carry.
@@ -91,6 +105,11 @@ pub static CASES: &[Case<'static>] = &[
 	// THE REQUIRED LIGATURE IS FORMED FROM THE POSITIONAL FORMS, which is why the lookup order in
 	// the face is what it is: `rlig` runs after the joining lookups, never before them.
 	Case { name: "the required ligature forms from the positional forms", face: ALPHA, text: "\u{0644}\u{0627}", expect: &[at("lam_alef", 0, 600)] },
+	// A VOWEL BETWEEN THE TWO DOES NOT STOP THEM: the ligature ignores marks, forms across the fatha and
+	// keeps it - on the component it followed, the lam: 420 - 80 - 600 over the lam half's anchor.
+	Case { name: "the required ligature forms across a vowel and keeps it on the lam half", face: ALPHA, text: "\u{0644}\u{064E}\u{0627}", expect: &[at("lam_alef", 0, 600), attached("fatha", 2, 0, -260, 220)] },
+	// AND ONE WRITTEN AFTER THE ALEF FOLLOWED THE WHOLE LIGATURE: the last component, 150 - 80 - 600.
+	Case { name: "a vowel after the ligature sits on its alef half", face: ALPHA, text: "\u{0644}\u{0627}\u{064E}", expect: &[at("lam_alef", 0, 600), attached("fatha", 4, 0, -530, 160)] },
 	// -----------------------------------------------------------------------------------------
 	// Hebrew: marks, and the two classes one base carries.
 	// -----------------------------------------------------------------------------------------
@@ -123,6 +142,13 @@ pub static CASES: &[Case<'static>] = &[
 	// -----------------------------------------------------------------------------------------
 	Case { name: "sara am is decomposed and its upper half attaches", face: COMPLEX, text: "\u{0E01}\u{0E33}", expect: &[at("th.ko", 0, 540), attached("th.nikhahit", 3, 0, -345, -40), at("th.sara-aa", 3, 300)] },
 	Case { name: "a tone mark sits over its consonant", face: COMPLEX, text: "\u{0E01}\u{0E48}", expect: &[at("th.ko", 0, 540), attached("th.mai-ek", 3, 0, -340, -160)] },
+	// A TONE MARK OVER AN UPPER VOWEL STACKS ON THE VOWEL, which is `mkmk`: its anchors meet the vowel's
+	// top - 100 - 70 and 740 - 760 apart - where the vowel is DRAWN, which `mark` put at -360, -20 on the
+	// consonant.
+	Case { name: "a tone mark stacks on the vowel above its consonant", face: COMPLEX, text: "\u{0E01}\u{0E34}\u{0E48}", expect: &[at("th.ko", 0, 540), attached("th.sara-i", 3, 0, -360, -20), attached("th.mai-ek", 6, 1, -330, -40)] },
+	// AND ONE OVER THE NEXT CONSONANT DOES NOT CLIMB THE VOWEL BEFORE IT. The mark-to-mark rule looks at the
+	// one glyph before the tone mark, and that is a consonant: the tone mark stays where `mark` put it.
+	Case { name: "a tone mark on the next consonant does not climb the vowel before it", face: COMPLEX, text: "\u{0E01}\u{0E34}\u{0E01}\u{0E48}", expect: &[at("th.ko", 0, 540), attached("th.sara-i", 3, 0, -360, -20), at("th.ko", 6, 540), attached("th.mai-ek", 9, 2, -340, -160)] },
 	// -----------------------------------------------------------------------------------------
 	// Khmer: the coeng that binds what follows into a subjoined form under the base.
 	// -----------------------------------------------------------------------------------------
@@ -188,9 +214,9 @@ pub static PARAGRAPHS: &[Paragraph<'static>] = &[
 /// THE CASES THE GUEST RUN SHAPES, LAYS OUT AND DRAWS on each architecture, by name.
 ///
 /// ONE OF EACH KIND THE THREE-ARCHITECTURE CLAIM IS ABOUT and not the whole corpus: Arabic in its
-/// joining forms and its required ligature, Devanagari reordered before and after its base, Thai
-/// decomposed and stacked, Hebrew marks on a right-to-left base, and a paragraph whose two directions
-/// meet on one line. Each is drawn as
+/// joining forms, its cursive joins and its required ligature - formed across a vowel too - Devanagari
+/// reordered before and after its base, Thai decomposed and stacked mark on mark, Hebrew marks on a
+/// right-to-left base, and a paragraph whose two directions meet on one line. Each is drawn as
 /// well as shaped, and every glyph of every one of them is an axis-aligned rectangle, so the picture
 /// is compared against coverage computed from the outlines rather than against a captured image.
 ///
@@ -199,10 +225,12 @@ pub static PARAGRAPHS: &[Paragraph<'static>] = &[
 pub static GUEST_CASES: &[&str] = &[
 	"three give all four forms their turn",
 	"the required ligature forms from the positional forms",
+	"the required ligature forms across a vowel and keeps it on the lam half",
 	"a pre-base vowel sign is drawn before its consonant",
 	"a syllable-initial ra becomes the reph, drawn over the base after it",
 	"sara am is decomposed and its upper half attaches",
 	"a tone mark sits over its consonant",
+	"a tone mark stacks on the vowel above its consonant",
 	"a mark is placed by its anchors",
 	"two marks of different classes take different anchors",
 ];

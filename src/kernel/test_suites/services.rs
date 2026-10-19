@@ -5347,7 +5347,12 @@ mod modem_rig {
 
 	impl Modem {
 		pub(super) fn new(slot: u32) -> Modem {
-			let info = device::ProviderInfo { kind: device::ProviderKind::Modem, bus: 0, dev: 28, func: 0, binding_generation: 1, slot, provider_generation: 1, name: String::from("org.libersystem.modem-rig"), live: true, platform: None };
+			Modem::named(slot, "org.libersystem.modem-rig")
+		}
+
+		// A modem published under `name` - the fixture's, for one the service's `fixture` alias resolves to.
+		pub(super) fn named(slot: u32, name: &str) -> Modem {
+			let info = device::ProviderInfo { kind: device::ProviderKind::Modem, bus: 0, dev: 28, func: 0, binding_generation: 1, slot, provider_generation: 1, name: String::from(name), live: true, platform: None };
 			Modem { info, server: None, kept: Vec::new() }
 		}
 
@@ -5428,7 +5433,7 @@ mod modem_rig {
 	pub(super) struct Rig {
 		boot: Arc<Channel>,
 		root: Arc<Channel>,
-		_admin: Arc<Channel>,
+		admin: Arc<Channel>,
 		_link: Arc<Channel>,
 		catalogue: Arc<Channel>,
 		stream: Option<Arc<Channel>>,
@@ -5460,12 +5465,13 @@ mod modem_rig {
 			let (link, link_user) = Channel::create();
 			let service = spawn_dynamic_test_process(sched::root_domain(), elf, boot_user);
 			// THE ROLES IN THE ORDER THE MANIFEST DECLARES THEM: the catalogue minted for `modem`, the observation
-			// root, the minting root, and the link-admin connection - which nothing in this scenario reaches.
+			// root, the minting root - which the revocation case mints and revokes through - and the link-admin
+			// connection, which nothing in these scenarios reaches.
 			send_cap(&boot, b"CATALOGUE", catalogue_user, role_rights()).expect("the catalogue role");
 			send_cap(&boot, b"SERVE", root_user, role_rights()).expect("the serve role");
 			send_cap(&boot, b"ADMIN", admin_user, role_rights()).expect("the admin role");
 			send_cap(&boot, b"LINK", link_user, role_rights()).expect("the link role");
-			let mut rig = Rig { boot, root, _admin: admin, _link: link, catalogue, stream: None, seq: 0, modems, _service: service };
+			let mut rig = Rig { boot, root, admin, _link: link, catalogue, stream: None, seq: 0, modems, _service: service };
 			for _ in 0..PASSES {
 				rig.pump();
 				if let Ok(report) = rig.boot.recv() {
@@ -5545,14 +5551,50 @@ mod modem_rig {
 
 		// A connection minted from the observation root, or none when the service refused one.
 		pub(super) fn connect(&mut self) -> Option<Arc<Channel>> {
-			self.root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), Vec::new())).expect("a connect request");
+			let root = self.root.clone();
+			self.connect_to(&root)
+		}
+
+		fn connect_to(&mut self, root: &Arc<Channel>) -> Option<Arc<Channel>> {
+			root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), Vec::new())).expect("a connect request");
 			for _ in 0..PASSES {
 				self.pump();
-				if let Ok(answer) = self.root.recv() {
+				if let Ok(answer) = root.recv() {
 					return answer.caps.first().map(|cap| cap.object().into_any_arc().downcast::<Channel>().expect("a connection is a channel"));
 				}
 			}
 			panic!("ModemService did not answer a connect");
+		}
+
+		// AN ADMIN CONNECTION, minted from the minting root as PermissionManager's is.
+		pub(super) fn admin(&mut self) -> Arc<Channel> {
+			let admin = self.admin.clone();
+			self.connect_to(&admin).expect("an admin connection")
+		}
+
+		// A GRANT OF `kind` minted through `admin` for the `fixture` alias, its owner `owner`: its connection and the
+		// modem it names. The test names the owner - it runs on no thread of its own, so it has no process to be one.
+		pub(super) fn mint(&mut self, admin: &Arc<Channel>, kind: modem::GrantKind, owner: &Arc<Process>) -> (Arc<Channel>, modem::ModemId) {
+			let mut transport = super::super::hardware::KernelTransport::new(admin, 200);
+			let handle = transport.offer(owner.clone() as Arc<dyn object::KernelObject>, Rights::ALL);
+			let policy = modem::DataPolicy { apn: String::new(), replace_uplink: false };
+			let mut client = modem::modem_admin::Client::new(transport);
+			let grant = match client.mint(&kind, "fixture", &policy, &handle) {
+				Some(Ok(grant)) => grant,
+				other => panic!("the mint was not answered with a grant: {:?}", other.map(|answer| answer.err())),
+			};
+			let mut transport = client.into_transport();
+			let connection = transport.take(grant.connection).expect("the grant's connection came back").into_any_arc().downcast::<Channel>().expect("a grant's connection is a channel");
+			(connection, grant.modem)
+		}
+
+		// REVOKE every grant on `modem` through `admin`: how many ended.
+		pub(super) fn revoke(&mut self, admin: &Arc<Channel>, modem_id: &modem::ModemId) -> u32 {
+			let transport = super::super::hardware::KernelTransport::new(admin, 200);
+			match modem::modem_admin::Client::new(transport).revoke(modem_id) {
+				Some(Ok(count)) => count,
+				other => panic!("the revocation was not answered: {:?}", other.map(|answer| answer.err())),
+			}
 		}
 
 		// THE LIMITS, as a client reads them - through a connection of its own, which counts while it is open.
@@ -5641,6 +5683,47 @@ fn modem_service_refuses_at_its_provider_and_client_bounds_and_gives_them_back()
 		}
 	}
 	assert!(readmitted.is_some(), "a closed client connection gave its slot back");
+}
+
+// ADMIN REVOCATION ENDS EVERY GRANT ON ITS MODEM. Two grants are minted through the minting root for the modem the
+// `fixture` alias resolves to - a data grant and a management one - and a revocation names the modem: both are
+// retired, their connections closed as a closed connection's would be, and a second revocation finds none.
+tagged_test!(modem_admin_revocation_retires_every_grant_on_its_modem, [Service, Process], id = "kernel.services.modem_admin_revocation_retires_every_grant_on_its_modem", covers = ["kernel", "services", "bin.modem_service"]);
+fn modem_admin_revocation_retires_every_grant_on_its_modem() {
+	use modem_proto::generated::liber::modem::v1 as modem;
+	use modem_rig::{Modem, PASSES, Rig};
+	use object::address_space::AddressSpace;
+	use object::process::Process;
+
+	let mut rig = Rig::start(alloc::vec![Modem::named(1, "org.libersystem.modem-fixture")]);
+	let mut admitted = false;
+	for _ in 0..PASSES {
+		rig.pump();
+		if rig.modems[0].opened() && rig.limits().providers == 1 {
+			admitted = true;
+			break;
+		}
+	}
+	assert!(admitted, "the modem was admitted");
+	let admin = rig.admin();
+	// THE GRANTS' OWNER, a process of the test's that stays alive throughout: an owner that ended would retire them first.
+	let owner = Process::new(AddressSpace::create().expect("an owner's address space"), sched::root_domain()).expect("an owner process");
+	let (data, modem_id) = rig.mint(&admin, modem::GrantKind::Data, &owner);
+	let (manage, managed) = rig.mint(&admin, modem::GrantKind::Manage, &owner);
+	assert!(modem_id == managed, "both grants name the one modem");
+	let connections = rig.limits().clients;
+	assert_eq!(rig.revoke(&admin, &modem_id), 2, "a revocation of the modem ended both of its grants");
+	let mut closed = false;
+	for _ in 0..PASSES {
+		rig.pump();
+		if data.is_peer_closed() && manage.is_peer_closed() {
+			closed = true;
+			break;
+		}
+	}
+	assert!(closed, "and closed both connections, as a closed connection's grant would be");
+	assert!(rig.limits().clients < connections, "the retired grants gave their client slots back");
+	assert_eq!(rig.revoke(&admin, &modem_id), 0, "a second revocation found none");
 }
 
 #[path = "services/bluetooth_audio.rs"]

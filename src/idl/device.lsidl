@@ -244,6 +244,10 @@ record binding-record {
 	/// wrong; these are for one that has not, so a driver's footprint can be read without breaking it. Appended.
 	memory-used: u64,
 	memory-peak: u64,
+	/// THE RUNNING DRIVER'S DMA MEMORY, from the same counters: what its Domain holds pinned for devices now. A driver
+	/// that gives back what a departed device held returns to the same figure after every plug and unplug, which is how
+	/// a gate reads that it did. Zero where no driver runs. Appended.
+	dma-used:    u64,
 }
 
 /// The Device service contract: enumerate the devices the kernel discovered on the

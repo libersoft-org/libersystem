@@ -21,6 +21,9 @@
 #   a failed prepared launch    `camfail`: its capture grant was minted and retired with the launch
 #   a kept buffer               `camhold retain` beside `camcheck again`: nothing new reaches an old client's
 #                                 buffer while a new grant captures
+#   a late negotiation          `camcheck retired`, `camcheck free`: the provider's answer is held, the grant that
+#                                 asked ends before it comes, the provider is told to stop what it negotiated, and
+#                                 the next grant's negotiation is admitted
 #   quarantine and replacement  `camcheck quarantine`: an unconfirmed stop times out after two seconds and
 #                                 quarantines the camera; its replacement is another camera
 
@@ -62,7 +65,7 @@ expect() {
 # `fg` BEFORE THE LAST `graph`: the background holder, `camhold retain &`, can still hold what it was granted when
 # the last probe returns, and a count read then is the holder's and not a leak. `fg` waits for it, and says
 # there is no such job when it has already gone.
-guest_gate_run $'camread\ncamcheck capture\ngraph\ncamcheck mjpeg\ncamcheck timing\ncamhold hold 3 &\ncamcheck busy\ncamhold dup | camcheck inherit\ncamfail\ncamhold retain &\ncamcheck again\ncamcheck quarantine\nfg\ngraph' ""
+guest_gate_run $'camread\ncamcheck capture\ngraph\ncamcheck mjpeg\ncamcheck timing\ncamhold hold 3 &\ncamcheck busy\ncamhold dup | camcheck inherit\ncamfail\ncamhold retain &\ncamcheck again\ncamcheck retired\ncamcheck free\ncamcheck quarantine\nfg\ngraph' ""
 lines="$GUEST_LINES"
 
 if grep -aq 'camcheck: FAIL\|camhold: FAIL\|camread: FAIL\|camfail: FAIL' "$lines"; then
@@ -81,6 +84,8 @@ expect "$lines" "camcheck: PASS inherit" "a transferred endpoint must not keep i
 expect "$lines" "CameraService: a grant's owner ended - its grant is retired" "the service must observe owners, not channels"
 expect "$lines" "camhold: PASS retain" "an old client's buffer must receive nothing once its stream stopped"
 expect "$lines" "camcheck: PASS again" "a new grant must capture into its own buffer"
+expect "$lines" "camcheck: PASS retired" "a negotiation answered after its grant ended must be stopped at the provider"
+expect "$lines" "camcheck: PASS free" "the camera must be free for the next grant after a retired grant's late negotiation"
 expect "$lines" "camcheck: PASS quarantine" "an unconfirmed stop must quarantine the camera, and its replacement is another"
 expect "$lines" "CameraService: a stop was not confirmed in time - the camera is quarantined" "the service must say it quarantined the camera"
 

@@ -2304,6 +2304,8 @@ fn platform_line_acquire(claim_handle: u64, which: u64) -> i64 {
 	// THE FUNCTION'S PIN, ON ONLY WHILE ITS BINDING IS CURRENT: a release that ran since the registration has turned
 	// it off already and revoked the line, and a pin turned on after that would assert a line nothing holds for it.
 	if let Some((bus, dev, func)) = function {
+		// RECORDED FIRST: the Interrupt turns the pin off again when it is let go of, however that happens.
+		interrupt.set_function(bus, dev, func);
 		arch::pci::set_intx_disabled(bus, dev, func, false);
 		if !device::claim_is_current(key) {
 			arch::pci::set_intx_disabled(bus, dev, func, true);
@@ -2743,9 +2745,10 @@ fn sys_memory_plug_change(handle: u64, first: u64, count: u64, online: bool) -> 
 	}
 }
 
-// WHICH BLOCKS ARE ONLINE, one byte a block at `out_ptr`, at most `out_len` and at most 32768 of them: the block count.
+// WHICH BLOCKS ARE ONLINE, one byte a block at `out_ptr`, at most `out_len` of them: the block count. A region never has
+// more than `MAX_BLOCKS`, so this is always the whole of it.
 fn sys_memory_plug_state(handle: u64, out_ptr: u64, out_len: u64) -> i64 {
-	const MOST: usize = 32768;
+	const MOST: usize = crate::mem::hotplug::MAX_BLOCKS as usize;
 	let region = match current_typed::<PlugRegion>(handle, ObjectType::PlugRegion, Rights::READ) {
 		Ok(region) => region,
 		Err(error) => return error,

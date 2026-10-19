@@ -168,11 +168,15 @@ impl Pipe {
 
 	/// Give the ring and the page back, and stop keeping completions for this endpoint.
 	pub fn release(&mut self, hc: &mut Xhci) {
-		self.ring.release();
-		if self.handle != 0 {
-			close(self.handle);
-			self.handle = 0;
+		// A TRANSFER STILL STANDING IS ABANDONED FIRST: the page is given back for real, and the controller would
+		// otherwise complete into it. On a device whose slot is already disabled the stop is refused at once.
+		if self.busy {
+			let mut none = Hids::new();
+			let _ = abandon(hc, &mut none, self);
 		}
+		self.ring.release();
+		common::release_dma(self.handle);
+		self.handle = 0;
 		hc.class_rx.retain(|&(slot, dci)| (slot, dci) != (self.slot, self.dci));
 		hc.class_pending.retain(|&(_, _, control)| !(control >> 24 == self.slot && (control >> 16 & 0x1f) == self.dci));
 	}
@@ -603,8 +607,9 @@ impl Classes {
 			// A DEVICE THAT LEFT ON PURPOSE keeps its publication until the device it becomes arrives - or its
 			// handoff expires, which answers whoever is waiting and withdraws it then.
 			let handoff = if gone.published { gone.module.handoff() } else { None };
-			gone.module.release(hc);
+			// The slot first: the module's pipes are given back for real, and its endpoints name them until then.
 			gone.module.device_mut().release(hc);
+			gone.module.release(hc);
 			hc.budget.release(gone.module.kind());
 			print(b"driver.xhci: ");
 			print(crate::kind_name(gone.module.inventory()).as_bytes());

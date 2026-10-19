@@ -319,9 +319,13 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 	let placement = {
 		// The suite's own console row is not placed against: it sits over a UART other suites publish rows for,
 		// and a description merged into it would become a console claim. See `synthetic_console_row`.
+		//
+		// NOR, FOR A TEST'S DESCRIPTION, A ROW THE ACPI SERVICE PUBLISHED. Whether the service has run by then is the
+		// order a selection put the tests in: a test row over COM2's ports merged into the service's COM2 row when it had
+		// - and failed on an identity that was the service's - and became a row of its own when it had not.
 		let placed = |entry: &DeviceEntry| -> bool {
 			#[cfg(test)]
-			if entry.platform.as_ref().is_some_and(|row| row.part.identity() == SYNTHETIC_CONSOLE_IDENTITY) {
+			if entry.platform.as_ref().is_some_and(|row| row.part.identity() == SYNTHETIC_CONSOLE_IDENTITY || (SYNTHETIC.load(core::sync::atomic::Ordering::Acquire) && row.part.source == abi::PLATFORM_SOURCE_ACPI)) {
 				return false;
 			}
 			let _ = entry;
@@ -2156,7 +2160,11 @@ pub fn add_synthetic_platform_row(item: Described) -> Option<usize> {
 	let mut table = DEVICES.lock();
 	let forbidden = forbidden_ranges(&table);
 	let before = table.len();
-	let row = publish_locked(&mut table, item, &forbidden)?;
+	// Under the table's lock, so it marks this placement alone.
+	SYNTHETIC.store(true, core::sync::atomic::Ordering::Release);
+	let row = publish_locked(&mut table, item, &forbidden);
+	SYNTHETIC.store(false, core::sync::atomic::Ordering::Release);
+	let row = row?;
 	let appended = table.len() > before;
 	drop(table);
 	if appended {
@@ -2184,6 +2192,10 @@ pub fn expire_release_for_test(index: usize) {
 
 #[cfg(test)]
 const SYNTHETIC_CONSOLE_IDENTITY: &[u8] = b"test:console-uart";
+
+// A TEST'S DESCRIPTION IS BEING PLACED, which keeps the ACPI service's rows out of its placement - see `publish_locked`.
+#[cfg(test)]
+static SYNTHETIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // A CONSOLE UART'S ROW OF THE SUITE'S OWN - claimable, carrying `PLATFORM_FLAG_CONSOLE`, eight ports at `base`
 // and the suite's hardware id - APPENDED WITHOUT THE PLACEMENT: other suites publish rows over the same UART, and

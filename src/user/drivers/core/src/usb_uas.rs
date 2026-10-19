@@ -177,12 +177,12 @@ impl Uas {
 		self.data_in.release();
 		self.data_out.release();
 		if self.control_handle != 0 {
-			close(self.control_handle);
+			common::release_dma(self.control_handle);
 			self.control_handle = 0;
 		}
 		for tag in self.tags.iter_mut() {
 			if tag.handle != 0 {
-				close(tag.handle);
+				common::release_dma(tag.handle);
 				tag.handle = 0;
 				tag.virt = 0;
 				tag.phys = 0;
@@ -458,13 +458,16 @@ pub unsafe fn configure_uas(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Uas> {
 				Err(_) => break,
 			}
 		}
+		// FROM HERE THE TARGET HAS HAD COMMANDS, and a failure deconfigures its endpoints before their pages go back.
 		if !ready {
 			print(b"driver.xhci: the UAS target did not become ready inside the bring-up window\n");
+			crate::deconfigure(hc, dev);
 			device.release();
 			return None;
 		}
 		if command(hc, &mut hids, dev, &mut device, 0, &scsi::read_capacity10(), 8, true, &mut deadline).is_err() {
 			print(b"driver.xhci: the UAS target refused READ CAPACITY\n");
+			crate::deconfigure(hc, dev);
 			device.release();
 			return None;
 		}
@@ -473,10 +476,12 @@ pub unsafe fn configure_uas(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Uas> {
 			*byte = r8(device.tags[0].virt + i as u64);
 		}
 		let Ok(capacity) = scsi::capacity(&bytes) else {
+			crate::deconfigure(hc, dev);
 			device.release();
 			return None;
 		};
 		if capacity.block_bytes != SECTOR {
+			crate::deconfigure(hc, dev);
 			device.release();
 			return None;
 		}

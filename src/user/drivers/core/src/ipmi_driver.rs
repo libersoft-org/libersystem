@@ -886,7 +886,10 @@ impl admin_executor::Service for ExecutorView<'_> {
 			AdminAction::BmcSelClear => {
 				let clear = ipmi_bmc::prepare_sel_clear(self.driver, selector.as_bytes(), &parameters, &copied).map_err(prepare_refused)?;
 				let prepared = self.driver.sel_ops.prepare(generation, &parameters, &copied, now, LIFETIME_TICKS).map_err(refused)?.clone();
-				self.driver.sel_prepared.retain(|(operation, _)| *operation != prepared.operation);
+				// WHAT THE SEAM LET GO OF GOES FROM HERE TOO - started, cancelled, expired - or this list kept one entry for
+				// every preparation the driver ever made.
+				let operations = &self.driver.sel_ops;
+				self.driver.sel_prepared.retain(|(operation, _)| operations.holds(*operation) && *operation != prepared.operation);
 				self.driver.sel_prepared.push((prepared.operation, clear));
 				self.driver.say(&format!("a clear of its {} SEL record(s) is prepared under reservation {:#06x}", clear.count, clear.reservation));
 				(driver_protocol::provider::BMC_SEL_NAME, SEL_CLEAR_MS, prepared)
@@ -894,7 +897,8 @@ impl admin_executor::Service for ExecutorView<'_> {
 			AdminAction::BmcChassisControl => {
 				let operation = ipmi_bmc::prepare_chassis(selector.as_bytes(), &parameters, &copied).map_err(prepare_refused)?;
 				let prepared = self.driver.chassis_ops.prepare(generation, &parameters, &copied, now, LIFETIME_TICKS).map_err(refused)?.clone();
-				self.driver.chassis_prepared.retain(|(held, _)| *held != prepared.operation);
+				let operations = &self.driver.chassis_ops;
+				self.driver.chassis_prepared.retain(|(held, _)| operations.holds(*held) && *held != prepared.operation);
 				self.driver.chassis_prepared.push((prepared.operation, operation));
 				self.driver.say(&format!("a chassis {operation:?} is prepared"));
 				(driver_protocol::provider::BMC_CHASSIS_NAME, CHASSIS_MS, prepared)
@@ -1163,17 +1167,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Ok(said) => driver.say(&format!("{:?} interface: {said}", driver.interface.kind())),
 		Err(failure) => driver.say(&format!("{:?} interface did not come ready - {failure:?}", driver.interface.kind())),
 	}
-	// WHO THE BMC IS.
-	match ipmi_bmc::identify(&mut driver, &binding) {
-		Ok((device, identity)) => {
-			driver.say(&format!("{} - device {:#04x} revision {}, firmware {}.{:02x}, IPMI {}.{}, manufacturer {:#07x} product {:#06x}{}", identity.name(), device.device_id, device.device_revision, device.firmware_major, device.firmware_minor, device.ipmi.0, device.ipmi.1, device.manufacturer, device.product, if identity.selector().is_none() { " - its name is past the administrative selector's 64 bytes, so it cannot be administered" } else { "" }));
-			driver.device = device;
-			driver.identity = identity;
-		}
-		Err(answer) => driver.say(&format!("Get Device ID was not answered - {answer:?}; the BMC is looked for again every ten seconds")),
-	}
-	driver.read_repository();
-	// THE WATCHDOG, on every form but SSIF: what the last reset was, and a timer found running taken over.
+	// THE WATCHDOG FIRST, on every form but SSIF: what the last reset was, and a timer found running taken over - before
+	// the BMC is identified or its repository read, which on a large repository is the slow part of a bind, and which a
+	// running timer would otherwise count down through.
 	if !ssif_form {
 		match ipmi_bmc::data(&mut driver, &ipmi::watchdog::get()).ok().and_then(|bytes| ipmi::watchdog::state(&bytes)) {
 			Some(state) => {
@@ -1198,6 +1194,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => driver.say("its watchdog did not answer Get Watchdog Timer - none is published"),
 		}
 	}
+	// WHO THE BMC IS.
+	match ipmi_bmc::identify(&mut driver, &binding) {
+		Ok((device, identity)) => {
+			driver.say(&format!("{} - device {:#04x} revision {}, firmware {}.{:02x}, IPMI {}.{}, manufacturer {:#07x} product {:#06x}{}", identity.name(), device.device_id, device.device_revision, device.firmware_major, device.firmware_minor, device.ipmi.0, device.ipmi.1, device.manufacturer, device.product, if identity.selector().is_none() { " - its name is past the administrative selector's 64 bytes, so it cannot be administered" } else { "" }));
+			driver.device = device;
+			driver.identity = identity;
+		}
+		Err(answer) => driver.say(&format!("Get Device ID was not answered - {answer:?}; the BMC is looked for again every ten seconds")),
+	}
+	driver.read_repository();
 	// THE PUBLICATIONS.
 	let mut offers: Vec<(u16, u16, u64, &[u8])> = alloc::vec![(TOKEN_IPMI, driver_protocol::provider::IPMI, 0, driver_protocol::provider::IPMI_NAME)];
 	if !driver.zones.is_empty() {

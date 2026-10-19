@@ -62,7 +62,7 @@ The largest x86_64 term remains drawing: 57.282 ms, 48.9% of the 117.079 ms whol
 
 ### Measurement and analysis provenance
 
-All runs used one frozen guest implementation, after P02M0193/P02M0198 and the final provider/policy fixes. Results and exact commands are retained in `.build/logs/qemu-2d-account/continuation-20261008/`. The ordinary x86 gate passed in 687 s and its optimized counterpart in 490 s. Each used one reproducible image across its three boots, four vCPUs, one pinned drawing lane except the explicitly pooled row, headless QEMU, and enforcing-required DMA. The host was Intel Xeon Platinum 8272CL @ 2.60 GHz; QEMU was 10.0.13. x86 used KVM, `-cpu host` and `virtio-vga`; ports used TCG, four vCPUs, 512 MiB and `virtio-gpu-pci`, with no competing guest/build. Port figures are emulated consistency checks, not hardware-speed results. Their exact command lines, firmware/ESP/staged-kernel/system-volume hashes, layer artifacts and observed boot evidence are in each port’s `conditions-live.json`, `conditions-final.json` and `runner.log`.
+All runs used one frozen guest implementation, after soft2ds parallel tile rendering over the worker pool, the processor power services idle and performance states, and the final provider/policy fixes. Results and exact commands are retained in `.build/logs/qemu-2d-account/continuation-20261008/`. The ordinary x86 gate passed in 687 s and its optimized counterpart in 490 s. Each used one reproducible image across its three boots, four vCPUs, one pinned drawing lane except the explicitly pooled row, headless QEMU, and enforcing-required DMA. The host was Intel Xeon Platinum 8272CL @ 2.60 GHz; QEMU was 10.0.13. x86 used KVM, `-cpu host` and `virtio-vga`; ports used TCG, four vCPUs, 512 MiB and `virtio-gpu-pci`, with no competing guest/build. Port figures are emulated consistency checks, not hardware-speed results. Their exact command lines, firmware/ESP/staged-kernel/system-volume hashes, layer artifacts and observed boot evidence are in each port’s `conditions-live.json`, `conditions-final.json` and `runner.log`.
 
 The initial all-input identity was `58d9026ae15c0247044c3765db7526986167c76ccca36e7dfb58eb113cb5e6e4`. Only three host analysis/harness files changed afterward: `frame_account.py`, its collector fixtures and the port gate’s profile check. Excluding exactly those three leaves all 2,795 other source/build inputs identical, SHA-256 `ae4fb91668fb7bf60b8372755454f2f0b40b2a938334e9200451bcdd80340210`. Final analysis-inclusive identity: `52b900132b4e7a0dbbb1b116d391a87b0523419f8a84def07d73837458274b5f`. The proof files retain individual old/new hashes. No guest code, instrumentation point or payload changed between measured rows; build profiles differ only as explicitly stated.
 
@@ -100,7 +100,7 @@ Kernel: `.build/cargo/kernel/x86_64-unknown-none/debug/kernel`; driver: `.build/
 | aarch64 | 62500000 | CNTVCT_EL0 |
 | riscv64 | 10000000 | global time (rdtime), not per-hart rdcycle |
 
-Reproduce x86 with `LIBER_DEVELOPMENT=1 ACCOUNT_RESULTS=<ordinary> ./check.sh --gate qemu-2d-account`, then export `CARGO_PROFILE_DEV_OPT_LEVEL=2 ACCOUNT_REFERENCE=<ordinary> ACCOUNT_RESULTS=<optimized>` for the entire second invocation. Ports run last and alone: `LIBER_DEVELOPMENT=1 SMP=4 ACCOUNT_RESULTS=<port> src/tools/check-qemu-2d-account.sh --arch aarch64|riscv64`. Clear inherited boot-profile, scanout/display and gadget overrides as recorded in the audit. The gate supplies the trace/dormant profiles itself.
+Reproduce x86 with `LIBER_DEVELOPMENT=1 ACCOUNT_RESULTS=<ordinary> ./check.sh --gate qemu-2d-account`, then export `CARGO_PROFILE_DEV_OPT_LEVEL=2 ACCOUNT_REFERENCE=<ordinary> ACCOUNT_RESULTS=<optimized>` for the entire second invocation. Ports run last and alone: `LIBER_DEVELOPMENT=1 SMP=4 ACCOUNT_RESULTS=<port> src/tools/check-qemu-2d-account.sh --arch aarch64|riscv64`. The gate clears `LIBER_BOOT_PROFILE` and `GPU_SIZE` itself; run it with `DISPLAYS` and `USB_GADGET` unset as well, and the ordinary invocation with `CARGO_PROFILE_DEV_OPT_LEVEL` and `ACCOUNT_REFERENCE` unset. The gate supplies the trace/dormant profiles itself.
 
 ### Instrument cost and the current dormant reference
 
@@ -1259,7 +1259,7 @@ WHAT IS NOT MEASURED HERE, AND WHY: the postprocess chain. `scene3d::postprocess
 threshold, both kernels, the fog, the tone map and the pass graph that orders them, and no backend
 runs a full-screen pass over an HDR target yet - so a bloom row would be a measurement of arithmetic
 called in a loop written for the benchmark rather than of a pass the system executes. It is left out
-rather than invented, and the HDR item in `P02M0103` records the same boundary.
+rather than invented, and the rendering foundation's HDR item records the same boundary.
 
 **THE 30 FPS FLOOR AT 640x480 IS NOT MET AND THIS IS THE MEASUREMENT THAT SAYS SO.** The frame is
 1185 ms where the floor is 33, which is a factor of thirty-six. The number is not a tuning gap: the
@@ -3040,7 +3040,7 @@ side. UI-effects is where it was: the blur is 49 ms of it and the remaining hund
 are spread over forty-five commands, with no dominant term and no probe here separating one.
 
 
-### P02M0103 native serial floor acceptance, 2026-10-09
+### The native serial floor acceptance, 2026-10-09
 
 The first complete five-scene run below every original ceiling passed with one worker. The frozen fixtures, 640×480 target, command/resource counts, filter quality, five warmups and thirty measured samples are unchanged. Preparation remains outside replay. The reference host is the same Intel Xeon Platinum 8272CL at 2.60 GHz, 100 logical CPUs (the host itself runs under KVM); Linux 6.12.111+deb13-amd64, rustc 1.93.1 (01f6ddf75), Cargo 1.93.1. The host runner uses the ordinary Cargo release profile, no RUSTFLAGS or release-profile environment overrides, and std::time::Instant. No guest or competing build was run during this coordinated measurement window.
 
@@ -3059,7 +3059,7 @@ Per the plan, these first accepted measurements (at the runner's reported millis
 The final filter optimization evaluates four independent Gaussian outputs together while preserving each output's original tap-addition order. Other changes prepare exact image samples, avoid provably overwritten backdrop work and remove repeated decoder dispatch. None lowers the frozen workload or precision. The separately reported two-worker result is informational and does not replace the serial acceptance. Final guest 3D, HiDPI and emulated-port rows remain pending at this point.
 
 
-### P02M0103 frozen-budget follow-up, 2026-10-09
+### The frozen-budget follow-up, 2026-10-09
 
 The initial frozen budgets above remain unchanged. Two wrapper attempts failed: the first overlapped a host compilation; its quiet diagnostic missed only image-convert at16.244ms. The release disassembly then identified avoidable unsigned-64 conversion work for transfer-table indices bounded to4096. Using u32 indices preserves exact lookup/interpolation values. A subsequent quiet run improved conversion to15.673ms but missed effects at67.199ms. Expanding four independent Gaussian output accumulators to eight preserved every output's ordered tap arithmetic and produced the following complete passing serial run. The new transfer-index regression and the Gaussian scalar differential both pass bit for bit.
 
@@ -3074,7 +3074,7 @@ The initial frozen budgets above remain unchanged. Two wrapper attempts failed: 
 Command: `.build/cargo/shared/release/soft2d-bench --check --workers 1`, exit0. Evidence: `.build/logs/end-of-job/qemu-only-20261009/render103/soft2d-eight-transfer-floor.log`. Environment, fixtures and sample counts are the same as the initial acceptance; the team kept this bounded measurement window free of builds and guests. These numbers establish a passing frozen-budget run, not immunity to host contention. Final registered-gate execution and guest/port evidence remain pending.
 
 
-## P02M0103 quiet verification continuation (2026-10-09 UTC)
+## The rendering foundation's quiet verification continuation (2026-10-09 UTC)
 
 These are actual retained measurements, not acceptance of the remaining 3D floor. Evidence is under `.build/logs/end-of-job/qemu-only-20261009/render103/`. The host remains Intel Xeon Platinum 8272CL at 2.60 GHz, 100 logical CPUs, Linux 6.12.111+deb13-amd64, rustc 1.93.1 (01f6ddf75). The team held these windows free of other builds, tests and guests. Commands, UTC times, wall time, environment and exits are in each window's `results.json`/`environment.json`.
 
@@ -3176,7 +3176,7 @@ Post-allocation native benchmark (2026-10-09 23:09:16 UTC): After the animated a
 Placement-corrected ordinary guest (2026-10-10 01:16:05 UTC): actual x86 QEMU/KVM host CPU,32vCPUs,4GiB, release/shared-image demo, guest monotonic full-present intervals; complete environment/identities in `.build/logs/end-of-job/qemu-only-20261009/render103/post-placement-guest-20261010T010800Z/`. Core640x480:35frames/30steady intervals, median154546us, p99/max175316us, elapsed4658579523ns=6.439731FPS;30FPS FAIL. Extended640x480: median439539us, max478031us, elapsed13215216718ns=2.270110FPS, no30FPS floor. Both renderer and whole-loop steady allocation maxima0. Core heap peak30518800B, scene prepared961118B; Extended peak186684704B, scene prepared140101154B, HDR prepared16873630B. Core35-frame stage means(us): scene47457, transparent9247, handover10330, overlay29230, present36740; Extended shadow36331, scene127561, postprocess171919, handover10971, overlay29360, present37269. All32 actual vCPU threads consumed CPU time, independently mapped by the monitor. No new native-stage benchmark or320/800 result is claimed.
 
 
-### P02M0103 measured scaled presentation correction (2026-10-10 01:22:18 UTC)
+### The measured scaled presentation correction (2026-10-10 01:22:18 UTC)
 
 A native release comparison of the unchanged generic scaler against the applied exact packed-BGR8 branch used identical input bytes, target layout, aspect/damage calculations and whole-buffer/BlitResult equality. Each row is30 calls after5 warmups; independent current guest acceptance remains pending.
 
@@ -3190,7 +3190,7 @@ A native release comparison of the unchanged generic scaler against the applied 
 No SIMD, new buffers, workers, display lifecycle or timing threshold change. Canonical scaled bytes retain X=0 independently of source alpha; layouts with declared reserved bits remain generic.13 functional tests passed including the frozen original as an oracle. Host benchmark command, compiler/configuration, exact patch identity, output and initial duplicate-smoke-symbol fixture link failure are retained under `.build/logs/end-of-job/qemu-only-20261009/present-scaling`. The successful retry changed only that unused baseline symbol's name. These host component measurements do not revise the last actual ordinary SMP32 Core result6.439731FPS (FAIL30); a rebuilt live guest remains required.
 
 
-### P02M0103 isolated HUD attribution (2026-10-10 01:27:02 UTC)
+### The isolated HUD attribution (2026-10-10 01:27:02 UTC)
 
 Exact old/applied app Hud/list/Scene/Forms, deterministic preallocated opaque640x480 RGBA source, changing content generation, persistent host workers (std condition variables),5 warmups and30 measured frames. These are independent medians; total is not a sum of medians. All rows retain hash25379433745664d0 and maximum warmed allocation count0.
 
@@ -3204,7 +3204,7 @@ Exact old/applied app Hud/list/Scene/Forms, deterministic preallocated opaque640
 Evidence: `.build/logs/end-of-job/qemu-only-20261009/render103/hud-parallel/hud-attribution-results.json` and exact extraction manifest. This is a HUD-only host diagnostic using a fixed input field, not the real guest renderer or rt IPC pool; it claims no30FPS result. Serial cache refresh is now measured as the remaining dominant HUD cost.
 
 
-### P02M0103 cached HUD refresh (2026-10-10 01:46:57 UTC)
+### The cached HUD refresh (2026-10-10 01:46:57 UTC)
 
 Exact extracted existing HUD, changing640x480 content,5 warmups plus30 measured samples,32 persistent host workers. Independently measured medians compare previously applied parallel replay with newly applied parallel cache refresh.
 
@@ -3219,7 +3219,7 @@ Both retain exact pixel hash25379433745664d0 and maximum measured allocations0. 
 Shared-runtime copy attribution (2026-10-10): an exact252-byte lsrt memcpy shim passed1,072 length/alignment/guard cases and confirmed executable symbol binding.32-worker/30-pose paired native shader measurements using that shim gave baseline scene+panel36.095/37.772ms and applied0–4-word scalar-store candidate32.974/31.622ms (approximately12.6% mean reduction). All rows preserve combined colour/identity/depth hash b318488e33b3be99 and0 warmed allocations. The initial constant-copy match was rejected because LLVM emitted the same dynamic memcpy. Actual scalar-store disassembly confirms the intended change;128 Soft3D tests pass. Evidence under render103/shading-attribution includes exact source, ELF, shim, command and output identities. No whole-guest gap attribution or new30FPS PASS is claimed.
 
 
-### P02M0103 ordinary guest after measured graphics corrections (2026-10-10 02:33:26 UTC)
+### The ordinary guest after measured graphics corrections (2026-10-10 02:33:26 UTC)
 
 Quiet x86 QEMU/KVM 10.0.13, Xeon Platinum 8272CL host, 32 vCPUs, 4GiB, release/shared-image demo and guest monotonic full-present intervals. Exact opened ISO, paired volume, compiler/source identities and commands: `.build/logs/end-of-job/qemu-only-20261009/render103/post-hud-guest-20261010T022500Z/`. Both rows present 35 frames and measure 30 intervals after five warmups; both renderer/whole-loop allocation maxima are zero.
 

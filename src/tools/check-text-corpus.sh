@@ -19,7 +19,7 @@
 #   1  the generator's own `--check`, so the pinned corpus is exactly what the generator produces
 #   2  the gate's `--self-test`, so a corpus that drifted, an expectation one unit out of true, a
 #      glyph name nothing declares and a wrong visual order are each REFUSED
-#   3  FOUR DELIBERATE DEFECTS in the shaper itself, each watched to fail. A gate that has never
+#   3  SEVEN DELIBERATE DEFECTS in the shaper itself, each watched to fail. A gate that has never
 #      failed is a gate nobody has tested: every case in it passes today, and passing is what a case
 #      does when the thing it checks has quietly stopped being checked.
 #
@@ -123,9 +123,38 @@ run_mutation "the Indic reordering does not run" \
 run_mutation "a mark is measured from after its base" \
 	"src/user/libs/text/font-shape/src/gpos.rs" \
 	'a wide base is an accent floating over the NEXT letter.
-	let advance_between: i32 = buffer.positions[base_at..at]' \
+				let crossed = buffer.positions[parent.min(child)..child]' \
 	'a wide base is an accent floating over the NEXT letter.
-	let advance_between: i32 = buffer.positions[base_at + 1..at]' \
+				let crossed = buffer.positions[parent.min(child) + 1..child]' \
 	"a mark is placed by its anchors"
 
-echo "text-corpus: the corpus passes, the gate refuses what it should, and four deliberate defects are each caught"
+# 5. A LOOKUP'S FLAGS READ AT ITS FIRST GLYPH AND NO FURTHER, which is every glyph after it being the next
+#    buffer slot: the accent between a kerned pair becomes the pair's second glyph, and nothing is kerned.
+run_mutation "a match ignores the lookup's flags past its first glyph" \
+	"src/user/libs/text/font-shape/src/layout.rs" \
+	'		while at < buffer.len() {
+			if !self.skips(&buffer.infos[at])? {' \
+	'		while at < buffer.len() {
+			if true || !self.skips(&buffer.infos[at])? {' \
+	"a kerning pair is kerned across the accent between them"
+
+# 6. A RIGHT-TO-LEFT CURSIVE JOIN MADE THE LEFT-TO-RIGHT WAY, which is how it was written first: every
+#    cursive script the profile names is right to left, and each letter of a joined word lands apart from
+#    the next.
+run_mutation "a right-to-left join is made the left-to-right way" \
+	"src/user/libs/text/font-shape/src/gpos.rs" \
+	'	if buffer.right_to_left {
+		let moved = exit_x' \
+	'	if !buffer.right_to_left {
+		let moved = exit_x' \
+	"three give all four forms their turn"
+
+# 7. A STACKED MARK THAT WALKS PAST A CONSONANT to the previous letter's vowel, which the mark-to-mark
+#    search did while it looked for the nearest mark rather than at the one glyph before.
+run_mutation "a mark-to-mark search walks past a base" \
+	"src/user/libs/text/font-shape/src/gpos.rs" \
+	'			if !lookup.skips_marks_named(&buffer.infos[candidate])? {' \
+	'			if buffer.infos[candidate].class == 3 && !lookup.skips_marks_named(&buffer.infos[candidate])? {' \
+	"a tone mark on the next consonant does not climb the vowel before it"
+
+echo "text-corpus: the corpus passes, the gate refuses what it should, and seven deliberate defects are each caught"

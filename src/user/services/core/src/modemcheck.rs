@@ -27,6 +27,11 @@
 //   modemcheck uncertain-retired
 //                          the same PIN with its grant closed before the modem answers: the expiry
 //                          has nobody to answer and is reconciled all the same
+//   modemcheck deactivate-retired
+//                          a context up, its deactivation's answer held, and the data grant that asked for it closed
+//                          while the modem has not answered - for `readmit` to follow
+//   modemcheck readmit     past that deactivation's deadline a fresh activation is admitted: its unknown outcome was
+//                          reconciled although nobody was left to answer
 //   modemcheck limits      the limits are exposed, and nothing is left in use
 //   modemcheck republish   a withdrawn modem's grant fails; republication is another modem
 //   modemcheck busy        with a NIC selected, a data grant that may not replace it is refused, and the
@@ -444,10 +449,63 @@ fn uncertain_retired(probe: &Probe) {
 	// with nobody to answer, and its unknown outcome must be reconciled by a query all the same - or the
 	// modem refuses every state change from here on.
 	close(probe.manage);
-	if !until(10, || probe.status().sim == SimState::Ready) {
-		fail(b"uncertain-retired: a retired grant's unanswered PIN was never reconciled");
+	// SO A STATE CHANGE IS ASKED FOR, PAST THAT DEADLINE. The SIM reading ready proves nothing here: the fixture
+	// indicated the unlocking before the expiry was even reached, and the old service, which dropped the call,
+	// read it ready too.
+	sleep_until(clock() + 6 * TICKS);
+	readmitted(probe, b"uncertain-retired");
+	say(b"PASS uncertain-retired: a PIN whose grant ended before the modem answered was reconciled - a state change was admitted after its deadline");
+}
+
+// A STATE CHANGE ADMITTED: a fresh activation through this run's data grant comes up, and is deactivated again. One
+// the modem refuses as busy is a modem still waiting to be reconciled.
+fn readmitted(probe: &Probe, step: &[u8]) {
+	let mut line = Vec::from(step);
+	if !until(3, || unlinked(probe)) {
+		line.extend_from_slice(b": NetworkService had a link before the activation");
+		fail(&line);
 	}
-	say(b"PASS uncertain-retired: a PIN whose grant ended before the modem answered was reconciled by a fresh query");
+	let context = match probe.data().activate(&probe.modem()) {
+		Some(Ok(status)) if status.state == ContextState::Active => status,
+		Some(Err(Error::Again)) => {
+			line.extend_from_slice(b": the modem refused a state change as busy - the unknown outcome was never reconciled");
+			fail(&line);
+		}
+		_ => {
+			line.extend_from_slice(b": the activation was refused or did not complete");
+			fail(&line);
+		}
+	};
+	if !matches!(probe.data().deactivate(&context.id), Some(Ok(()))) || !until(3, || unlinked(probe)) {
+		line.extend_from_slice(b": the admitted context could not be taken down again");
+		fail(&line);
+	}
+}
+
+// A DEACTIVATION OUT AT THE MODEM WHEN ITS GRANT ENDS: the context comes up, the fixture holds the deactivation's
+// answer, and the data grant that asked for it closes before the modem answers. `readmit`, the next run, asks for a
+// state change past that deactivation's deadline.
+fn deactivate_retired(probe: &Probe) {
+	if !until(3, || unlinked(probe)) {
+		fail(b"deactivate-retired: NetworkService had a link before the activation");
+	}
+	let context = activate_now(probe);
+	probe.fixture_ok(probe.fixture().delay(&CommandKind::Deactivate, &0), b"deactivate-retired: the fixture could not hold the deactivation's answer");
+	let before = probe.stats();
+	// SENT AND NOT WAITED FOR, as `uncertain-retired`'s PIN is.
+	let _ = modem_data::Client::with_deadline(ChannelTransport { chan: probe.data }, 1).deactivate(&context.id);
+	if !until(3, || probe.stats().commands > before.commands && probe.status().context.is_some_and(|context| context.state == ContextState::Deactivating)) {
+		fail(b"deactivate-retired: the deactivation never reached the modem");
+	}
+	close(probe.data);
+	say(b"deactivate-retired: a deactivation is out at the modem and the data grant that asked for it has ended");
+}
+
+// PAST THE DEADLINE OF THE DEACTIVATION `deactivate-retired` LEFT OUT: a fresh activation must be admitted.
+fn readmit(probe: &Probe) {
+	sleep_until(clock() + 6 * TICKS);
+	readmitted(probe, b"readmit");
+	say(b"PASS readmit: a deactivation whose grant ended before the modem answered was reconciled - a fresh activation was admitted after its deadline");
 }
 
 fn limits(probe: &Probe) {
@@ -524,6 +582,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		b"lock" => lock(&probe),
 		b"uncertain" => uncertain(&probe),
 		b"uncertain-retired" => uncertain_retired(&probe),
+		b"deactivate-retired" => deactivate_retired(&probe),
+		b"readmit" => readmit(&probe),
 		b"limits" => limits(&probe),
 		b"republish" => republish(&probe),
 		b"busy" => busy(&probe),

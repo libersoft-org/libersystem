@@ -10,7 +10,6 @@
 // `hid` module.
 
 use alloc::vec::Vec;
-use rt::*;
 
 use crate::{CC_SHORT_PACKET, CC_STALL, CC_SUCCESS, DESC_CONFIG, FEATURE_DEVICE_REMOTE_WAKEUP, FEATURE_ENDPOINT_HALT, REQ_CLEAR_FEATURE, REQ_GET_DESCRIPTOR, REQ_SET_CONFIGURATION, REQ_SET_FEATURE, RT_ENDPOINT, TRB_CONFIGURE_ENDPOINT, TRB_EV_TRANSFER, TRB_IOC, TRB_NORMAL};
 use crate::{Ring, UsbDevice, Xhci};
@@ -46,10 +45,8 @@ impl Hid {
 	// attach.
 	pub fn release(&mut self) {
 		self.ring.release();
-		if self.page.handle != 0 {
-			close(self.page.handle);
-			self.page.handle = 0;
-		}
+		drivers::common::release_dma(self.page.handle);
+		self.page.handle = 0;
 	}
 
 	pub fn has_gamepad(&self) -> bool {
@@ -151,7 +148,7 @@ pub unsafe fn configure_hid(hc: &mut Xhci, dev: &mut UsbDevice, pads: &mut Pads)
 						ring.release();
 					}
 					if let Some((handle, _, _)) = page {
-						close(handle);
+						drivers::common::release_dma(handle);
 					}
 					for mut made in interfaces {
 						made.release();

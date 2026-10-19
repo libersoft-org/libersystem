@@ -75,6 +75,12 @@ const MAX_CONTROLLERS: usize = bt_bounds::CONTROLLERS;
 const MAX_CLIENTS: usize = bt_bounds::CLIENT_CONNECTIONS;
 // Commands queued for one controller before a send is refused.
 const MAX_QUEUED: usize = 16;
+// The queue a standing attempt's rebuild leaves free as it is fed: a link's encryption, a disconnect, an operator's own.
+const REBUILD_HEADROOM: usize = 4;
+// How long after the standing attempt failed on its own it is taken up again.
+const REARM_TICKS: u64 = TICKS_PER_SECOND;
+// The status an LE connection attempt cancelled by the host completes with.
+const STATUS_UNKNOWN_CONNECTION: u8 = 0x02;
 // Open report streams per link.
 const MAX_STREAMS: usize = 4;
 // A scan: the caller's deadline is capped, and so is what it may find.
@@ -612,6 +618,27 @@ impl Controller {
 		self.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(on))
 	}
 
+	// THE STANDING ATTEMPT'S REBUILD, fed to the queue as it has room - keeping room for what a link needs meanwhile, its
+	// encryption above all - and the attempt queued behind the lists once they all are.
+	fn feed_rebuild(&mut self) {
+		while self.pending.len() + REBUILD_HEADROOM < MAX_QUEUED {
+			let Some((op, mut params)) = self.le.rebuild.pop_front() else { break };
+			let queued = self.command(op, &params);
+			scrub(&mut params);
+			if !queued {
+				self.le.clear_rebuild();
+				return;
+			}
+		}
+		if self.le.arming && self.le.rebuild.is_empty() && self.pending.len() < MAX_QUEUED {
+			self.le.arming = false;
+			let own = self.le.own_type();
+			if self.le_create_connection(&hci_codec::create_connection_accepted(own)) {
+				self.le.accepting = true;
+			}
+		}
+	}
+
 	fn le_create_connection(&mut self, legacy: &[u8; 25]) -> bool {
 		if self.extended {
 			return self.command(service_logic::le_iso::opcode::LE_EXTENDED_CREATE_CONNECTION, &service_logic::le_iso::extended_create_connection(legacy));
@@ -651,6 +678,7 @@ impl Controller {
 	// credit comes back on the controller's own completion - never on the transport's acceptance,
 	// which is the defect `hci::Credits` exists to rule out. Then whatever link data the buffers allow.
 	fn pump(&mut self) {
+		self.feed_rebuild();
 		self.flush_links();
 		if self.stalled || self.outstanding.is_some() || self.pending.is_empty() {
 			return;
@@ -1207,14 +1235,24 @@ impl Stack {
 			}
 			opcode::LE_CREATE_CONNECTION | service_logic::le_iso::opcode::LE_EXTENDED_CREATE_CONNECTION => {
 				controller.le.accepting = false;
+				// Nothing is out, so nothing is left for a cancellation's marks to be consumed by.
+				controller.le.relist = false;
+				controller.le.rotate = false;
 				if let Some(peer) = controller.reconnect.take() {
 					controller.fail_attempt(&peer);
 				}
+				let mut operator = false;
 				if let Some(attempt) = controller.attempt.as_mut()
 					&& attempt.peer[0] != KIND_BREDR
 					&& attempt.state == PairingState::Connecting
 				{
 					attempt.state = PairingState::Failed;
+					operator = true;
+				}
+				// AN OPERATOR'S ATTEMPT THE CONTROLLER REFUSED had set the standing attempt aside, and is taken up again
+				// now: a refusal at Command Status never completes, so nothing else would have.
+				if operator {
+					self.reconnect_bonded(at);
 				}
 			}
 			opcode::LE_GENERATE_DHKEY => {
@@ -1273,9 +1311,13 @@ impl Stack {
 				self.reconnect_bonded(at);
 			} else if !through_list {
 				// AN OPERATOR'S ATTEMPT THAT ENDED WITHOUT A LINK - refused, or cancelled at its sixty seconds - had set the
-				// standing attempt aside; it is taken up again now. (The standing attempt failing on its own is not
-				// re-armed here, which would retry a controller's refusal in a loop.)
+				// standing attempt aside; it is taken up again now.
 				self.reconnect_bonded(at);
+			} else if status != STATUS_UNKNOWN_CONNECTION {
+				// THE STANDING ATTEMPT FAILED ON ITS OWN - a peripheral that missed its first connection events (0x3E),
+				// say - and is taken up again after a pause, which is what keeps a controller that fails it every time
+				// from a loop. Left down, no absent bonded peripheral reconnected until something unrelated took it up.
+				controller.le.rearm_at = Some(clock().saturating_add(REARM_TICKS));
 			}
 			return;
 		}
@@ -1298,12 +1340,6 @@ impl Stack {
 		link.reconnecting = reconnecting;
 		link.local = controller.le.local(local_address(controller));
 		controller.links.push(link);
-		// THE STANDING ATTEMPT ENDS WITH THE FIRST DEVICE IT CONNECTS, and the bonded peers still absent are waited for
-		// again at once: of two LE input devices, or the two earbuds of a set, the second came back only when the first
-		// left.
-		if through_list {
-			self.reconnect_bonded(at);
-		}
 		if pairing_peer {
 			self.start_le_pairing(at, handle, connection_peer);
 		} else {
@@ -1332,6 +1368,16 @@ impl Stack {
 				}
 				None => self.controllers[at].disconnect(handle, REASON_AUTHENTICATION),
 			}
+		}
+		// THE STANDING ATTEMPT ENDS WITH THE FIRST DEVICE IT CONNECTS, and the bonded peers still absent are waited for
+		// again at once: of two LE input devices, or the two earbuds of a set, the second came back only when the first
+		// left. Behind the link's encryption, which is queued first, and from a new private address first where the
+		// cancellation this connection overtook was for one - left set, that mark stopped every later rotation.
+		if through_list {
+			if core::mem::take(&mut self.controllers[at].le.rotate) {
+				self.rotate_address(at);
+			}
+			self.reconnect_bonded(at);
 		}
 	}
 
@@ -1671,6 +1717,9 @@ impl Stack {
 			if let Some(due) = controller.bredr_state.next_deadline(&controller.links) {
 				soonest = soonest.min(due);
 			}
+			if let Some(due) = controller.le.rearm_at {
+				soonest = soonest.min(due);
+			}
 		}
 		soonest
 	}
@@ -1715,6 +1764,11 @@ impl Stack {
 			let controller = &self.controllers[at];
 			if controller.powered && controller.le.own.is_some() && now >= controller.le.rotate_at && controller.attempt.as_ref().is_none_or(|attempt| attempt.state != PairingState::Connecting) {
 				self.rotate_due(at);
+			}
+			// THE STANDING ATTEMPT THAT FAILED ON ITS OWN, taken up again after its pause.
+			if self.controllers[at].le.rearm_at.is_some_and(|due| now >= due) {
+				self.controllers[at].le.rearm_at = None;
+				self.reconnect_bonded(at);
 			}
 		}
 	}

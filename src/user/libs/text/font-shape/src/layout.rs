@@ -10,6 +10,52 @@
 use font_parse::{Error, Malformed, Reader};
 use opentype_profile::{Unsupported, layout as profile};
 
+use crate::buffer::{Buffer, GlyphInfo};
+
+/// The lookup flags, by the bits the format gives them.
+pub const RIGHT_TO_LEFT: u16 = 0x0001;
+pub const IGNORE_BASE_GLYPHS: u16 = 0x0002;
+pub const IGNORE_LIGATURES: u16 = 0x0004;
+pub const IGNORE_MARKS: u16 = 0x0008;
+pub const USE_MARK_FILTERING_SET: u16 = 0x0010;
+pub const MARK_ATTACHMENT_TYPE: u16 = 0xFF00;
+
+/// `GDEF`'s mark glyph sets: the sets a lookup's `useMarkFilteringSet` restricts it to.
+///
+/// EMPTY WHEN THE FACE HAS NONE, and a lookup that names a set the face does not have then has no
+/// mark in it - which is what the format's own reading gives a set that is not there.
+#[derive(Clone, Copy, Default)]
+pub struct MarkSets<'a> {
+	table: Option<Reader<'a>>,
+}
+
+impl<'a> MarkSets<'a> {
+	/// The sets of a `MarkGlyphSetsDef` table.
+	pub fn new(table: Option<Reader<'a>>) -> Self {
+		Self { table }
+	}
+
+	/// Whether set `set` holds `glyph`.
+	pub fn covers(&self, set: u16, glyph: u16) -> Result<bool, Error> {
+		let bad = || Error::Malformed(Malformed::InconsistentTable { table: *b"GDEF" });
+		let Some(table) = self.table else { return Ok(false) };
+		let mut reader = table;
+		let format = reader.u16().ok_or_else(bad)?;
+		if format != 1 {
+			return Err(Error::Unsupported(Unsupported::SubtableFormat { table: *b"GDEF", format }));
+		}
+		let count = reader.u16().ok_or_else(bad)?;
+		if set >= count {
+			return Ok(false);
+		}
+		// THE OFFSETS ARE 32 BITS WIDE here, unlike every other offset a lookup reads.
+		reader.seek(4 + set as usize * 4).ok_or_else(bad)?;
+		let offset = reader.u32().ok_or_else(bad)? as usize;
+		let coverage = table.slice(offset, table.len().checked_sub(offset).ok_or_else(bad)?).ok_or_else(bad)?;
+		Ok(coverage_index(coverage, glyph)?.is_some())
+	}
+}
+
 /// A `GSUB` or `GPOS` table, opened and checked.
 #[derive(Clone, Copy)]
 pub struct LayoutTable<'a> {
@@ -18,6 +64,7 @@ pub struct LayoutTable<'a> {
 	features: usize,
 	lookups: usize,
 	tag: [u8; 4],
+	marks: MarkSets<'a>,
 }
 
 /// One feature: its tag, and the lookups it turns on.
@@ -38,6 +85,7 @@ pub struct Lookup<'a> {
 	table: Reader<'a>,
 	subtables: usize,
 	offset: usize,
+	marks: MarkSets<'a>,
 }
 
 impl<'a> LayoutTable<'a> {
@@ -60,7 +108,13 @@ impl<'a> LayoutTable<'a> {
 				return Err(bad());
 			}
 		}
-		Ok(Self { table, scripts, features, lookups, tag })
+		Ok(Self { table, scripts, features, lookups, tag, marks: MarkSets::default() })
+	}
+
+	/// The same table, with the face's `GDEF` mark glyph sets for its lookups' flags to read.
+	pub fn with_mark_sets(mut self, marks: MarkSets<'a>) -> Self {
+		self.marks = marks;
+		self
 	}
 
 	fn bad(&self) -> Error {
@@ -180,7 +234,7 @@ impl<'a> LayoutTable<'a> {
 		} else {
 			None
 		};
-		Ok(Lookup { kind, flags, mark_filtering_set, table, subtables, offset: 6 })
+		Ok(Lookup { kind, flags, mark_filtering_set, table, subtables, offset: 6, marks: self.marks })
 	}
 }
 
@@ -242,16 +296,68 @@ impl<'a> Lookup<'a> {
 		self.table.slice(offset, self.table.len().checked_sub(offset)?)
 	}
 
-	/// Whether this lookup skips a glyph, from its flags and the glyph's `GDEF` class.
+	/// Whether this lookup skips a glyph, from its flags and what `GDEF` says about the glyph.
 	///
 	/// THE FLAGS ARE NOT DECORATION. A lookup that says it ignores marks and is applied to them
 	/// anyway attaches an accent to an accent; one that says it ignores ligatures and is not
-	/// re-kerns inside a word that has none.
-	pub fn skips(&self, class: u16) -> bool {
-		let base = self.flags & 0x0002 != 0 && class == 1;
-		let ligature = self.flags & 0x0004 != 0 && class == 2;
-		let mark = self.flags & 0x0008 != 0 && class == 3;
-		base || ligature || mark
+	/// re-kerns inside a word that has none. And the two that NAME marks - a mark glyph set, a mark
+	/// attachment class - say which marks take part: every other mark is passed over as though it
+	/// were not there, which is how one lookup positions a shadda's vowels and leaves the rest alone.
+	pub fn skips(&self, info: &GlyphInfo) -> Result<bool, Error> {
+		self.skips_by(info, self.flags)
+	}
+
+	/// The same, with the class flags left out: what a mark-to-mark rule searches back with, which
+	/// passes over only the marks the lookup does not name.
+	pub fn skips_marks_named(&self, info: &GlyphInfo) -> Result<bool, Error> {
+		self.skips_by(info, self.flags & !(IGNORE_BASE_GLYPHS | IGNORE_LIGATURES | IGNORE_MARKS))
+	}
+
+	fn skips_by(&self, info: &GlyphInfo, flags: u16) -> Result<bool, Error> {
+		let class = info.class;
+		if (flags & IGNORE_BASE_GLYPHS != 0 && class == 1) || (flags & IGNORE_LIGATURES != 0 && class == 2) || (flags & IGNORE_MARKS != 0 && class == 3) {
+			return Ok(true);
+		}
+		if class == 3 {
+			if flags & USE_MARK_FILTERING_SET != 0 {
+				let Some(set) = self.mark_filtering_set else { return Ok(true) };
+				return Ok(!self.marks.covers(set, info.glyph)?);
+			}
+			let wanted = (flags & MARK_ATTACHMENT_TYPE) >> 8;
+			if wanted != 0 {
+				return Ok(info.mark_class != wanted);
+			}
+		}
+		Ok(false)
+	}
+
+	/// THE NEXT GLYPH THIS LOOKUP SEES after `from`: the first one its flags do not skip.
+	///
+	/// EVERY GLYPH OF A MATCH AFTER ITS FIRST IS FOUND THIS WAY, and that is what the flags are for. A
+	/// lookup that ignores marks forms lam-alef across a fatha written between the two letters, and
+	/// kerns a pair across an accent; reading the next buffer slot instead would see the mark as the
+	/// neighbour and match nothing.
+	pub fn next(&self, buffer: &Buffer, from: usize) -> Result<Option<usize>, Error> {
+		let mut at = from + 1;
+		while at < buffer.len() {
+			if !self.skips(&buffer.infos[at])? {
+				return Ok(Some(at));
+			}
+			at += 1;
+		}
+		Ok(None)
+	}
+
+	/// The nearest glyph this lookup sees BEFORE `from`, which is what a backtrack is matched against.
+	pub fn previous(&self, buffer: &Buffer, from: usize) -> Result<Option<usize>, Error> {
+		let mut at = from;
+		while at > 0 {
+			at -= 1;
+			if !self.skips(&buffer.infos[at])? {
+				return Ok(Some(at));
+			}
+		}
+		Ok(None)
 	}
 }
 

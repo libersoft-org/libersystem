@@ -105,4 +105,7 @@ interface camera-fixture {
 	@op(6) withdraw:    func() -> result<unit, error>;
 	@op(7) republish:   func() -> result<unit, error>;
 	@op(8) stats:       func() -> result<camera-fixture-stats, error>;
+	/// Hold the next negotiation's answer for `delay-ms`, which must not be zero: the window a client can end in
+	/// while its camera's provider has not answered.
+	@op(9) delay-negotiate: func(delay-ms: u32) -> result<unit, error>;
 }

@@ -699,7 +699,7 @@ say "a shutdown typed during a held drivers' step ended the transaction, and the
 
 # ------------------------------------------------------------------ the platform boot
 
-# THE SECOND BOOT: P02M0196d's fixture SSDT with the sleep gate's devices - the lid, the control-method power and sleep
+# THE SECOND BOOT: the ACPI fixture's SSDT with the sleep gate's devices - the lid, the control-method power and sleep
 # buttons and a Time and Alarm Device - and the development switch naming the CMOS RTC absent, so the wall clock is the
 # TAD's and a suspend to RAM's timed wake is the TAD's timer. The harness plays the TAD's clock FIVE YEARS AHEAD of the
 # host's, and keeps it running.
@@ -1136,7 +1136,7 @@ run_soft_off_fallback() {
 	say "soft-off: with the registration refused, power-off took the fixed ports"
 }
 
-# THE WATCHDOG BOOT: P02M0200's i6300esb armed by the policy at 15 s, and `-action watchdog=pause`, which every QMP boot
+# THE WATCHDOG BOOT: an i6300esb armed by the policy at 15 s, and `-action watchdog=pause`, which every QMP boot
 # carries - so an expiry leaves QEMU in the run state `watchdog` until somebody continues it. A suspend to idle three
 # times longer than the timeout, `running` at every reading through it and after; then a resume made to hang after the
 # drivers (ServiceManager's development hook) - the driver re-armed first, at most `RESUME_WATCH_MS`, and nothing after

@@ -1,4 +1,4 @@
-use super::{MAX_ADDRESS, Refusal, check, give, is_free, offline, online, register, state, take, totals};
+use super::{MAX_ADDRESS, MAX_BLOCKS, Refusal, check, give, is_free, offline, online, register, state, take, totals};
 
 const MIB: u64 = 1 << 20;
 
@@ -11,6 +11,10 @@ fn a_plugged_range_is_whole_blocks_over_nothing_the_machine_has() {
 	assert_eq!(check(0x2_0010_0000, 512 * MIB, 2 * MIB, &ram), Err(Refusal::Unaligned), "a base inside a block");
 	assert_eq!(check(0x2_0000_0000, 3 * MIB, 2 * MIB, &ram), Err(Refusal::Unaligned), "a size that is not whole blocks");
 	assert_eq!(check(0x2_0000_0000, 0, 2 * MIB, &ram), Err(Refusal::Unaligned), "no size");
+	// AT MOST `MAX_BLOCKS`, so the state call always reports the whole region: 64 GiB in 2 MiB blocks, and not a block
+	// more.
+	assert_eq!(check(0x20_0000_0000, MAX_BLOCKS * 2 * MIB, 2 * MIB, &ram), Ok(()), "exactly the most blocks");
+	assert_eq!(check(0x20_0000_0000, (MAX_BLOCKS + 1) * 2 * MIB, 2 * MIB, &ram), Err(Refusal::TooMany), "one block more");
 	assert_eq!(check(0x1_7000_0000, 512 * MIB, 2 * MIB, &ram), Err(Refusal::Overlap), "over the RAM above 4 GiB");
 	assert_eq!(check(MAX_ADDRESS - 2 * MIB, 4 * MIB, 2 * MIB, &ram), Err(Refusal::TooHigh), "past the direct map's shared slot");
 	assert_eq!(check(u64::MAX - 2 * MIB + 1, 4 * MIB, 2 * MIB, &ram), Err(Refusal::TooHigh), "or wrapping");
@@ -42,6 +46,9 @@ fn a_plugged_block_is_used_last_and_goes_offline_only_when_every_frame_is_free()
 	assert_eq!(is_free(BASE), Some(true));
 	assert_eq!(crate::mem::frame::is_free(BASE), true, "and the allocator answers for them");
 	assert!(crate::mem::frame::totals().0 >= 1024, "counted in the machine's total");
+	// AND KEPT OUT OF THE BOOT POOLS' OWN COUNT, which is what a balloon's floor is judged against: its frames come from
+	// the boot pools alone, so free plugged frames must not keep its room open while they drain.
+	assert_eq!(crate::mem::frame::totals().0 - crate::mem::frame::boot_totals().0, totals().0, "the boot pools' count leaves plugged memory out");
 	// A HELD FRAME KEEPS ITS BLOCK.
 	let held = take().expect("a free frame of an online block");
 	assert!((BASE..BASE + 2 * BLOCK).contains(&held));

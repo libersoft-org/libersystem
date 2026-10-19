@@ -409,7 +409,7 @@ fn shape_span(faced: &Faced<'_>, span: &Span, faces: &impl Faces, size: Fixed266
 		let mirror = if right_to_left { faced.mirrored[index] } else { None };
 		spell(face, &text[at..items.clusters[index + 1]], at, mirror, right_to_left, &mut cluster, &mut characters, &mut buffer)?;
 	}
-	font_shape::shape_run(face, &mut buffer, &characters, span.language)?;
+	font_shape::shape_run(face, &mut buffer, &characters, span.language, right_to_left)?;
 	let units = face.header.units_per_em;
 	let mut advances: Vec<Fixed266> = storage(buffer.len())?;
 	for position in &buffer.positions {

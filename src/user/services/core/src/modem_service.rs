@@ -756,7 +756,7 @@ impl Service {
 				self.answer(grant, corr, result, |identity, w| identity.write(w));
 			}
 			Purpose::Activate => self.activated(key, done, payload.and_then(|answer| answer.config)),
-			Purpose::Deactivate { caller } => self.deactivated(done, caller),
+			Purpose::Deactivate { caller } => self.deactivated(key, done, caller),
 			Purpose::Cleanup => {
 				if done.result == mc::Outcome::OutcomeUnknown {
 					self.reconcile(key);
@@ -973,10 +973,19 @@ impl Service {
 		Ok(())
 	}
 
-	fn deactivated(&mut self, done: mc::Completion, caller: Option<(u32, u32)>) {
+	// A DEACTIVATION OF `key`'S CONTEXT ENDED. The context it ends is the one deactivating on that modem, and only that
+	// one: a grant retired while its deactivation was out has had its context ended already, and a context there now is
+	// a newer activation's, which this completion is no answer for. AND WHATEVER IT ENDED WITH BUT `Done`, A
+	// DEACTIVATION NOBODY OWNS ANY MORE IS SETTLED BY A QUERY - the modem was asked to take a context down and nobody
+	// knows whether it did: an expiry left the modem refusing every state change until a query said, and a refusal
+	// left a context up that nobody holds. The query's answer takes such a context down (`reconciled`).
+	fn deactivated(&mut self, key: u32, done: mc::Completion, caller: Option<(u32, u32)>) {
+		let ours = self.context.as_ref().is_some_and(|context| context.modem == key && context.stage == Stage::Deactivating);
 		match done.result {
 			mc::Outcome::Done => {
-				self.end_context(Error::Closed, true);
+				if ours {
+					self.end_context(Error::Closed, true);
+				}
 				if let Some((grant, corr)) = caller {
 					self.answer(grant, corr, Ok(()), |_, _| Some(()));
 				}
@@ -984,21 +993,20 @@ impl Service {
 			// NOT CONFIRMED EITHER WAY: the link cannot be trusted with traffic, so it goes; the modem's
 			// context is unknown until a query says otherwise.
 			mc::Outcome::OutcomeUnknown => {
-				let key = self.context.as_ref().map(|context| context.modem);
-				self.end_context(Error::CommitUncertain, true);
-				if let Some(key) = key {
-					self.reconcile(key);
+				if ours {
+					self.end_context(Error::CommitUncertain, true);
 				}
+				self.reconcile(key);
 				if let Some((grant, corr)) = caller {
 					self.answer::<()>(grant, corr, Err(Error::CommitUncertain), |_, _| Some(()));
 				}
 			}
 			other => {
-				// Refused: the context is still up and still installed.
-				if let Some(context) = self.context.as_mut()
-					&& context.stage == Stage::Deactivating
-				{
+				// Refused: the context is still up - and still installed, when it is still somebody's.
+				if ours && let Some(context) = self.context.as_mut() {
 					context.stage = Stage::Active;
+				} else {
+					self.reconcile(key);
 				}
 				if let Some((grant, corr)) = caller {
 					self.answer::<()>(grant, corr, Err(failure(other)), |_, _| Some(()));
@@ -1287,6 +1295,20 @@ impl modem_admin::Service for AdminView<'_> {
 		let key = modem.key;
 		service.grants.push(GrantConn { id, chan: mine, owner, kind, modem: key, modem_id: modem_id.clone(), sim_generation, policy });
 		Ok(ModemGrant { connection: theirs, modem: modem_id, sim_generation })
+	}
+
+	// ADMIN REVOCATION: every grant on the modem retired, as a closed connection's would be - its connection closed, its
+	// owner let go of, the context it holds ended and torn down at the modem, a state change it had out settled.
+	fn revoke(&mut self, modem: ModemId) -> Result<u32, Error> {
+		let service = &mut *self.service;
+		let revoked: Vec<u32> = service.grants.iter().filter(|grant| grant.modem_id == modem).map(|grant| grant.id).collect();
+		for &id in &revoked {
+			service.retire(id);
+		}
+		if !revoked.is_empty() {
+			print(b"ModemService: an administrator revoked a modem's grants\n");
+		}
+		Ok(revoked.len() as u32)
 	}
 }
 

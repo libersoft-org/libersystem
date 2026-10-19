@@ -12,9 +12,10 @@
 //! WHAT THESE FACES ARE NOT. They are not type design and they draw nothing anybody would want to
 //! read: every glyph is a rectangle, because what a shaper gate reads is which glyph and where, and
 //! an outline that varied per glyph would be a decision nothing checks. What they DO carry is real:
-//! a `cmap` per plane, real `GSUB` ligature, single and multiple substitutions, real `GPOS` pair and
-//! mark-to-base positioning - under `mark`, and under Devanagari's own `abvm` - a real `GDEF` class
-//! definition, and real `fvar`/`gvar`/`HVAR`/`MVAR`.
+//! a `cmap` per plane, real `GSUB` ligature, single and multiple substitutions, real `GPOS` pair,
+//! mark-to-base, mark-to-mark, mark-to-ligature and cursive positioning - under `mark`, `mkmk` and
+//! `curs`, and under Devanagari's own `abvm` - lookups whose flags pass over marks, a real `GDEF`
+//! class definition, and real `fvar`/`gvar`/`HVAR`/`MVAR`.
 //!
 //! AND THEY ARE NOT STAGED INTO ANY IMAGE. A face that exercises Khmer stacking has no business in
 //! a system volume; these live beside the gate that reads them, pinned by SHA-256 so a corpus that
@@ -118,6 +119,11 @@ fn alphabetic() -> Authored {
 		("less", drawn(560, 500)),
 		("greater", drawn(560, 500)),
 		("zwsp", Glyph::blank(0)),
+		// APPENDED TOO. A Latin accent and an Arabic vowel, each a mark - the two that sit BETWEEN
+		// letters a lookup has to see past: the accent between a kerned pair, the fatha between the lam
+		// and the alef its ligature is formed from.
+		("acute", mark(120, 720, 820)),
+		("fatha", mark(160, 560, 640)),
 	];
 	let id = |name: &str| glyphs.iter().position(|(known, _)| *known == name).expect("a glyph this face declares") as u16;
 
@@ -142,6 +148,8 @@ fn alphabetic() -> Authored {
 		(0x003C, id("less")),
 		(0x003E, id("greater")),
 		(0x200B, id("zwsp")),
+		(0x0301, id("acute")),
+		(0x064E, id("fatha")),
 	];
 
 	// THE LOOKUP ORDER IS THE FACE'S MEANING. The joining forms run first and the required ligature
@@ -160,8 +168,9 @@ fn alphabetic() -> Authored {
 		Lookup::new(1, layout::single(&[(id("beh"), id("beh.medi")), (id("jeem"), id("jeem.medi")), (id("lam"), id("lam.medi"))])),
 		// 4: fina
 		Lookup::new(1, layout::single(&[(id("alef"), id("alef.fina")), (id("beh"), id("beh.fina")), (id("jeem"), id("jeem.fina")), (id("lam"), id("lam.fina"))])),
-		// 5: rlig
-		Lookup::new(4, layout::ligature(&[(vec![id("lam.init"), id("alef.fina")], id("lam_alef"))])),
+		// 5: rlig. IGNORING MARKS, as every Arabic face's required ligature is: a fatha written between
+		// the lam and the alef does not stop the two becoming one glyph, and stays to sit on the lam half.
+		Lookup::ignoring_marks(4, layout::ligature(&[(vec![id("lam.init"), id("alef.fina")], id("lam_alef"))])),
 	];
 	let gsub = layout::table(
 		&[ScriptEntry { tag: *b"latn", features: vec![0] }, ScriptEntry { tag: *b"arab", features: vec![1, 2, 3, 4, 5] }],
@@ -184,10 +193,23 @@ fn alphabetic() -> Authored {
 		Lookup::ignoring_marks(2, layout::pair(&[(id("A"), id("V"), KERN_AV), (id("V"), id("A"), KERN_VA)])),
 		// 1: mark
 		Lookup::new(4, layout::mark_to_base(&[(id("dagesh"), 0, (45, 285)), (id("qamats"), 1, (80, -135)), (id("sheva"), 1, (60, -155))], &[(id("he.alef"), vec![(300, 350), (310, -120)]), (id("he.bet"), vec![(290, 330), (300, -110)])], 2)),
+		// 2: mark - the Latin accent over its letter.
+		Lookup::new(4, layout::mark_to_base(&[(id("acute"), 0, (60, 720))], &[(id("A"), vec![(350, 720)]), (id("V"), vec![(350, 720)])], 1)),
+		// 3: mark - the fatha over a COMPONENT of lam-alef: the lam's half and the alef's.
+		Lookup::new(5, layout::mark_to_ligature(&[(id("fatha"), 0, (80, 560))], &[(id("lam_alef"), vec![vec![(420, 780)], vec![(150, 720)]])], 1)),
+		// 4: curs - the joins of beh and jeem, ROOTED ON THE LAST LETTER as an Arabic face roots them:
+		// each letter hangs from the one after it in the text, which in a right-to-left line is the one
+		// drawn to its left. An initial form only exits and a final form only enters.
+		Lookup::with_flags(3, 0x0001, layout::cursive(&[(id("beh.init"), None, Some((40, 120))), (id("jeem.medi"), Some((430, 60)), Some((30, 160))), (id("beh.fina"), Some((560, 40)), None)])),
 	];
-	let gpos = layout::table(&[ScriptEntry { tag: *b"latn", features: vec![0] }, ScriptEntry { tag: *b"hebr", features: vec![1] }], &[FeatureEntry { tag: *b"kern", lookups: vec![0] }, FeatureEntry { tag: *b"mark", lookups: vec![1] }], &gpos_lookups);
+	let gpos = layout::table(
+		// The feature list in tag order, as the script list is.
+		&[ScriptEntry { tag: *b"arab", features: vec![0, 2] }, ScriptEntry { tag: *b"latn", features: vec![1, 2] }, ScriptEntry { tag: *b"hebr", features: vec![2] }],
+		&[FeatureEntry { tag: *b"curs", lookups: vec![4] }, FeatureEntry { tag: *b"kern", lookups: vec![0] }, FeatureEntry { tag: *b"mark", lookups: vec![1, 2, 3] }],
+		&gpos_lookups,
+	);
 
-	let gdef = layout::gdef(&[(id("A"), id("he.bet"), 1), (id("dagesh"), id("sheva"), 3)]);
+	let gdef = layout::gdef(&[(id("A"), id("he.bet"), 1), (id("dagesh"), id("sheva"), 3), (id("acute"), id("fatha"), 3)]);
 
 	Authored { file: "conformance-alpha.ttf", spec: face("LiberSystem Conformance Alpha", "LiberSystemConformanceAlpha-Regular", glyphs.iter().map(|(_, glyph)| Glyph { contours: glyph.contours.clone(), advance: glyph.advance, left_bearing: glyph.left_bearing }).collect(), cmap, vec![(*b"GDEF", gdef), (*b"GPOS", gpos), (*b"GSUB", gsub)]), glyphs: glyphs.iter().map(|(name, _)| *name).collect() }
 }
@@ -296,8 +318,10 @@ fn complex() -> Authored {
 		),
 		// 1: abvm - the reph over the right of its base.
 		Lookup::new(4, layout::mark_to_base(&[(id("dv.repha"), 0, (100, 640))], &[(id("dv.ka"), vec![(430, 620)]), (id("dv.kha"), vec![(450, 620)]), (id("dv.ra"), vec![(380, 620)])], 1)),
+		// 2: mkmk - the tone mark on the vowel above the consonant, at the vowel's top.
+		Lookup::new(6, layout::mark_to_base(&[(id("th.mai-ek"), 0, (70, 760))], &[(id("th.sara-i"), vec![(100, 740)])], 1)),
 	];
-	let gpos = layout::table(&[ScriptEntry { tag: *b"thai", features: vec![0] }, ScriptEntry { tag: *b"khmr", features: vec![0] }, ScriptEntry { tag: *b"dev2", features: vec![1] }], &[FeatureEntry { tag: *b"mark", lookups: vec![0] }, FeatureEntry { tag: *b"abvm", lookups: vec![1] }], &gpos_lookups);
+	let gpos = layout::table(&[ScriptEntry { tag: *b"thai", features: vec![0, 2] }, ScriptEntry { tag: *b"khmr", features: vec![0] }, ScriptEntry { tag: *b"dev2", features: vec![1] }], &[FeatureEntry { tag: *b"mark", lookups: vec![0] }, FeatureEntry { tag: *b"abvm", lookups: vec![1] }, FeatureEntry { tag: *b"mkmk", lookups: vec![2] }], &gpos_lookups);
 
 	// The marks of this face are marks, and its consonants are bases. `dv.virama` and `km.coeng` are
 	// marks too: a Khmer coeng that a kerning pair did not skip would break every stacked cluster.

@@ -2,7 +2,8 @@
 // by bluetooth_le_reconnect.py. Bond-store IPC and controller commands are mocked;
 // these tests do not claim independent radio, kernel IPC or completed encryption.
 extern crate alloc;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 
 /* EXACT_MODULES */
 mod service_logic {
@@ -103,6 +104,8 @@ impl BondStore<'_> {
 	}
 }
 thread_local! { static SCRUBBED: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) }; }
+// Whether a case expects the private address rotated; any other rotation is a defect.
+thread_local! { static ROTATING: Cell<bool> = const { Cell::new(false) }; }
 const REASON_USER: u8 = 0x13;
 const REASON_AUTHENTICATION: u8 = 0x05;
 
@@ -148,6 +151,7 @@ enum Action {
 	Relist,
 	Command(u16),
 	Create(Vec<u8>),
+	Rotate,
 }
 struct BredrState {
 	watcher: u64,
@@ -231,8 +235,11 @@ impl Stack {
 		}
 		self.controllers[at].actions.push(Action::Relist);
 	}
-	fn rotate_address(&mut self, _: usize) {
-		panic!("unexpected private address rotation")
+	fn rotate_address(&mut self, at: usize) {
+		if !ROTATING.with(Cell::get) {
+			panic!("unexpected private address rotation")
+		}
+		self.controllers[at].actions.push(Action::Rotate);
 	}
 	fn own_irk(&mut self, _: usize) -> Option<[u8; 16]> {
 		Some(IRK)
@@ -314,10 +321,10 @@ fn connect(stack: &mut Stack, status: u8, kind: u8, address: [u8; 6]) {
 	let hci_codec::Event::Connected { status, handle, peer_kind, peer } = hci_codec::event(&event).unwrap() else { panic!("not a connection event") };
 	stack.on_connected(0, status, handle, peer_kind, peer);
 }
-// A CONNECTION THROUGH THE ACCEPT LIST takes the standing attempt up again at once, for the bonded peers still absent,
-// before anything is decided about the device it connected.
+// A CONNECTION THROUGH THE ACCEPT LIST takes the standing attempt up again at once, for the bonded peers still absent -
+// behind what is decided about the device it connected, its encryption above all, which goes first.
 fn rearmed(through_list: bool, then: Action) -> Vec<Action> {
-	if through_list { vec![Action::Relist, then] } else { vec![then] }
+	if through_list { vec![then, Action::Relist] } else { vec![then] }
 }
 fn reused(stack: &Stack, identity: Peer, legacy: bool, through_list: bool) {
 	assert_eq!(*stack.reads.borrow(), [identity], "only stored identity may select its bond");
@@ -534,9 +541,25 @@ fn pair_completion_cases() {
 	assert!(s.controllers[0].actions.is_empty());
 	println!("13 actual pair-to-completion identity/policy/failure cases passed");
 }
+// A ROTATION WITH THE ATTEMPT OUT, its cancellation overtaken by a connection through the list: the rotate mark is
+// consumed - left set, it stopped every later rotation while the attempt it re-armed was out - the address is rotated,
+// and only then is the attempt taken up again.
+fn rotation_cases() {
+	let rpa = bt_keys::private_address(&IRK, 0x12_3456);
+	let mut s = stack(IDENTITY, false);
+	s.controllers[0].le.relist = true;
+	s.controllers[0].le.rotate = true;
+	ROTATING.with(|rotating| rotating.set(true));
+	connect(&mut s, 0, 1, rpa);
+	ROTATING.with(|rotating| rotating.set(false));
+	assert_eq!(s.controllers[0].actions, [Action::Secure(7, [0x42; 16]), Action::Rotate, Action::Relist], "the overtaken rotation is made before the attempt is taken up again");
+	assert!(!s.controllers[0].le.rotate && !s.controllers[0].le.relist, "and both marks are consumed");
+	println!("1 actual rotation-overtaken case passed");
+}
 fn main() {
 	if !std::env::args().any(|arg| arg == "--forget-only") {
 		connection_cases();
+		rotation_cases();
 	}
 	forget_cases();
 	if !std::env::args().any(|arg| arg == "--forget-only") {

@@ -272,6 +272,17 @@ impl Clients {
 		Some(core::mem::replace(&mut self.entries[at], (0, Sessions::new())).1)
 	}
 
+	// THE DRIVER ENDING, stopped or not: every connection's sessions destroyed at the device, as a connection that goes
+	// has its own destroyed. A reset is not known to close a backend's sessions - and their keys - and a driver started
+	// after this one has no ids to destroy them with.
+	fn destroy_all(&mut self, engine: &mut Engine) {
+		for (_, sessions) in self.entries.iter_mut() {
+			for session in sessions.drain() {
+				let _ = engine.destroy(session);
+			}
+		}
+	}
+
 	// After a sleep that cut the power: the device holds no session, so no connection does either.
 	fn forget_all(&mut self) -> usize {
 		let mut forgotten = 0;
@@ -390,6 +401,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		loop {
 			match common::wait_providers_until(bootstrap, &bind, &mut serving, &[], 0) {
 				None => {
+					clients.destroy_all(&mut engine);
 					if common::stop_requested() {
 						common::finish_stop(bootstrap, &bind, device.capability, common::quiesce_virtio());
 					}
@@ -397,6 +409,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 				Some(None) => {
 					if !common::take_sleep_step(bootstrap, &bind, &mut Sleep { device: &device, engine: &mut engine, clients: &mut clients, serving: &mut serving, stopped: false }) {
+						clients.destroy_all(&mut engine);
 						if common::stop_requested() {
 							common::finish_stop(bootstrap, &bind, device.capability, common::quiesce_virtio());
 						}

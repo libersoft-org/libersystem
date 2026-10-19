@@ -211,7 +211,10 @@ fn run_case(bytes: &[u8], pinned: &Pinned, case: &Case<'_>) -> Result<(), String
 		at += character.len_utf8() as u32;
 	}
 
-	font_shape::shape_run(&face, &mut buffer, &characters, *b"dflt").map_err(|error| format!("shaping refused the run: {error:?}"))?;
+	// IN THE DIRECTION THE CASE'S ONE RUN READS, which is the pipeline's answer for the string.
+	let source = text_pipeline::Source::new(case.text).map_err(|error| format!("the text is refused: {error:?}"))?;
+	let right_to_left = text_pipeline::stages::resolve_levels(text_pipeline::stages::itemise(source), unicode_bidi::ParagraphDirection::Auto).levels.paragraph_level % 2 == 1;
+	font_shape::shape_run(&face, &mut buffer, &characters, *b"dflt", right_to_left).map_err(|error| format!("shaping refused the run: {error:?}"))?;
 
 	if buffer.len() != case.expect.len() {
 		return Err(format!("expected {} glyph(s), got {}: {}", case.expect.len(), buffer.len(), describe(&buffer, pinned)));

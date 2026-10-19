@@ -1,4 +1,4 @@
-# THE DERIVED PART OF P02M0135's LOCKFILE. Frozen after the converging audit link, and before
+# THE DERIVED PART OF THE FOREIGN SUBSTRATE'S LOCKFILE. Frozen after the converging audit link, and before
 # anything is declared done.
 #
 # WHY IT COMES LAST. Everything here is an OUTPUT of this milestone's own measurements: the platform
@@ -20,7 +20,7 @@
 applies_to = "vulkan-sdk-1.4.357.0"
 series = [
 	{ order = 1, path = "src/foreign/patches/0001-portable-static-target.patch", sha256 = "911e5bf3689624affccd6e7373409e251f6052af3a8eddcee0dc68e52a8ea45c", part = "static-target", describes = "the platform surface, declared and not defined" },
-	{ order = 2, path = "src/foreign/patches/0002-platform-port.patch", sha256 = "bb53f95588b4d0ecca82de990f7beb36e83621cecd3982b819775c1120756eaf", part = "derived", describes = "no environment, and no layers" },
+	{ order = 2, path = "src/foreign/patches/0002-platform-port.patch", sha256 = "195cf53c7d830fc3e171828e755d1b8652a775a6e4c20bb440a751bb5cfc07b7", part = "derived", describes = "no environment, no layers, and one way to load a driver" },
 ]
 
 [generated_sources]
@@ -78,16 +78,18 @@ inventory = "src/foreign/INVENTORY-pass2.json"
 # the stop-condition scopes and the lifecycle entries did not move on any target; what moved is the
 # three ELF sizes below, by the bounded entry point, and the inventory gained the negotiated
 # interface range it is required to record beside the symbols.
-inventory_sha256 = "aac23d48c48dc6ce2035022a5bd01881bb3012d45c24f2d863f755ab2aa5f605"
+# REFROZEN 2026-10-19, after the platform port took out the loader's direct-driver path: again only
+# the three ELF sizes moved, each smaller by that path, and nothing else in the inventory.
+inventory_sha256 = "7ed14cdd03e39fb02cb8f3addf196e9b1ae8139cc001ba65137c6dae571b477f"
 tool = "src/tools/foreign-audit-link.py"
 tool_sha256 = "a087a519e787322878256e73901aab2c406ec62e2e8c839baae76457191bb9e8"
 surface = 52
 # Of which forty-eight come from the substrate crates and four from the runtime; see the
 # compiler-runtime section, which the artifact check corrected.
 resolved_from_substrate = 48
-x86_64 = { elf_bytes = 618152, converged = true }
-aarch64 = { elf_bytes = 639992, converged = true }
-riscv64 = { elf_bytes = 957784, converged = true }
+x86_64 = { elf_bytes = 614720, converged = true }
+aarch64 = { elf_bytes = 636504, converged = true }
+riscv64 = { elf_bytes = 952816, converged = true }
 
 [forbidden_mechanisms]
 # THE MECHANISMS THIS PROFILE REFUSES, with the flags that stop them being emitted and the gate that

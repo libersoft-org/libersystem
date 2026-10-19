@@ -9,11 +9,12 @@
 //! cannot be read without reading its format first - and reading it wrong shifts every field after
 //! it, which looks like a font with wild kerning rather than like a parser bug.
 
+use alloc::vec::Vec;
 use font_parse::{Error, Malformed, Reader};
 use opentype_profile::Unsupported;
 
-use crate::buffer::Buffer;
-use crate::layout::{class_of, coverage_index};
+use crate::buffer::{Buffer, GlyphInfo};
+use crate::layout::{Lookup, RIGHT_TO_LEFT, class_of, coverage_index};
 
 fn bad() -> Error {
 	Error::Malformed(Malformed::InconsistentTable { table: *b"GPOS" })
@@ -54,12 +55,15 @@ fn apply_value(format: u16, reader: &mut Reader<'_>, position: &mut crate::buffe
 /// Apply one positioning subtable at one position. The contextual types are in `context`, for the
 /// same reason they are there for substitution: they apply other lookups rather than positioning
 /// anything themselves.
-pub fn apply_subtable(kind: u16, subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Error> {
+///
+/// `lookup` is the lookup the subtable belongs to, whose flags say which glyphs are passed over on the
+/// way to a pair's second glyph, a cursive join's other half and a stacked mark's parent.
+pub fn apply_subtable(kind: u16, subtable: Reader<'_>, buffer: &mut Buffer, at: usize, lookup: &Lookup<'_>) -> Result<bool, Error> {
 	match kind {
 		1 => single(subtable, buffer, at),
-		2 => pair(subtable, buffer, at),
-		4 | 6 => mark(kind, subtable, buffer, at),
-		3 => cursive(subtable, buffer, at),
+		2 => pair(subtable, buffer, at, lookup),
+		4 | 6 => mark(kind, subtable, buffer, at, lookup),
+		3 => cursive(subtable, buffer, at, lookup),
 		5 => mark_to_ligature(subtable, buffer, at),
 		other => Err(Error::Unsupported(Unsupported::GposLookup(other))),
 	}
@@ -98,10 +102,11 @@ fn single(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, 
 }
 
 /// Type 2: a pair adjustment - kerning, in both the glyph-pair and the class-pair forms.
-fn pair(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Error> {
-	if at + 1 >= buffer.len() {
-		return Ok(false);
-	}
+///
+/// THE SECOND GLYPH IS THE NEXT ONE THE LOOKUP SEES, so a kerning rule that ignores marks kerns a pair
+/// with an accent between them - which is every pointed or vocalised word.
+fn pair(subtable: Reader<'_>, buffer: &mut Buffer, at: usize, lookup: &Lookup<'_>) -> Result<bool, Error> {
+	let Some(second_at) = lookup.next(buffer, at)? else { return Ok(false) };
 	let mut reader = subtable;
 	let format = reader.u16().ok_or_else(bad)?;
 	let coverage_offset = reader.u16().ok_or_else(bad)? as usize;
@@ -109,7 +114,7 @@ fn pair(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Er
 	let second_format = reader.u16().ok_or_else(bad)?;
 	let coverage = subtable.slice(coverage_offset, subtable.len().checked_sub(coverage_offset).ok_or_else(bad)?).ok_or_else(bad)?;
 	let first = buffer.infos[at].glyph;
-	let second = buffer.infos[at + 1].glyph;
+	let second = buffer.infos[second_at].glyph;
 	let Some(index) = coverage_index(coverage, first)? else { return Ok(false) };
 	match format {
 		1 => {
@@ -132,7 +137,7 @@ fn pair(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Er
 					continue;
 				}
 				apply_value(first_format, &mut entry, &mut buffer.positions[at])?;
-				apply_value(second_format, &mut entry, &mut buffer.positions[at + 1])?;
+				apply_value(second_format, &mut entry, &mut buffer.positions[second_at])?;
 				return Ok(true);
 			}
 			Ok(false)
@@ -158,7 +163,7 @@ fn pair(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Er
 			let mut entry = subtable;
 			entry.seek(offset).ok_or_else(bad)?;
 			apply_value(first_format, &mut entry, &mut buffer.positions[at])?;
-			apply_value(second_format, &mut entry, &mut buffer.positions[at + 1])?;
+			apply_value(second_format, &mut entry, &mut buffer.positions[second_at])?;
 			Ok(true)
 		}
 		other => Err(Error::Unsupported(Unsupported::SubtableFormat { table: *b"GPOS", format: other })),
@@ -170,7 +175,7 @@ fn pair(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Er
 /// THIS IS THE RULE THAT MAKES A SCRIPT RENDER AT ALL. An accent placed at the pen instead of at its
 /// anchor is not a small error: Arabic, Hebrew and Devanagari become a row of disconnected pieces,
 /// and a reader who does not know the script cannot tell that anything is wrong.
-fn mark(kind: u16, subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Error> {
+fn mark(kind: u16, subtable: Reader<'_>, buffer: &mut Buffer, at: usize, lookup: &Lookup<'_>) -> Result<bool, Error> {
 	// A mark attaches to what PRECEDES it, so there is nothing to do at the start of a run.
 	if at == 0 {
 		return Ok(false);
@@ -189,18 +194,27 @@ fn mark(kind: u16, subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Resu
 	let mark_coverage = subtable.slice(mark_coverage_at, subtable.len().checked_sub(mark_coverage_at).ok_or_else(bad)?).ok_or_else(bad)?;
 	let Some(mark_index) = coverage_index(mark_coverage, buffer.infos[at].glyph)? else { return Ok(false) };
 
-	// The base is the nearest preceding glyph of the right kind: for type 4 a base, for type 6
-	// another mark. Walking back rather than taking `at - 1` is what makes two stacked accents
-	// attach to each other and to the letter rather than all to the letter.
-	let mut base_at = None;
-	for candidate in (0..at).rev() {
-		let class = buffer.infos[candidate].class;
-		let wanted = if kind == 4 { class != 3 } else { class == 3 };
-		if wanted {
-			base_at = Some(candidate);
-			break;
+	// FOR TYPE 4 THE BASE IS THE NEAREST GLYPH BEFORE THE MARK THAT IS NOT A MARK, whatever else the
+	// lookup's flags say: every mark between the two hangs from that base as well.
+	//
+	// FOR TYPE 6 IT IS THE ONE GLYPH BEFORE - the nearest the lookup sees once only the marks it does
+	// not name are passed over - and that glyph has to be a mark, of the same base or of the same
+	// component of one ligature. A base there ends the search: walking on past it attached an accent
+	// on one letter to the previous letter's accent.
+	let base_at = if kind == 4 {
+		(0..at).rev().find(|candidate| buffer.infos[*candidate].class != 3)
+	} else {
+		let mut found = None;
+		let mut candidate = at;
+		while candidate > 0 {
+			candidate -= 1;
+			if !lookup.skips_marks_named(&buffer.infos[candidate])? {
+				found = Some(candidate);
+				break;
+			}
 		}
-	}
+		found.filter(|previous| buffer.infos[*previous].class == 3 && same_owner(&buffer.infos[at], &buffer.infos[*previous]))
+	};
 	let Some(base_at) = base_at else { return Ok(false) };
 	let base_coverage = subtable.slice(base_coverage_at, subtable.len().checked_sub(base_coverage_at).ok_or_else(bad)?).ok_or_else(bad)?;
 	let Some(base_index) = coverage_index(base_coverage, buffer.infos[base_at].glyph)? else { return Ok(false) };
@@ -240,17 +254,26 @@ fn mark(kind: u16, subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Resu
 	}
 	let (base_x, base_y) = anchor(base_array, offset)?;
 
-	// The mark is placed so its anchor meets the base's, and it takes no advance of its own - which
-	// is what makes it sit ON the letter rather than after it.
-	// EVERYTHING FROM THE BASE UP TO THE MARK, the base INCLUDED: the pen has already advanced past
-	// the base by the time the mark is drawn, so the mark is moved back by that much to sit on it.
-	// Starting after the base leaves the mark one glyph's width to the right, which on a letter with
-	// a wide base is an accent floating over the NEXT letter.
-	let advance_between: i32 = buffer.positions[base_at..at].iter().map(|position| position.x_advance).sum();
-	buffer.positions[at].x_offset = base_x - mark_x - advance_between;
-	buffer.positions[at].y_offset = base_y - mark_y;
-	buffer.infos[at].attached_to = u16::try_from(base_at).ok();
+	attach(buffer, at, base_at, (base_x - mark_x, base_y - mark_y))
+}
+
+/// Attach the mark at `at` to the glyph at `base_at`, its anchors `offset` apart.
+///
+/// THE ANCHORS AND NOTHING ELSE, here: how far the pen has moved from what the mark hangs from, and
+/// where that is drawn, are not final until every positioning rule has run - see `propagate`.
+fn attach(buffer: &mut Buffer, at: usize, base_at: usize, offset: (i32, i32)) -> Result<bool, Error> {
+	let Ok(base) = u16::try_from(base_at) else { return Ok(false) };
+	buffer.positions[at].x_offset = offset.0;
+	buffer.positions[at].y_offset = offset.1;
+	buffer.infos[at].attached_to = Some(base);
+	buffer.infos[at].cursive = None;
 	Ok(true)
+}
+
+/// Whether a mark may hang from the mark before it: both belong to the same base, or to the same
+/// component of one ligature - or one of them is itself a ligature of marks.
+fn same_owner(mark: &GlyphInfo, previous: &GlyphInfo) -> bool {
+	if mark.ligature == previous.ligature { mark.ligature == 0 || mark.component == previous.component } else { (mark.ligature != 0 && mark.component == 0) || (previous.ligature != 0 && previous.component == 0) }
 }
 
 /// One anchor: a point in font units. Formats 2 and 3 carry a contour point or a device table on top
@@ -269,14 +292,24 @@ fn anchor(table: Reader<'_>, offset: usize) -> Result<(i32, i32), Error> {
 
 /// Type 3: cursive attachment - what joins Arabic letters into a written line.
 ///
-/// EACH GLYPH HAS AN ENTRY AND AN EXIT ANCHOR, and a pair joins when the first has an exit and the
-/// second an entry: the second is moved so its entry meets the first's exit. Without it a joining
-/// script is rendered as letters that touch but do not connect, which is the difference between
-/// handwriting and a row of shapes.
-pub fn cursive(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool, Error> {
-	if at + 1 >= buffer.len() {
-		return Ok(false);
-	}
+/// EACH GLYPH HAS AN ENTRY AND AN EXIT ANCHOR, and a pair joins when the glyph before has an exit and
+/// this one an entry: the two are placed so the anchors meet. Without it a joining script is rendered
+/// as letters that touch but do not connect, which is the difference between handwriting and a row
+/// of shapes. The glyph before is the nearest the lookup sees, so a mark between two letters does not
+/// break their join.
+///
+/// ALONG THE LINE THE JOIN IS MADE BY THE ADVANCES, and which glyph's advance is the run's direction:
+/// drawn left to right the glyph before ends at its exit and this one starts at its entry; drawn right
+/// to left the glyph before - drawn to the RIGHT of this one - starts at its exit and this one ends at
+/// its entry. Every cursive script the profile names is written right to left, so the arithmetic
+/// written only one way round was wrong for all of them.
+///
+/// ACROSS THE LINE ONE OF THE TWO IS MOVED TO MEET THE OTHER, and the lookup's `rightToLeft` flag says
+/// which: set, the LAST glyph of a joined sequence stays on the baseline and each earlier one hangs
+/// from the one after it; clear, the first stays and each later one hangs from the one before. A
+/// glyph already hanging from another is re-rooted onto its new parent, its old chain reversed - which
+/// is what keeps a whole word on one line of joins rather than every pair on its own.
+pub fn cursive(subtable: Reader<'_>, buffer: &mut Buffer, at: usize, lookup: &Lookup<'_>) -> Result<bool, Error> {
 	let mut reader = subtable;
 	let format = reader.u16().ok_or_else(bad)?;
 	if format != 1 {
@@ -285,26 +318,146 @@ pub fn cursive(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<b
 	let coverage_at = reader.u16().ok_or_else(bad)? as usize;
 	let count = reader.u16().ok_or_else(bad)? as usize;
 	let coverage = subtable.slice(coverage_at, subtable.len().checked_sub(coverage_at).ok_or_else(bad)?).ok_or_else(bad)?;
-	let Some(first) = coverage_index(coverage, buffer.infos[at].glyph)? else { return Ok(false) };
-	let Some(second) = coverage_index(coverage, buffer.infos[at + 1].glyph)? else { return Ok(false) };
-	if first as usize >= count || second as usize >= count {
-		return Err(bad());
+	// Each entry is an entry anchor offset and an exit anchor offset, both from the subtable start; a
+	// zero offset is no anchor, which is an ordinary answer: the pair does not join.
+	let record = |glyph: u16, exit: bool| -> Result<usize, Error> {
+		let Some(index) = coverage_index(coverage, glyph)? else { return Ok(0) };
+		if index as usize >= count {
+			return Err(bad());
+		}
+		Ok(subtable.u16_at(3 + index as usize * 2 + usize::from(exit)).ok_or_else(bad)? as usize)
+	};
+	let entry_offset = record(buffer.infos[at].glyph, false)?;
+	if entry_offset == 0 {
+		return Ok(false);
 	}
-	// Each entry is an entry anchor offset and an exit anchor offset, both from the subtable start.
-	let exit_offset = subtable.u16_at(3 + (first as usize) * 2 + 1).ok_or_else(bad)? as usize;
-	let entry_offset = subtable.u16_at(3 + (second as usize) * 2).ok_or_else(bad)? as usize;
-	// A zero offset is no anchor, which is an ordinary answer: this pair does not join.
-	if exit_offset == 0 || entry_offset == 0 {
+	let Some(before) = lookup.previous(buffer, at)? else { return Ok(false) };
+	let exit_offset = record(buffer.infos[before].glyph, true)?;
+	if exit_offset == 0 {
 		return Ok(false);
 	}
 	let (exit_x, exit_y) = anchor(subtable, exit_offset)?;
 	let (entry_x, entry_y) = anchor(subtable, entry_offset)?;
-	// The first glyph's advance is shortened to its exit, and the second is moved so its entry lands
-	// there - which is what makes the two share a join rather than merely abut.
-	buffer.positions[at].x_advance = exit_x;
-	buffer.positions[at + 1].x_offset += -entry_x;
-	buffer.positions[at + 1].y_offset += exit_y - entry_y;
+	let (first, second) = (before, at);
+	if buffer.right_to_left {
+		let moved = exit_x + buffer.positions[first].x_offset;
+		buffer.positions[first].x_advance -= moved;
+		buffer.positions[first].x_offset -= moved;
+		buffer.positions[second].x_advance = entry_x + buffer.positions[second].x_offset;
+	} else {
+		buffer.positions[first].x_advance = exit_x + buffer.positions[first].x_offset;
+		let moved = entry_x + buffer.positions[second].x_offset;
+		buffer.positions[second].x_advance -= moved;
+		buffer.positions[second].x_offset -= moved;
+	}
+	let (mut child, mut parent, mut across) = (first, second, entry_y - exit_y);
+	if lookup.flags & RIGHT_TO_LEFT == 0 {
+		core::mem::swap(&mut child, &mut parent);
+		across = -across;
+	}
+	let Ok(to) = u16::try_from(parent) else { return Ok(false) };
+	reroot(buffer, child, parent)?;
+	buffer.infos[child].cursive = Some(to);
+	buffer.infos[child].attached_to = None;
+	buffer.positions[child].y_offset = across;
+	// A PARENT THAT HUNG FROM THIS CHILD is separated from it, or the two would hang from each other.
+	if buffer.infos[parent].cursive.map(usize::from) == Some(child) {
+		buffer.infos[parent].cursive = None;
+		buffer.positions[parent].y_offset = 0;
+	}
 	Ok(true)
+}
+
+/// THE CHAIN A GLYPH HUNG FROM, REVERSED, before it is hung from `parent`: what it hung from now hangs
+/// from it, and so on up the old chain - stopping where the chain reaches the new parent - with each
+/// offset across the line turned round with its link.
+fn reroot(buffer: &mut Buffer, child: usize, parent: usize) -> Result<(), Error> {
+	let mut links: Vec<(usize, usize)> = Vec::new();
+	let mut node = child;
+	while let Some(old) = buffer.infos[node].cursive.map(usize::from) {
+		buffer.infos[node].cursive = None;
+		if old == parent || old >= buffer.len() || links.len() >= buffer.len() {
+			break;
+		}
+		links.try_reserve(1).map_err(|_| Error::Allocation)?;
+		links.push((node, old));
+		node = old;
+	}
+	// FROM THE FAR END BACK, so each offset is turned round before the link below it changes it.
+	for (from, old) in links.iter().rev() {
+		buffer.positions[*old].y_offset = -buffer.positions[*from].y_offset;
+		buffer.infos[*old].cursive = u16::try_from(*from).ok();
+	}
+	Ok(())
+}
+
+/// WHERE EVERY ATTACHED GLYPH ENDS UP, once every positioning rule has run.
+///
+/// ONCE, AT THE END, AND NOT WHERE EACH RULE ATTACHES, because what an attachment is measured from is
+/// not final until positioning is: a kerning rule after the mark rule changes the advance a mark is
+/// measured back over, a stacked mark hangs from a mark that moved after it was attached, and a
+/// cursive chain is re-rooted by every join. Measured where it attached, a mark on a mark kept none
+/// of its parent's movement - a second accent drawn a letter off, toward the next one.
+///
+/// A MARK takes what it hangs from's offsets and is moved back over everything the pen crossed from
+/// there up to it, that glyph included - in logical order; `font-run` turns that round, link by link,
+/// for a run drawn right to left. A GLYPH A CURSIVE JOIN HANGS takes its parent's offset across the
+/// line; along it, the join was made by the advances. Parents first, so each takes a final answer.
+pub fn propagate(buffer: &mut Buffer) -> Result<(), Error> {
+	let count = buffer.len();
+	if !buffer.infos.iter().any(|info| info.attached_to.is_some() || info.cursive.is_some()) {
+		return Ok(());
+	}
+	let mut done: Vec<bool> = Vec::new();
+	done.try_reserve_exact(count).map_err(|_| Error::Allocation)?;
+	done.resize(count, false);
+	let mut path: Vec<usize> = Vec::new();
+	path.try_reserve_exact(count).map_err(|_| Error::Allocation)?;
+	for start in 0..count {
+		path.clear();
+		let mut node = start;
+		// UP TO A GLYPH ALREADY PLACED OR ONE THAT HANGS FROM NOTHING - bounded by the run, so a chain
+		// a font managed to close on itself ends rather than loops.
+		while !done[node] && path.len() < count {
+			path.push(node);
+			match parent_of(&buffer.infos[node]) {
+				Some((parent, _)) if parent < count && parent != node => node = parent,
+				_ => break,
+			}
+		}
+		for child in path.iter().rev() {
+			let child = *child;
+			done[child] = true;
+			let Some((parent, mark)) = parent_of(&buffer.infos[child]) else { continue };
+			if parent >= count || parent == child {
+				continue;
+			}
+			let above = buffer.positions[parent];
+			if mark {
+				buffer.positions[child].x_offset = buffer.positions[child].x_offset.saturating_add(above.x_offset);
+				buffer.positions[child].y_offset = buffer.positions[child].y_offset.saturating_add(above.y_offset);
+				// EVERYTHING FROM WHAT THE MARK HANGS FROM UP TO THE MARK, that glyph INCLUDED: the pen has
+				// already advanced past it by the time the mark is drawn, so the mark is moved back by
+				// that much to sit on it. Starting after it leaves the mark one glyph's width to the
+				// right, which on a letter with a wide base is an accent floating over the NEXT letter.
+				let crossed = buffer.positions[parent.min(child)..child].iter().fold((0i32, 0i32), |sum, position| (sum.0.saturating_add(position.x_advance), sum.1.saturating_add(position.y_advance)));
+				buffer.positions[child].x_offset = buffer.positions[child].x_offset.saturating_sub(crossed.0);
+				buffer.positions[child].y_offset = buffer.positions[child].y_offset.saturating_sub(crossed.1);
+			} else {
+				buffer.positions[child].y_offset = buffer.positions[child].y_offset.saturating_add(above.y_offset);
+			}
+		}
+	}
+	Ok(())
+}
+
+/// What a glyph hangs from, and whether as a mark.
+fn parent_of(info: &GlyphInfo) -> Option<(usize, bool)> {
+	match (info.attached_to, info.cursive) {
+		(Some(base), _) => Some((usize::from(base), true)),
+		(None, Some(parent)) => Some((usize::from(parent), false)),
+		(None, None) => None,
+	}
 }
 
 /// Type 5: a mark attached to one COMPONENT of a ligature.
@@ -371,9 +524,12 @@ pub fn mark_to_ligature(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) ->
 	if components == 0 {
 		return Err(bad());
 	}
-	// WHICH COMPONENT: the mark's cluster against the ligature's tells how far into it the mark
-	// belongs. A mark whose cluster matches the ligature's own attaches to the first component.
-	let component = (buffer.infos[at].cluster.saturating_sub(buffer.infos[base_at].cluster) as usize).min(components - 1);
+	// WHICH COMPONENT: the one the mark followed when the ligature was formed, which the substitution
+	// recorded on the mark - a fatha written after the lam of a lam-alef goes over the lam half. A
+	// mark that sat in no part of this ligature followed all of it, and takes the last component.
+	let mark = buffer.infos[at];
+	let ligature = buffer.infos[base_at];
+	let component = if ligature.ligature != 0 && mark.ligature == ligature.ligature && mark.component > 0 { usize::from(mark.component).min(components) - 1 } else { components - 1 };
 	let cell = component.checked_mul(class_count).ok_or_else(bad)?.checked_add(mark_class).ok_or_else(bad)?;
 	let anchor_at = 2usize.checked_add(cell.checked_mul(2).ok_or_else(bad)?).ok_or_else(bad)?;
 	let offset = attach.u16_at(anchor_at / 2).ok_or_else(bad)? as usize;
@@ -381,9 +537,5 @@ pub fn mark_to_ligature(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) ->
 		return Ok(false);
 	}
 	let (base_x, base_y) = anchor(attach, offset)?;
-	let advance_between: i32 = buffer.positions[base_at..at].iter().map(|position| position.x_advance).sum();
-	buffer.positions[at].x_offset = base_x - mark_x - advance_between;
-	buffer.positions[at].y_offset = base_y - mark_y;
-	buffer.infos[at].attached_to = u16::try_from(base_at).ok();
-	Ok(true)
+	self::attach(buffer, at, base_at, (base_x - mark_x, base_y - mark_y))
 }

@@ -6321,6 +6321,7 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 				platform: node.id.platform,
 				memory_used: domain.as_ref().map_or(0, |domain| domain.memory_used),
 				memory_peak: domain.as_ref().map_or(0, |domain| domain.memory_peak),
+				dma_used: domain.as_ref().map_or(0, |domain| domain.dma_used),
 			})
 			.collect()
 	}

@@ -688,6 +688,21 @@ fn own_intx(index: usize) {
 	crate::tests::release_device(&grant);
 	assert!(intx_disabled(&edu), "the release turned its pin off");
 	assert!(!arch::interrupts::is_bound(interrupt.vector()), "and unbound its line");
+	drop(interrupt);
+	// AND A HOLDER THAT LETS GO WITHOUT ITS RELEASE - a driver that died, its claim still current - while its device is
+	// asserting the line: the pin is turned off before the line is given back, so what the unbind unmasks is quiet.
+	let grant = crate::tests::claim_device_as(index as u64, &entry).expect("the function is claimed again");
+	let handle = acquire(grant.claim, abi::RESOURCE_KIND_LINE, 0);
+	assert!(handle > 0, "the row's line is bound again ({handle})");
+	assert!(!intx_disabled(&edu), "with its pin on");
+	let vector = interrupt_of(handle).vector();
+	edu.raise_interrupt(2);
+	settle(5);
+	assert_eq!(unsafe { arch::syscall::invoke(abi::SYS_HANDLE_CLOSE, handle as u64, 0, 0, 0) } as i64, 0, "the holder lets the line go");
+	assert!(!arch::interrupts::is_bound(vector), "its line is given back");
+	assert!(intx_disabled(&edu), "and the pin of a device still asserting it is off - not left for the release to turn off");
+	edu.acknowledge_interrupt(2);
+	crate::tests::release_device(&grant);
 }
 
 // The function's command-register Interrupt Disable bit.

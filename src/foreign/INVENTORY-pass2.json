@@ -136,7 +136,7 @@
 			"vsnprintf"
 		],
 		"converged": true,
-		"elf_bytes": 639992,
+		"elf_bytes": 636504,
 		"fini_array": [
 			"loader_free_library"
 		],
@@ -285,7 +285,7 @@
 			"vsnprintf"
 		],
 		"converged": true,
-		"elf_bytes": 957784,
+		"elf_bytes": 952816,
 		"fini_array": [
 			"loader_free_library"
 		],
@@ -435,7 +435,7 @@
 			"vsnprintf"
 		],
 		"converged": true,
-		"elf_bytes": 618152,
+		"elf_bytes": 614720,
 		"fini_array": [
 			"loader_free_library"
 		],

@@ -1371,6 +1371,7 @@ pub mod camera_fixture {
 	pub const OP_WITHDRAW: u16 = 6;
 	pub const OP_REPUBLISH: u16 = 7;
 	pub const OP_STATS: u16 = 8;
+	pub const OP_DELAY_NEGOTIATE: u16 = 9;
 
 	pub trait Service {
 		/// Lose the next `count` frames in the device, definitely observed.
@@ -1386,6 +1387,9 @@ pub mod camera_fixture {
 		fn withdraw(&mut self) -> Result<(), Error>;
 		fn republish(&mut self) -> Result<(), Error>;
 		fn stats(&mut self) -> Result<CameraFixtureStats, Error>;
+		/// Hold the next negotiation's answer for `delay-ms`, which must not be zero: the window a client can end in
+		/// while its camera's provider has not answered.
+		fn delay_negotiate(&mut self, delay_ms: u32) -> Result<(), Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1671,6 +1675,42 @@ pub mod camera_fixture {
 						Err(v42) => {
 							w.u8(0)?;
 							v42.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_DELAY_NEGOTIATE => {
+				let delay_ms = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.delay_negotiate(delay_ms);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v43) => {
+							w.u8(1)?;
+						}
+						Err(v44) => {
+							w.u8(0)?;
+							v44.write(w)?;
 						}
 					}
 					Some(())
@@ -2035,6 +2075,39 @@ pub mod camera_fixture {
 			}
 			decoded
 		}
+		pub fn delay_negotiate(&mut self, delay_ms: &u32) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DELAY_NEGOTIATE)?;
+			w.u32(corr)?;
+			w.u32(*delay_ms)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -2099,6 +2172,14 @@ pub mod camera_fixture {
 	fn channel_invoke_stats(chan: u64) -> Option<Result<CameraFixtureStats, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.stats()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_camera_device_camera_fixture_delay_negotiate")]
+	fn channel_invoke_delay_negotiate(chan: u64, delay_ms: &u32) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.delay_negotiate(delay_ms)
 	}
 }
 
@@ -2191,8 +2272,8 @@ impl CameraFrame {
 		out.push(',');
 		out.push_str("\"device\":");
 		match &self.device {
-			Some(v43) => {
-				v43.to_json_into(out);
+			Some(v45) => {
+				v45.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -2222,8 +2303,8 @@ impl CameraFrame {
 		out.push_str(", ");
 		out.push_str("device=");
 		match &self.device {
-			Some(v44) => {
-				v44.to_text_into(out);
+			Some(v46) => {
+				v46.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -2247,8 +2328,8 @@ impl CameraFrame {
 		crate::codec::cbor::uint(out, self.arrival_ns as u64);
 		crate::codec::cbor::text(out, "device");
 		match &self.device {
-			Some(v45) => {
-				v45.to_cbor_into(out);
+			Some(v47) => {
+				v47.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -2413,58 +2494,58 @@ impl CameraDeviceEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			CameraDeviceEvent::Frame(v46) => {
+			CameraDeviceEvent::Frame(v48) => {
 				out.push_str("{\"frame\":");
-				v46.to_json_into(out);
-				out.push('}');
-			}
-			CameraDeviceEvent::Dropped(v47) => {
-				out.push_str("{\"dropped\":");
-				v47.to_json_into(out);
-				out.push('}');
-			}
-			CameraDeviceEvent::Gap(v48) => {
-				out.push_str("{\"gap\":");
 				v48.to_json_into(out);
+				out.push('}');
+			}
+			CameraDeviceEvent::Dropped(v49) => {
+				out.push_str("{\"dropped\":");
+				v49.to_json_into(out);
+				out.push('}');
+			}
+			CameraDeviceEvent::Gap(v50) => {
+				out.push_str("{\"gap\":");
+				v50.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			CameraDeviceEvent::Frame(v49) => {
+			CameraDeviceEvent::Frame(v51) => {
 				out.push_str("frame(");
-				v49.to_text_into(out);
-				out.push(')');
-			}
-			CameraDeviceEvent::Dropped(v50) => {
-				out.push_str("dropped(");
-				v50.to_text_into(out);
-				out.push(')');
-			}
-			CameraDeviceEvent::Gap(v51) => {
-				out.push_str("gap(");
 				v51.to_text_into(out);
+				out.push(')');
+			}
+			CameraDeviceEvent::Dropped(v52) => {
+				out.push_str("dropped(");
+				v52.to_text_into(out);
+				out.push(')');
+			}
+			CameraDeviceEvent::Gap(v53) => {
+				out.push_str("gap(");
+				v53.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			CameraDeviceEvent::Frame(v52) => {
+			CameraDeviceEvent::Frame(v54) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "frame");
-				v52.to_cbor_into(out);
+				v54.to_cbor_into(out);
 			}
-			CameraDeviceEvent::Dropped(v53) => {
+			CameraDeviceEvent::Dropped(v55) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "dropped");
-				v53.to_cbor_into(out);
+				v55.to_cbor_into(out);
 			}
-			CameraDeviceEvent::Gap(v54) => {
+			CameraDeviceEvent::Gap(v56) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "gap");
-				v54.to_cbor_into(out);
+				v56.to_cbor_into(out);
 			}
 		}
 	}

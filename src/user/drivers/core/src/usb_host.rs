@@ -13,9 +13,10 @@
 // string instead of an address and owns its endpoints through contexts - so what it shares is the layer above the
 // transfer: the same class policy and the same class state, which it reaches through its own transfer rings.
 //
-// WHAT THIS CORE BINDS: hubs, HID (keyboards, pointers, touch surfaces, gamepads) and Bulk-Only storage - the
-// classes the earlier controllers carry. A device of any other class is addressed, said, and left in the
-// inventory, and the line names the class.
+// WHAT THIS CORE BINDS: hubs, HID (keyboards, pointers, touch surfaces, gamepads) and Bulk-Only storage. USB 1.1 and
+// 2.0 devices carry every other class too - network, serial, audio, printers, smart cards and the rest - and those stay
+// xHCI's: on these controllers such a device is addressed, said, and left in the inventory, and the line names the
+// class.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -127,11 +128,11 @@ impl Dma {
 		unsafe { core::slice::from_raw_parts_mut(self.virt as *mut u8, len.min(self.bytes as usize)) }
 	}
 
+	/// Given back - unmapped, then closed (`common::release_dma`). The caller has taken every descriptor that named
+	/// it off the schedule first.
 	pub fn release(&mut self) {
-		if self.handle != 0 {
-			close(self.handle);
-			self.handle = 0;
-		}
+		common::release_dma(self.handle);
+		self.handle = 0;
 	}
 }
 
@@ -141,7 +142,7 @@ pub fn dma_below_4g(device: u64, bytes: u32) -> Option<Dma> {
 	// SAFETY: a DMA buffer for this process's controller, mapped for this process.
 	let (handle, virt, phys) = unsafe { dma_buffer_below_4g(device, bytes as u64) }?;
 	if phys >> 32 != 0 {
-		close(handle);
+		common::release_dma(handle);
 		return None;
 	}
 	Some(Dma { handle, virt, phys: phys as u32, bytes })
@@ -1236,6 +1237,13 @@ pub fn run<C: Controller>(bootstrap: u64, bind: &common::Bind, device: u64, irq:
 	loop {
 		host.reap_reports();
 		host.reap_hubs();
+		// A ROOT-PORT CHANGE A WAIT INSIDE A TRANSFER SAW is acted on before the loop blocks. That wait has already
+		// cleared what raised it - and OHCI holds its root hub's interrupt off until the change is taken - so left for
+		// the next wake it waited for unrelated traffic: a stick plugged after a keyboard was not seen until a key was
+		// pressed, and one pulled mid-read stayed published until somebody asked it for a block.
+		if host.hc.take_port_change() {
+			host.reconcile();
+		}
 		publications.follow(&mut host, bootstrap, bind, &mut serving);
 		host.pads.flush();
 		let owed = host.pads.owes();
@@ -1256,6 +1264,14 @@ pub fn run<C: Controller>(bootstrap: u64, bind: &common::Bind, device: u64, irq:
 			exit();
 		};
 		publications.sinks(&mut host, &serving);
+		// THE CONSUMER THE WAIT ANSWERED, BY ITS ENDPOINT. A departure taken below may retire publications, and the
+		// serving table fills the gaps they leave - so the index the wait gave can name another consumer afterwards, or
+		// none. Read past its end it was the bus inventory's token on a closed handle, and its close then dropped a live
+		// endpoint from the table, told the manager the inventory lost a consumer, or underflowed the count.
+		let consumer = match ready {
+			common::ProviderReady::Consumer(at) => Some(serving.at(at)),
+			_ => None,
+		};
 		// THE INTERRUPT IS ACKNOWLEDGED AFTER THE CONTROLLER'S STATUS IS CLEARED, which is what a level line needs: the
 		// line stays masked until then, and an acknowledgement before the clear would be one more firing for nothing.
 		if let common::ProviderReady::Device(0) = ready {
@@ -1271,8 +1287,8 @@ pub fn run<C: Controller>(bootstrap: u64, bind: &common::Bind, device: u64, irq:
 			host.reconcile();
 			publications.follow(&mut host, bootstrap, bind, &mut serving);
 		}
-		let common::ProviderReady::Consumer(at) = ready else { continue };
-		let server = serving.at(at);
+		let Some(server) = consumer else { continue };
+		let Some(at) = serving.as_slice().iter().position(|&end| end == server) else { continue };
 		let token = serving.token_at(at);
 		let closed = if publications.disk.token == Some(token) {
 			match try_recv(server, &mut req) {

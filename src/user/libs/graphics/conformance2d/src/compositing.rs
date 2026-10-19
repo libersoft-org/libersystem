@@ -1,25 +1,26 @@
 //! COMPOSITING: the twelve Porter-Duff operators, additive `Plus`, and every blend mode.
 //!
 //! ONE DRAWING TELLS ALL THIRTEEN OPERATORS APART. An opaque backdrop on the left, a partly
-//! transparent source on the right, overlapping in the middle - and three probes: where only the
+//! transparent source on the right, overlapping in the middle - three regions: where only the
 //! backdrop is, where both are, and where only the source is. Every operator has its own signature
-//! across those three, because that is exactly what the pair of factors decides.
+//! across those three, because that is exactly what the pair of factors decides, and every pixel of
+//! the target is compared with its region's.
 //!
 //! THE SOURCE ALPHA IS SIX TENTHS AND NOT A HALF, deliberately. At a half, `as` and `1 - as` are the
 //! same number, and four pairs of operators become indistinguishable - which is how a suite passes an
 //! implementation that has `Xor` and `DestinationAtop` the wrong way round.
 //!
-//! AND EVERY BLEND MODE IS ITS EQUATION EVALUATED AT ONE POINT, written out in the scene. The
-//! backdrop and source are chosen with a different value in each channel, so a mode that is right in
-//! one channel and wrong in another cannot pass.
+//! AND EVERY BLEND MODE IS ITS EQUATION EVALUATED AT ONE POINT, written out in the scene and expected
+//! at every pixel of a target both shapes cover. The backdrop and source are chosen with a different
+//! value in each channel, so a mode that is right in one channel and wrong in another cannot pass.
 //!
-//! EVERY PROBE IS A PIXEL THE SHAPES COVER WHOLLY OR NOT AT ALL, so the frozen edge policy compares it
+//! EVERY PIXEL IS ONE THE SHAPES COVER WHOLLY OR NOT AT ALL, so the frozen edge policy compares it
 //! EXACTLY - against the byte the target stores the expected value as, which is the value moved by the
-//! profile's ordered dither at that pixel and rounded (see `harness::stored`). A tolerance here would be a
-//! colour error wearing an antialiasing tolerance.
+//! profile's ordered dither at that pixel and rounded (see `harness::stored`) - and the frozen mask
+//! compares all of them. A tolerance here would be a colour error wearing an antialiasing tolerance.
 
 use crate::Outcome;
-use crate::harness::{Frame, draw, rect_path, solid};
+use crate::harness::{Frame, byte, draw, every_pixel, rect_path, solid, stored};
 use graphics_core::geom::RectF;
 use render2d::blend::{BlendMode, Operator};
 use render2d::path::FillRule;
@@ -41,22 +42,29 @@ fn composed(operator: Operator) -> Result<Frame, crate::Trouble> {
 	})
 }
 
-fn probe(frame: &Frame, x: u32, expect: &Expect, where_: &str) -> Outcome {
-	let pixel = frame.pixel(x, 4);
-	// NOTHING THERE IS NOTHING AT ALL, colour included: a transparent pixel stores no colour.
+/// The bytes a pixel stores for what it should show. NOTHING THERE IS NOTHING AT ALL, colour included: a
+/// transparent pixel stores no colour.
+fn bytes_of(expect: &Expect, x: u32, y: u32) -> [u8; 4] {
 	let colour = expect.colour.unwrap_or([0.0; 3]);
-	require!(frame.holds(x, 4, colour, expect.alpha), "{where_}: the pixel should hold exactly {colour:?} at alpha {} and is {pixel:?}", expect.alpha);
-	Ok(())
+	[stored(colour[0], x, y), stored(colour[1], x, y), stored(colour[2], x, y), byte(expect.alpha)]
 }
 
-/// Check one operator at the three probes. THE BACKDROP-ONLY PROBE IS ALWAYS THE BACKDROP: an
-/// operator applies where the source SHAPE is, and a `Clear` that wiped the whole surface would be a
-/// drawing API with no bounded drawing in it.
+/// Check one operator at every pixel: left of the source the backdrop, then where both are, then where only
+/// the source is. THE BACKDROP-ONLY PART IS ALWAYS THE BACKDROP: an operator applies where the source SHAPE
+/// is, and a `Clear` that wiped the whole surface would be a drawing API with no bounded drawing in it.
 fn operator_scene(operator: Operator, middle: Expect, source_only: Expect) -> Outcome {
 	let frame = composed(operator)?;
-	probe(&frame, 4, &Expect { alpha: 1.0, colour: Some([0.0, 0.0, 1.0]) }, "outside the source shape")?;
-	probe(&frame, 16, &middle, "where both are")?;
-	probe(&frame, 28, &source_only, "where only the source is")
+	let backdrop_only = Expect { alpha: 1.0, colour: Some([0.0, 0.0, 1.0]) };
+	let region = |x: u32| {
+		if x < 12 {
+			&backdrop_only
+		} else if x < 20 {
+			&middle
+		} else {
+			&source_only
+		}
+	};
+	every_pixel(&frame, |x, y| bytes_of(region(x), x, y))
 }
 
 // @covers: CompositeClear
@@ -160,11 +168,11 @@ fn blended(mode: BlendMode) -> Result<Frame, crate::Trouble> {
 	})
 }
 
+/// An opaque source over an opaque backdrop is opaque, and the equation gives exactly `expected` - at every
+/// pixel, because both shapes cover the whole target.
 fn blend_scene(mode: BlendMode, expected: [f32; 3]) -> Outcome {
 	let frame = blended(mode)?;
-	let pixel = frame.pixel(8, 4);
-	require!(frame.holds(8, 4, expected, 1.0), "an opaque source over an opaque backdrop is opaque, and the equation gives exactly {expected:?}: the pixel is {pixel:?}");
-	Ok(())
+	every_pixel(&frame, |x, y| bytes_of(&Expect { alpha: 1.0, colour: Some(expected) }, x, y))
 }
 
 // @covers: BlendMultiply

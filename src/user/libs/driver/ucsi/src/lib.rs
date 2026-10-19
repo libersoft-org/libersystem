@@ -166,7 +166,13 @@ pub enum Completion {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Exchange {
 	pub completion: Completion,
+	/// The change the PPM indicated while the command ran - or, when it indicated none, the one the acknowledgement's
+	/// completion named.
 	pub change: Option<u8>,
+	/// THE CHANGE THE ACKNOWLEDGEMENT'S COMPLETION NAMED, whatever came before it. A PPM names its next pending change as
+	/// soon as the one before it is acknowledged, and may name it nowhere else: this was dropped whenever the command's
+	/// own completion had named a connector, and that connector's change was then never read.
+	pub after: Option<u8>,
 }
 
 // Wait for a notification whose CCI satisfies `done`, noting every connector change seen on the way; a BUSY PPM is
@@ -223,14 +229,18 @@ pub fn execute(ppm: &mut dyn Ppm, layout: &Layout, command: command::Command, me
 	// THE ACKNOWLEDGEMENT, and its own completion, before anything else is sent.
 	ppm.send(command::ack(true, change_ack).control, &[])?;
 	let deadline = ppm.now_ms() + COMMAND_MS;
-	let mut ignored = None;
-	await_cci(ppm, deadline, &mut ignored, |cci| cci.has(Cci::ACK_COMPLETE))?;
-	if let Some(number) = ignored
-		&& change.is_none()
+	let mut after = None;
+	await_cci(ppm, deadline, &mut after, |cci| cci.has(Cci::ACK_COMPLETE))?;
+	if let Some(number) = after
+		&& number > connectors
+		&& connectors != 0
 	{
-		change = Some(number);
+		return Err(Failure::Connector(number));
 	}
-	Ok(Exchange { completion, change })
+	if change.is_none() {
+		change = after;
+	}
+	Ok(Exchange { completion, change, after })
 }
 
 /// PPM_RESET, its completion POLLED through the `_DSM`'s function 2 - a reset leaves notifications off, so nothing else

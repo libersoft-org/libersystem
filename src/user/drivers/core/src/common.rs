@@ -1588,6 +1588,17 @@ pub fn stop_requested() -> bool {
 //
 // This used to take no such argument, and every caller was therefore certifying quiescence it had
 // not established.
+/// A DMA BUFFER GIVEN BACK: unmapped from this process, then its handle closed. Closing alone gives nothing back - the
+/// kernel keeps every buffer a process has mapped, with its frames and its Domain's DMA charge, until the buffer is
+/// unmapped or the process ends - so a controller that only closed what a departed device held kept all of it, for
+/// every device ever plugged in. The caller has made sure nothing on the bus still names the buffer.
+pub fn release_dma(handle: u64) {
+	if handle != 0 {
+		let _ = dma_buffer_unmap(handle);
+		close(handle);
+	}
+}
+
 pub fn finish_stop(bootstrap: u64, bind: &Bind, device: u64, quiet: bool) {
 	if !quiet {
 		print(b"driver: the device did not confirm it stopped - no clean stop is acknowledged for it\n");

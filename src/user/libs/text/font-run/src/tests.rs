@@ -383,6 +383,30 @@ fn a_right_to_left_mark_is_placed_for_the_order_it_is_drawn_in() {
 }
 
 #[test]
+// AND A MARK ON A MARK IS MOVED FOR EVERY LINK DOWN TO THE LETTER. The second accent's offset carries the
+// first accent's, which was placed for the other order: 15 between the two accents' anchors on top of
+// the first's -365, which is -350 logically. Drawn right to left the first accent lands at 255 and the
+// second must land 15 further, at 270 - and correcting only its own link, where the pen crossed nothing,
+// leaves it at -350.
+fn a_right_to_left_mark_on_a_mark_is_placed_for_the_order_it_is_drawn_in() {
+	let bytes = build::plain();
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let size = Fixed266::from_pixels(16);
+	let units = face.header.units_per_em;
+	let text = "\u{05D0}\u{05BC}\u{05B8}";
+	let first = Position { x_advance: 0, y_advance: 0, x_offset: -365, y_offset: 65 };
+	let second = Position { x_advance: 0, y_advance: 0, x_offset: -350, y_offset: 185 };
+	let mut shaped = buffer(&[(1, 0, advance(620)), (2, 2, first), (3, 4, second)]);
+	shaped.infos[1].attached_to = Some(0);
+	shaped.infos[2].attached_to = Some(1);
+	let run = produce(&request(&face, text, Direction::RightToLeft, size), &shaped).expect("a run");
+	let glyphs = &run.run().glyphs;
+	assert_eq!((glyphs[0].glyph, glyphs[1].glyph, glyphs[2].glyph), (3, 2, 1), "the stack is drawn top down, then its letter");
+	assert_eq!(glyphs[1].x_offset, Fixed266::from_font_units(255, units, size).expect("in range"), "the first accent on the letter");
+	assert_eq!(glyphs[0].x_offset, Fixed266::from_font_units(270, units, size).expect("in range"), "the second on the first");
+}
+
+#[test]
 // A CLUSTER IS A GRAPHEME CLUSTER AND NOT A CHARACTER. A caret does not stand between a letter and
 // the accent on it, so a mapping that made the mark its own cluster would offer a caret position that
 // is not a place in the text.

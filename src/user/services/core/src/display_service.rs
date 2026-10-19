@@ -843,16 +843,22 @@ impl DisplayState {
 		let evidence: TimestampEvidence = TimestampEvidence::Unavailable;
 		let complete = PresentComplete { serial, outcome, evidence, timing: FrameTiming { preferred_deadline: None, refresh_interval: None } };
 		self.emit(index, &SurfaceEvent::PresentComplete(complete));
+		self.release(index, serial, pending.image);
+		self.notify_image_available(index);
+		// THE COMPLETION SENT - the event, the release and the image-available notice.
+		perf_site(b"ds-cmpl\0", serial);
+	}
+
+	/// The release a frame loop waits on WITHOUT a dispatch: a settled present's serial and image, on
+	/// PRESENT_DONE. Non-blocking, as every send from this loop is.
+	fn release(&self, index: usize, serial: u64, image: u32) {
 		let done: u64 = self.surfaces[index].done;
 		if done != 0 {
 			let mut frame: [u8; 16] = [0; 16];
 			frame[..8].copy_from_slice(&serial.to_le_bytes());
-			frame[8..12].copy_from_slice(&pending.image.to_le_bytes());
+			frame[8..12].copy_from_slice(&image.to_le_bytes());
 			let _ = try_send(done, &frame, 0);
 		}
-		self.notify_image_available(index);
-		// THE COMPLETION SENT - the event, the release and the image-available notice.
-		perf_site(b"ds-cmpl\0", serial);
 	}
 
 	/// Tell a client an image is available, which is what it waits on instead of blocking.
@@ -1057,6 +1063,12 @@ impl DisplayState {
 				for handle in frame_handles.as_slice() {
 					close(*handle);
 				}
+				// A DROPPED CONFIGURATION IS SAID SO. The client still learns of it - its next acquire
+				// answers `out-of-date` - but one that is not acquiring learns nothing, and a resize
+				// it never followed would otherwise leave no trace of where it was lost.
+				if matches!(event, SurfaceEvent::Configure(_)) {
+					debug_write(alloc::format!("DisplayService: surface {index}'s configuration event was dropped: its stream is full\n").as_bytes());
+				}
 				return;
 			}
 			SendOutcome::Failed => {}
@@ -1066,6 +1078,7 @@ impl DisplayState {
 		}
 		if let Some(dead) = self.surfaces[index].events.take() {
 			close(dead.producer);
+			debug_write(alloc::format!("DisplayService: surface {index}'s event stream failed and was closed\n").as_bytes());
 		}
 	}
 
@@ -1096,11 +1109,14 @@ impl DisplayState {
 			for image in &mut self.surfaces[index].images {
 				image.state = ImageState::Stale;
 			}
-			// A FRAME IN FLIGHT IS NOT UN-SUBMITTED: it settles first, as replaced.
+			// A FRAME IN FLIGHT IS NOT UN-SUBMITTED: it settles first, as replaced - and BOTH WAYS, as every
+			// completion goes. Settled only as an event, a present whose event a full stream dropped stayed
+			// in flight for good to a loop waiting on PRESENT_DONE, holding the images it may hold.
 			for pending in core::mem::take(&mut self.surfaces[index].pending) {
 				self.stats.record(PresentOutcome::ReplacedByResize);
 				let complete = PresentComplete { serial: pending.serial, outcome: PresentOutcome::ReplacedByResize, evidence: TimestampEvidence::Unavailable, timing: FrameTiming { preferred_deadline: None, refresh_interval: None } };
 				self.emit(index, &SurfaceEvent::PresentComplete(complete));
+				self.release(index, pending.serial, pending.image);
 			}
 			self.rebuild_images(index);
 		}
@@ -1144,6 +1160,8 @@ impl DisplayState {
 			// moved. One field cannot answer two questions.
 			if self.surfaces[index].native {
 				self.reconfigure(index, width, height);
+				let surface = &self.surfaces[index];
+				debug_write(alloc::format!("DisplayService: surface {index} follows the scanout to {}x{}, generation {} serial {}\n", surface.width, surface.height, surface.generation, surface.serial).as_bytes());
 			} else {
 				let snapshot = self.snapshot(index);
 				self.emit(index, &SurfaceEvent::Configure(snapshot));
@@ -1452,10 +1470,14 @@ impl DisplayState {
 				self.scanout.monitor = ask_monitor(self.scanout.gpu);
 				return false; // No framebuffer geometry or surface configuration changed.
 			}
+			// EVERY ONE IS SAID, ACCEPTED OR DROPPED: a resize the screen never followed has to show where
+			// it was lost, and a silent arm cannot.
 			DeviceEvent::Resized(extent) => {
 				if extent.width == 0 || extent.height == 0 || extent.width > self.scanout.fb.width || extent.height > self.scanout.fb.height {
+					debug_write(alloc::format!("DisplayService: a resize to {}x{} was dropped: the framebuffer is {}x{}\n", extent.width, extent.height, self.scanout.fb.width, self.scanout.fb.height).as_bytes());
 					return false;
 				}
+				debug_write(alloc::format!("DisplayService: the display resized to {}x{}\n", extent.width, extent.height).as_bytes());
 				self.scanout.width = extent.width;
 				self.scanout.height = extent.height;
 				for surface in &mut self.surfaces {
@@ -1472,6 +1494,7 @@ impl DisplayState {
 		self.end_trusted();
 		let handle: u64 = replaced.backing.handle;
 		let Some((fb, width, height)) = describe_framebuffer(&replaced) else {
+			debug_write(b"DisplayService: a replaced backing was dropped: its description is not a framebuffer\n");
 			close(handle);
 			return false;
 		};
@@ -1480,9 +1503,11 @@ impl DisplayState {
 			if !sys_is_err(addr as u64) {
 				dma_buffer_unmap(handle);
 			}
+			debug_write(alloc::format!("DisplayService: a replaced backing at {width}x{height} was dropped: it could not be mapped as a scanout\n").as_bytes());
 			close(handle);
 			return false;
 		}
+		debug_write(alloc::format!("DisplayService: the display's backing was replaced at {width}x{height}, generation {}\n", replaced.generation).as_bytes());
 		let old: u64 = self.scanout.handle;
 		self.scanout.handle = handle;
 		self.scanout.addr = addr as u64;

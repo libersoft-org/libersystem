@@ -107,6 +107,13 @@ impl Operations {
 		Ok(at)
 	}
 
+	/// Whether this executor still holds `operation` - live, started or cancelled - rather than having let it go when it
+	/// made room. An executor keeping what it prepared beside this record keeps exactly what this answers true for, which
+	/// is what bounds it: never more than `MAX_OPERATIONS` once a preparation has made room.
+	pub fn holds(&self, operation: u64) -> bool {
+		self.held.iter().any(|held| held.operation == operation)
+	}
+
 	/// How many preparations may still run: neither started nor cancelled, and inside their lifetime.
 	pub fn live(&self, now: u64) -> usize {
 		self.held.iter().filter(|held| held.live() && now < held.expires).count()

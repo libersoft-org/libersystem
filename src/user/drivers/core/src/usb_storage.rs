@@ -55,7 +55,7 @@ impl Storage {
 		pipes.ring_in.release();
 		pipes.ring_out.release();
 		if pipes.data_handle != 0 {
-			close(pipes.data_handle);
+			drivers::common::release_dma(pipes.data_handle);
 			pipes.data_handle = 0;
 			pipes.data_bytes = 0;
 		}
@@ -78,9 +78,7 @@ impl Pipes {
 		}
 		// SAFETY: a DMA buffer for this controller, mapped for this process.
 		let Some((handle, virt, phys)) = (unsafe { dma_buffer_for(crate::device(), bytes) }) else { return false };
-		if self.data_handle != 0 {
-			close(self.data_handle);
-		}
+		drivers::common::release_dma(self.data_handle);
 		self.data_handle = handle;
 		self.data_virt = virt;
 		self.data_phys = phys;
@@ -183,7 +181,7 @@ pub unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<St
 					ring.release();
 				}
 				if let Some((handle, _, _)) = data {
-					close(handle);
+					drivers::common::release_dma(handle);
 				}
 				return None;
 			}
@@ -211,6 +209,7 @@ pub unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<St
 			usb_bot::start(&mut Bot { hc, hids: &mut hids, dev, pipes }, unit)
 		};
 		if !usable {
+			crate::deconfigure(hc, dev);
 			st.release();
 			return None;
 		}

@@ -34,7 +34,11 @@
 #   an unanswered PIN           `modemcheck lock`, `modemcheck uncertain`: outcome-unknown, sent once,
 #                                 reconciled by a fresh query
 #   ... whose grant ended       `modemcheck lock`, `modemcheck uncertain-retired`: the grant closes before
-#                                 the modem answers, and the expiry is reconciled all the same
+#                                 the modem answers, and the expiry is reconciled all the same - a state change
+#                                 is admitted past its deadline
+#   a deactivation, likewise    `modemcheck deactivate-retired`, `modemcheck readmit`: the data grant closes
+#                                 with its deactivation unanswered, and past its deadline a fresh activation
+#                                 is admitted
 #   limits                      `modemcheck limits`: four providers, 32 clients, one context, none held
 #   withdrawal                  `modemcheck republish`: a withdrawn modem's grant fails; republication is
 #                                 another modem
@@ -90,7 +94,7 @@ refused() {
 # FROM AFTER THE FIRST PROBES, NOT FROM BOOT: PermissionManager resolves the service's roots by name the
 # first time it mints a grant from them, and keeps each resolved connection - which the service counts as
 # a handle. Measured: each root adds one, once, and nothing after.
-NET_NONE=1 guest_gate_run $'modemcheck clients\ngraph\nmodemdata\nmodemcheck pin\nmodemcheck identity\nmodemcheck activate\nmodemcheck context\nmodemcheck drop\nmodemcheck rollback\nmodemhold | modemcheck inherit\nmodemfail\nmodemcheck sim\nmodemcheck lock\nmodemcheck uncertain\nmodemcheck lock\nmodemcheck uncertain-retired\nmodemcheck limits\ngraph\nmodemcheck clients\nmodemcheck republish' ""
+NET_NONE=1 guest_gate_run $'modemcheck clients\ngraph\nmodemdata\nmodemcheck pin\nmodemcheck identity\nmodemcheck activate\nmodemcheck context\nmodemcheck drop\nmodemcheck rollback\nmodemhold | modemcheck inherit\nmodemfail\nmodemcheck sim\nmodemcheck lock\nmodemcheck uncertain\nmodemcheck lock\nmodemcheck uncertain-retired\nmodemcheck deactivate-retired\nmodemcheck readmit\nmodemcheck limits\ngraph\nmodemcheck clients\nmodemcheck republish' ""
 unlinked="$guest_gate_work/unlinked"
 cp "$GUEST_LINES" "$unlinked"
 refused "$unlinked"
@@ -110,7 +114,9 @@ expect "$unlinked" "modemcheck: PASS inherit" "a transferred endpoint must not k
 expect "$unlinked" "ModemService: a grant's owner ended - its grant is retired" "the service must observe owners, not channels"
 expect "$unlinked" "modemcheck: PASS sim" "a new SIM must end the context and its grants"
 expect "$unlinked" "modemcheck: PASS uncertain:" "an unanswered PIN must be outcome-unknown, sent once and reconciled"
-expect "$unlinked" "modemcheck: PASS uncertain-retired" "an unanswered PIN whose grant ended must still be reconciled"
+expect "$unlinked" "modemcheck: PASS uncertain-retired" "an unanswered PIN whose grant ended must still be reconciled, and a state change admitted after its deadline"
+expect "$unlinked" "modemcheck: deactivate-retired: a deactivation is out at the modem" "a deactivation must be left out at the modem when its grant ends"
+expect "$unlinked" "modemcheck: PASS readmit" "a deactivation whose grant ended before the modem answered must still be reconciled, and a fresh activation admitted"
 expect "$unlinked" "modemcheck: PASS limits" "the limits must be stated and nothing left held"
 expect "$unlinked" "modemcheck: PASS republish" "a withdrawn modem's grant must fail"
 if grep -aq "modemfail: FAIL" "$unlinked"; then

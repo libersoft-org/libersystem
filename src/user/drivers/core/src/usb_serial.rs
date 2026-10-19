@@ -99,10 +99,8 @@ impl Serial {
 		self.ring_in.release();
 		self.ring_out.release();
 		for handle in [&mut self.rx_handle, &mut self.tx_handle] {
-			if *handle != 0 {
-				close(*handle);
-				*handle = 0;
-			}
+			drivers::common::release_dma(*handle);
+			*handle = 0;
 		}
 	}
 }
@@ -300,7 +298,7 @@ pub unsafe fn configure_serial(hc: &mut Xhci, dev: &mut UsbDevice, limit: usize,
 					(Some(rx), Some(tx)) => (rx, tx),
 					(rx, tx) => {
 						for (handle, _, _) in [rx, tx].into_iter().flatten() {
-							close(handle);
+							drivers::common::release_dma(handle);
 						}
 						break;
 					}

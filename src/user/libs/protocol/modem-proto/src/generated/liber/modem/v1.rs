@@ -2607,9 +2607,13 @@ pub mod modem_admin {
 	use alloc::vec::Vec;
 
 	pub const OP_MINT: u16 = 1;
+	pub const OP_REVOKE: u16 = 2;
 
 	pub trait Service {
 		fn mint(&mut self, kind: GrantKind, alias: String, policy: DataPolicy, owner: u64) -> Result<ModemGrant, Error>;
+		/// Revoke every grant on one modem - data, identity and management alike: each ends as a closed connection's
+		/// would, its context torn down, and a client has to be granted again. Answers how many grants ended.
+		fn revoke(&mut self, modem: ModemId) -> Result<u32, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -2657,6 +2661,43 @@ pub mod modem_admin {
 						Err(v42) => {
 							w.u8(0)?;
 							v42.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_REVOKE => {
+				let modem = ModemId::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.revoke(modem);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v43) => {
+							w.u8(1)?;
+							w.u32(*v43)?;
+						}
+						Err(v44) => {
+							w.u8(0)?;
+							v44.write(w)?;
 						}
 					}
 					Some(())
@@ -2799,6 +2840,39 @@ pub mod modem_admin {
 			}
 			decoded
 		}
+		pub fn revoke(&mut self, modem: &ModemId) -> Option<Result<u32, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_REVOKE)?;
+			w.u32(corr)?;
+			modem.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -2807,6 +2881,14 @@ pub mod modem_admin {
 	fn channel_invoke_mint(chan: u64, kind: &GrantKind, alias: &str, policy: &DataPolicy, owner: &u64) -> Option<Result<ModemGrant, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.mint(kind, alias, policy, owner)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_modem_modem_admin_revoke")]
+	fn channel_invoke_revoke(chan: u64, modem: &ModemId) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.revoke(modem)
 	}
 }
 
@@ -3256,8 +3338,8 @@ impl ContextStatus {
 		out.push(',');
 		out.push_str("\"address\":");
 		match &self.address {
-			Some(v43) => {
-				let _ = write!(out, "{}", v43);
+			Some(v45) => {
+				let _ = write!(out, "{}", v45);
 			}
 			None => {
 				out.push_str("null");
@@ -3287,8 +3369,8 @@ impl ContextStatus {
 		out.push_str(", ");
 		out.push_str("address=");
 		match &self.address {
-			Some(v44) => {
-				let _ = write!(out, "{}", v44);
+			Some(v46) => {
+				let _ = write!(out, "{}", v46);
 			}
 			None => {
 				out.push('-');
@@ -3316,8 +3398,8 @@ impl ContextStatus {
 		self.state.to_cbor_into(out);
 		crate::codec::cbor::text(out, "address");
 		match &self.address {
-			Some(v45) => {
-				crate::codec::cbor::uint(out, *v45 as u64);
+			Some(v47) => {
+				crate::codec::cbor::uint(out, *v47 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3372,8 +3454,8 @@ impl ModemStatus {
 		out.push(',');
 		out.push_str("\"operator\":");
 		match &self.operator {
-			Some(v46) => {
-				crate::codec::json_escape(v46, out);
+			Some(v48) => {
+				crate::codec::json_escape(v48, out);
 			}
 			None => {
 				out.push_str("null");
@@ -3388,8 +3470,8 @@ impl ModemStatus {
 		out.push(',');
 		out.push_str("\"context\":");
 		match &self.context {
-			Some(v47) => {
-				v47.to_json_into(out);
+			Some(v49) => {
+				v49.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -3422,8 +3504,8 @@ impl ModemStatus {
 		out.push_str(", ");
 		out.push_str("operator=");
 		match &self.operator {
-			Some(v48) => {
-				out.push_str(v48);
+			Some(v50) => {
+				out.push_str(v50);
 			}
 			None => {
 				out.push('-');
@@ -3438,8 +3520,8 @@ impl ModemStatus {
 		out.push_str(", ");
 		out.push_str("context=");
 		match &self.context {
-			Some(v49) => {
-				v49.to_text_into(out);
+			Some(v51) => {
+				v51.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -3466,8 +3548,8 @@ impl ModemStatus {
 		self.registration.to_cbor_into(out);
 		crate::codec::cbor::text(out, "operator");
 		match &self.operator {
-			Some(v50) => {
-				crate::codec::cbor::text(out, v50);
+			Some(v52) => {
+				crate::codec::cbor::text(out, v52);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3479,8 +3561,8 @@ impl ModemStatus {
 		self.attempts.to_cbor_into(out);
 		crate::codec::cbor::text(out, "context");
 		match &self.context {
-			Some(v51) => {
-				v51.to_cbor_into(out);
+			Some(v53) => {
+				v53.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3625,13 +3707,13 @@ impl ModemWatch {
 		out.push(',');
 		out.push_str("\"modems\":");
 		out.push('[');
-		let mut v53 = true;
-		for v52 in self.modems.iter() {
-			if !v53 {
+		let mut v55 = true;
+		for v54 in self.modems.iter() {
+			if !v55 {
 				out.push(',');
 			}
-			v53 = false;
-			v52.to_json_into(out);
+			v55 = false;
+			v54.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3643,13 +3725,13 @@ impl ModemWatch {
 		out.push_str(", ");
 		out.push_str("modems=");
 		out.push('[');
-		let mut v55 = true;
-		for v54 in self.modems.iter() {
-			if !v55 {
+		let mut v57 = true;
+		for v56 in self.modems.iter() {
+			if !v57 {
 				out.push_str(", ");
 			}
-			v55 = false;
-			v54.to_text_into(out);
+			v57 = false;
+			v56.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3660,8 +3742,8 @@ impl ModemWatch {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "modems");
 		crate::codec::cbor::array(out, self.modems.len());
-		for v56 in self.modems.iter() {
-			v56.to_cbor_into(out);
+		for v58 in self.modems.iter() {
+			v58.to_cbor_into(out);
 		}
 	}
 }
@@ -3686,8 +3768,8 @@ impl Identity {
 		out.push('{');
 		out.push_str("\"imsi\":");
 		match &self.imsi {
-			Some(v57) => {
-				crate::codec::json_escape(v57, out);
+			Some(v59) => {
+				crate::codec::json_escape(v59, out);
 			}
 			None => {
 				out.push_str("null");
@@ -3696,8 +3778,8 @@ impl Identity {
 		out.push(',');
 		out.push_str("\"iccid\":");
 		match &self.iccid {
-			Some(v58) => {
-				crate::codec::json_escape(v58, out);
+			Some(v60) => {
+				crate::codec::json_escape(v60, out);
 			}
 			None => {
 				out.push_str("null");
@@ -3706,8 +3788,8 @@ impl Identity {
 		out.push(',');
 		out.push_str("\"msisdn\":");
 		match &self.msisdn {
-			Some(v59) => {
-				crate::codec::json_escape(v59, out);
+			Some(v61) => {
+				crate::codec::json_escape(v61, out);
 			}
 			None => {
 				out.push_str("null");
@@ -3719,8 +3801,8 @@ impl Identity {
 		out.push('{');
 		out.push_str("imsi=");
 		match &self.imsi {
-			Some(v60) => {
-				out.push_str(v60);
+			Some(v62) => {
+				out.push_str(v62);
 			}
 			None => {
 				out.push('-');
@@ -3729,8 +3811,8 @@ impl Identity {
 		out.push_str(", ");
 		out.push_str("iccid=");
 		match &self.iccid {
-			Some(v61) => {
-				out.push_str(v61);
+			Some(v63) => {
+				out.push_str(v63);
 			}
 			None => {
 				out.push('-');
@@ -3739,8 +3821,8 @@ impl Identity {
 		out.push_str(", ");
 		out.push_str("msisdn=");
 		match &self.msisdn {
-			Some(v62) => {
-				out.push_str(v62);
+			Some(v64) => {
+				out.push_str(v64);
 			}
 			None => {
 				out.push('-');
@@ -3752,8 +3834,8 @@ impl Identity {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "imsi");
 		match &self.imsi {
-			Some(v63) => {
-				crate::codec::cbor::text(out, v63);
+			Some(v65) => {
+				crate::codec::cbor::text(out, v65);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3761,8 +3843,8 @@ impl Identity {
 		}
 		crate::codec::cbor::text(out, "iccid");
 		match &self.iccid {
-			Some(v64) => {
-				crate::codec::cbor::text(out, v64);
+			Some(v66) => {
+				crate::codec::cbor::text(out, v66);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3770,8 +3852,8 @@ impl Identity {
 		}
 		crate::codec::cbor::text(out, "msisdn");
 		match &self.msisdn {
-			Some(v65) => {
-				crate::codec::cbor::text(out, v65);
+			Some(v67) => {
+				crate::codec::cbor::text(out, v67);
 			}
 			None => {
 				crate::codec::cbor::null(out);

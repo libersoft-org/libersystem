@@ -1,7 +1,7 @@
 //! CLIPPING: the four shapes a clip can be, how two of them combine, and what an inverse one is.
 
 use crate::Outcome;
-use crate::harness::{draw, draw_with, near, rect_path, white};
+use crate::harness::{draw, draw_with, near, rect_path, white, white_where};
 use graphics_core::geom::{PointF, RectF};
 use render2d::path::{FillRule, PathBuilder};
 
@@ -27,10 +27,8 @@ fn clipped(clip: render2d::path::Path, rule: FillRule, inverse: bool) -> Result<
 /// A rectangular clip passes what is inside it and nothing outside.
 pub fn clip_rect() -> Outcome {
 	let frame = clipped(rect_path(RectF::new(8.0, 8.0, 16.0, 16.0)), FillRule::NonZero, false)?;
-	require!(frame.covered(16, 16), "inside the clip the drawing is there: {:?}", frame.pixel(16, 16));
-	require!(frame.empty(4, 16), "and outside it is not: {:?}", frame.pixel(4, 16));
-	require!(frame.empty(28, 28), "on every side: {:?}", frame.pixel(28, 28));
-	Ok(())
+	// Inside the clip the drawing is there, and outside it - on every side - it is not.
+	white_where(&frame, |x, y| (8..24).contains(&x) && (8..24).contains(&y))
 }
 
 // @covers: ClipRoundedRect
@@ -70,10 +68,9 @@ pub fn clip_nested() -> Outcome {
 		canvas.restore()?;
 		canvas.restore()
 	})?;
-	require!(frame.covered(16, 16), "the overlap of the two clips passes: {:?}", frame.pixel(16, 16));
-	require!(frame.empty(4, 16), "what only the first allowed does not: {:?}", frame.pixel(4, 16));
-	require!(frame.empty(28, 16), "and neither does what only the second allowed: {:?}", frame.pixel(28, 16));
-	Ok(())
+	// The overlap of the two clips passes; what only the first allowed does not, and neither does what only the
+	// second allowed.
+	white_where(&frame, |x, _| (12..20).contains(&x))
 }
 
 // @covers: ClipAlphaMask
@@ -106,8 +103,6 @@ pub fn clip_alpha_mask() -> Outcome {
 /// clips needs the complement of an arbitrary path, which is not a path.
 pub fn clip_inverse() -> Outcome {
 	let frame = clipped(rect_path(RectF::new(8.0, 8.0, 16.0, 16.0)), FillRule::NonZero, true)?;
-	require!(frame.empty(16, 16), "inside the shape nothing passes: {:?}", frame.pixel(16, 16));
-	require!(frame.covered(2, 2), "and everything outside it does: {:?}", frame.pixel(2, 2));
-	require!(frame.covered(30, 30), "on every side: {:?}", frame.pixel(30, 30));
-	Ok(())
+	// Inside the shape nothing passes, and everything outside it does, on every side.
+	white_where(&frame, |x, y| !((8..24).contains(&x) && (8..24).contains(&y)))
 }

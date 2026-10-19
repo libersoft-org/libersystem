@@ -72,12 +72,17 @@ def production(root, overlay, *, candidate):
 
     x = read(DRIVER / 'xhci.rs')
     h = read(DRIVER / 'usb_hid.rs')
+    # THE SHARED HID BINDING. Since 2026-10-18 what a report means - the pad table, its sender, the decode and the
+    # sinks - is `drivers::usb_input`, shared by xHCI and the legacy controllers, and `usb_hid.rs` keeps only xHCI's
+    # rings and pages. The binding is compiled whole, as the parser is, so the decode the reports reach is literal.
+    if 'pub struct Input {' not in read(DRIVER / 'usb_input.rs'):
+        raise ValueError('the shared HID binding no longer holds the input state this proof drives')
     n = read(DRIVER / 'usb_net.rs')
     c = read(DRIVER / 'classes.rs')
     serial = read(DRIVER / 'usb_serial.rs')
     uac = read(DRIVER / 'uac.rs')
     modules = []
-    for name in ('hid', 'cdc', 'descriptor', 'port', 'usb_class', 'uac'):
+    for name in ('hid', 'cdc', 'descriptor', 'port', 'usb_class', 'uac', 'usb_input'):
         relative = DRIVER / (name + '.rs')
         read(relative)
         path = overlay / relative if (overlay / relative).is_file() else root / relative
@@ -101,6 +106,9 @@ def production(root, overlay, *, candidate):
                  'RT_ENDPOINT','REQ_CLEAR_FEATURE','FEATURE_ENDPOINT_HALT')
     chunks = [constant(x, name) for name in constants]
     chunks += ['mod usb_serial { ' + constant(serial, 'MAX_PORTS') + ' }']
+    # The class codes `usb_class` judges an interface by, from the modules that own them.
+    chunks += ['mod usb_bot { ' + constant(read(DRIVER / 'usb_bot.rs'), 'CLASS_MASS_STORAGE') + ' }',
+               'mod printer { ' + constant(read(DRIVER / 'printer.rs'), 'CLASS_PRINTER') + ' }']
     chunks += [take(x, 'xhci.rs', anchor) for anchor in (
         'struct Ring {','struct UsbDevice {','unsafe fn r8(', 'unsafe fn w32(', 'fn w64(',
         'fn command(', 'unsafe fn take_event(', 'fn wait_event(', 'fn command_and_wait(',
@@ -109,16 +117,15 @@ def production(root, overlay, *, candidate):
     chunks += ['impl Ring {\n' + '\n'.join(take(item(x, 'impl Ring {'), 'xhci.rs/Ring', anchor)
                for anchor in ('unsafe fn push(', 'fn release(')) + '\n}',
                'impl UsbDevice {\n' + take(item(x, 'impl UsbDevice {'), 'xhci.rs/UsbDevice', 'fn release(') + '\n}']
+    # What `usb_hid.rs` names from the shared binding, as its own `use` lines name them.
+    if 'use drivers::usb_input::{self, DESC_REPORT, HID_REQ_SET_PROTOCOL, Input, RT_INTERFACE_IN};' not in h \
+            or 'pub use drivers::usb_input::{KEY_SINK, PTR_SINK, Pads, TOUCH_SINK, TRUSTED_KEY_SINK};' not in h:
+        raise ValueError('the xHCI HID module no longer names the shared binding as this proof imports it')
+    chunks += ['use usb_input::{Input, Pads};']
     chunks += [take(h, 'usb_hid.rs', anchor) for anchor in (
-        'struct Page {', 'struct Pad {', 'pub struct Hid {', 'pub struct Hids {',
-        'pub struct Pads {', 'impl gamepad::Sender for Sink {',
-        'impl Pads {', 'fn post_report(', 'pub fn post_reports(',
-        'pub fn handle_hid_event(', 'unsafe fn feed_hid_report(', 'pub fn depart(')]
-    # The one tuple struct has no block.
-    if h.count('struct Sink(u64);') != 1:
-        raise ValueError('HID sender boundary changed')
-    chunks += ['struct Sink(u64);', constant(h, 'MAX_PADS'),
-               'impl Hids {\n' + take(item(h, 'impl Hids {'), 'usb_hid.rs/Hids', 'pub const fn new(') + '\n}',
+        'struct Page {', 'pub struct Hid {', 'pub struct Hids {', 'fn post_report(', 'pub fn post_reports(',
+        'pub fn handle_hid_event(', 'pub fn depart(')]
+    chunks += ['impl Hids {\n' + take(item(h, 'impl Hids {'), 'usb_hid.rs/Hids', 'pub const fn new(') + '\n}',
                'impl Hid {\n' + take(item(h, 'impl Hid {'), 'usb_hid.rs/Hid', 'pub fn release(') + '\n}']
     chunks += [take(n, 'usb_net.rs', anchor) for anchor in (
         'struct Notify {', 'struct Ncm {', 'pub struct Net {', 'pub fn post_notification(',

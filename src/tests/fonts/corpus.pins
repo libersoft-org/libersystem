@@ -4,7 +4,7 @@
 # quietly shaped: a corpus that drifted is a different test wearing the same name.
 # The glyph names are how the gate asks - never by number, because a number would
 # make the gate a test of this generator instead of a test of the shaper.
-face conformance-alpha.ttf a408a650c3cf091873f0c3789b255de0257c746cfa9eaf90bd9ba21de39b1eb4
+face conformance-alpha.ttf 102095a6f50a1b0371d096202c0dbc2a1adf3ad6214723947dd19b8b8839a2de
 glyph conformance-alpha.ttf .notdef 0
 glyph conformance-alpha.ttf space 1
 glyph conformance-alpha.ttf A 2
@@ -42,7 +42,9 @@ glyph conformance-alpha.ttf sheva 33
 glyph conformance-alpha.ttf less 34
 glyph conformance-alpha.ttf greater 35
 glyph conformance-alpha.ttf zwsp 36
-face conformance-complex.ttf a889378f26716cdd164d55a758fc3439ef037eecf4f4e8e075a14b8182021570
+glyph conformance-alpha.ttf acute 37
+glyph conformance-alpha.ttf fatha 38
+face conformance-complex.ttf a89e5750b60d59e9af9bea95ae03b88cdc91e66b96dd684b194bcef9e69f5b2e
 glyph conformance-complex.ttf .notdef 0
 glyph conformance-complex.ttf space 1
 glyph conformance-complex.ttf dv.ka 2

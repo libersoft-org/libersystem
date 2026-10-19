@@ -584,11 +584,11 @@ mutate "$DRIVERS" src/user/drivers/core/src/descriptor.rs \
 # larger than the transfer describes bytes nobody asked for, and the subtraction wraps into a moved
 # count of four gigabytes - which the caller then reads out of a buffer that holds one page.
 mutate "$DRIVERS" src/user/drivers/core/src/usb.rs \
-	"	if residue > wanted {
+	"	if csw.residue > wanted {
 		return Err(BotFault::Residue);
 	}
-	let moved = wanted - residue;" \
-	"	let moved = wanted.wrapping_sub(residue);" \
+	let moved = (wanted - csw.residue).min(observed);" \
+	"	let moved = wanted.wrapping_sub(csw.residue).min(observed);" \
 	a_residue_past_the_transfer_is_refused_before_it_is_subtracted
 
 # Bulk-only transport: a short transfer is refused where the command did not allow one. Allowed the

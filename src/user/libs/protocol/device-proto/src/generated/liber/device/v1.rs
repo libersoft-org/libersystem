@@ -905,6 +905,10 @@ pub struct BindingRecord {
 	/// wrong; these are for one that has not, so a driver's footprint can be read without breaking it. Appended.
 	pub memory_used: u64,
 	pub memory_peak: u64,
+	/// THE RUNNING DRIVER'S DMA MEMORY, from the same counters: what its Domain holds pinned for devices now. A driver
+	/// that gives back what a departed device held returns to the same figure after every plug and unplug, which is how
+	/// a gate reads that it did. Zero where no driver runs. Appended.
+	pub dma_used: u64,
 }
 
 impl BindingRecord {
@@ -966,6 +970,7 @@ impl BindingRecord {
 		}
 		w.u64(self.memory_used)?;
 		w.u64(self.memory_peak)?;
+		w.u64(self.dma_used)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<BindingRecord> {
@@ -984,7 +989,8 @@ impl BindingRecord {
 		let platform = if r.tag()? { Some(r.u32()?) } else { None };
 		let memory_used = r.u64()?;
 		let memory_peak = r.u64()?;
-		Some(BindingRecord { index, bus, dev, func, generation, state, cause, attempts, artifact, rule, providers, resources, platform, memory_used, memory_peak })
+		let dma_used = r.u64()?;
+		Some(BindingRecord { index, bus, dev, func, generation, state, cause, attempts, artifact, rule, providers, resources, platform, memory_used, memory_peak, dma_used })
 	}
 }
 
@@ -8924,6 +8930,9 @@ impl BindingRecord {
 		out.push(',');
 		out.push_str("\"memory-peak\":");
 		let _ = write!(out, "{}", self.memory_peak);
+		out.push(',');
+		out.push_str("\"dma-used\":");
+		let _ = write!(out, "{}", self.dma_used);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -8979,10 +8988,13 @@ impl BindingRecord {
 		out.push_str(", ");
 		out.push_str("memory-peak=");
 		let _ = write!(out, "{}", self.memory_peak);
+		out.push_str(", ");
+		out.push_str("dma-used=");
+		let _ = write!(out, "{}", self.dma_used);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 15);
+		crate::codec::cbor::map(out, 16);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
 		crate::codec::cbor::text(out, "bus");
@@ -9020,6 +9032,8 @@ impl BindingRecord {
 		crate::codec::cbor::uint(out, self.memory_used as u64);
 		crate::codec::cbor::text(out, "memory-peak");
 		crate::codec::cbor::uint(out, self.memory_peak as u64);
+		crate::codec::cbor::text(out, "dma-used");
+		crate::codec::cbor::uint(out, self.dma_used as u64);
 	}
 }
 

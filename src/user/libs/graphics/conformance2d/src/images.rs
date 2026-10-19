@@ -2,7 +2,7 @@
 //! happens to their colour on the way into a target that is not in their own space.
 
 use crate::Outcome;
-use crate::harness::{Frame, draw_with, render_in, stored};
+use crate::harness::{Frame, draw_with, every_pixel, render_in, stored};
 use graphics_core::geom::{Extent2D, RectF};
 use graphics_core::layout::{ImageLayout, RowOrigin};
 use graphics_core::pixel::Rgba;
@@ -77,10 +77,8 @@ pub fn image_source_dest_rect() -> Outcome {
 	});
 	// THE THIRD TEXEL ALONE, into the middle of the target.
 	let frame = drawn(&source, ImageQuality::Nearest, RectF::new(2.0, 0.0, 1.0, 1.0), RectF::new(8.0, 8.0, 16.0, 16.0))?;
-	let pixel = frame.pixel(16, 16);
-	require!(pixel[2] > 200 && pixel[0] < 40, "the chosen texel is the one drawn: {pixel:?}");
-	require!(frame.empty(4, 4), "and it is drawn only where the destination says: {:?}", frame.pixel(4, 4));
-	Ok(())
+	// The chosen texel is the one drawn - opaque blue - and only where the destination says.
+	every_pixel(&frame, |x, y| if (8..24).contains(&x) && (8..24).contains(&y) { [0, 0, 255, 255] } else { [0; 4] })
 }
 
 // @covers: ImageProjective
@@ -107,10 +105,9 @@ pub fn image_projective() -> Outcome {
 /// two texels is the only place the value changes.
 pub fn image_nearest() -> Outcome {
 	let frame = drawn(&black_and_white(), ImageQuality::Nearest, RectF::new(0.0, 0.0, 2.0, 1.0), RectF::new(0.0, 0.0, 32.0, 32.0))?;
-	require!(frame.pixel(4, 16)[0] == 0, "the left half is the black texel and nothing between: {:?}", frame.pixel(4, 16));
-	require!(frame.pixel(12, 16)[0] == 0, "right up to the boundary: {:?}", frame.pixel(12, 16));
-	require!(frame.pixel(20, 16)[0] == 255, "and the right half is the white one: {:?}", frame.pixel(20, 16));
-	Ok(())
+	// The left half is the black texel and nothing between, right up to the boundary, and the right half is the
+	// white one - every pixel of both, opaque.
+	every_pixel(&frame, |x, _| if x < 16 { [0, 0, 0, 255] } else { [255; 4] })
 }
 
 // @covers: ImageBilinear
@@ -187,18 +184,16 @@ fn spread(mode: SpreadMode) -> Result<Frame, crate::Trouble> {
 /// Clamped, the edge texel continues for ever - so everything past the image is its last colour.
 pub fn image_wrap_clamp() -> Outcome {
 	let frame = spread(SpreadMode::Clamp)?;
-	require!(frame.pixel(4, 4)[0] > 200, "inside the image the first texel is itself: {:?}", frame.pixel(4, 4));
-	require!(frame.pixel(30, 4)[2] > 200, "and past its end the last texel is held: {:?}", frame.pixel(30, 4));
-	Ok(())
+	// Inside the image each texel is itself, and past its end the last texel is held.
+	stripes(&frame, |x| x < 8)
 }
 
 // @covers: ImageWrapRepeat
 /// Repeated, the pattern starts again - so one period along is the first texel again.
 pub fn image_wrap_repeat() -> Outcome {
 	let frame = spread(SpreadMode::Repeat)?;
-	require!(frame.pixel(20, 4)[0] > 200, "one period along is the first texel again: {:?}", frame.pixel(20, 4));
-	require!(frame.pixel(28, 4)[2] > 200, "and the second follows it: {:?}", frame.pixel(28, 4));
-	Ok(())
+	// One period along is the first texel again, and the second follows it.
+	stripes(&frame, |x| x % 16 < 8)
 }
 
 // @covers: ImageWrapMirror
@@ -206,9 +201,13 @@ pub fn image_wrap_repeat() -> Outcome {
 /// without a seam-free source.
 pub fn image_wrap_mirror() -> Outcome {
 	let frame = spread(SpreadMode::Mirror)?;
-	require!(frame.pixel(20, 4)[2] > 200, "past the edge the pattern runs backwards, so the LAST texel comes first: {:?}", frame.pixel(20, 4));
-	require!(frame.pixel(28, 4)[0] > 200, "and the first comes second: {:?}", frame.pixel(28, 4));
-	Ok(())
+	// Past the edge the pattern runs backwards, so the LAST texel comes first and the first comes second.
+	stripes(&frame, |x| x < 8 || x >= 24)
+}
+
+/// EVERY PIXEL OF A SPREAD: the red texel where `red` says and the blue one everywhere else, both opaque.
+fn stripes(frame: &Frame, red: impl Fn(u32) -> bool) -> Outcome {
+	every_pixel(frame, |x, _| if red(x) { [255, 0, 0, 255] } else { [0, 0, 255, 255] })
 }
 
 // @covers: ImageOpacity
@@ -220,8 +219,8 @@ pub fn image_opacity() -> Outcome {
 		canvas.set_opacity(0.5);
 		canvas.draw_image(record(), RectF::new(0.0, 0.0, 1.0, 1.0), RectF::new(0.0, 0.0, 16.0, 16.0), ImageQuality::Nearest)
 	})?;
-	require!(frame.holds(8, 8, [1.0, 1.0, 1.0], 0.5), "half opacity is half alpha, of the white the image is: {:?}", frame.pixel(8, 8));
-	Ok(())
+	// Half opacity is half alpha, of the white the image is, at every pixel the image covers - all of them.
+	every_pixel(&frame, |x, y| [stored(1.0, x, y), stored(1.0, x, y), stored(1.0, x, y), crate::harness::byte(0.5)])
 }
 
 // @covers: ImageColorSpaceConversion

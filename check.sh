@@ -155,6 +155,10 @@ declare -A GATES=(
 	# companion, keys and tablet moves through each, and `vol://usb` following sticks out and in on all three, one
 	# behind a hub.
 	["usb-legacy"]="tools/check-usb-legacy.sh"
+	# WHAT A DEPARTED USB DEVICE HELD, GIVEN BACK, on the development guest's xHCI: the boot's stick out, one of the gate's
+	# own plugged, read through `vol://usb` and taken out, and the driver's DMA memory - read with `lsdev` - the same after
+	# as before it came.
+	["usb-release"]="tools/check-usb-release.sh"
 	# SMARTCARDSERVICE AGAINST THE IN-GUEST SMART-CARD FIXTURE: reader-scoped grants, the PIV allowlist,
 	# the pinpad with no PIN anywhere, an authentication signature verified by OpenSSL on the host,
 	# queues, removal, recovery, events and a restart. The service and its pinpad policy - not USB CCID.

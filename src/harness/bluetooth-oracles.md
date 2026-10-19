@@ -1,4 +1,4 @@
-# Bluetooth host oracles (P02M0194)
+# Bluetooth host oracles
 
 These dependencies run only on the development host. None is linked into a LiberSystem
 binary, copied into an image, or required to use Bluetooth in a shipping system.

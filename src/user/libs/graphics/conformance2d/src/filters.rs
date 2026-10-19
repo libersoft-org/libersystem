@@ -7,9 +7,15 @@
 //! wholly or not at all. A backend that computes a filter one tile at a time and blurs against nothing at
 //! the tile's edge is wrong by half the drawing's alpha there, and only a scene larger than a tile, read
 //! everywhere, can see it.
+//!
+//! AND EVERY SCENE WHOSE PICTURE IS WHOLE PIXELS IS COMPARED WHOLE TOO: a colour matrix, a composite and a
+//! blend inside the graph, both morphologies, a displacement by a whole number of pixels, a crop and a tile
+//! each leave every pixel of the target wholly covered or empty, so every one is compared exactly. The
+//! convolution alone is read at probes: its kernel's weights cancel, so its output leaves the range a colour
+//! can hold and its picture depends on what a backend makes of that, which the profile does not state.
 
 use crate::Outcome;
-use crate::harness::{Frame, WIDE, blurred, draw, draw_linear, gaussian, rect_path, solid, white};
+use crate::harness::{Frame, WIDE, blurred, byte, draw, draw_linear, every_pixel, gaussian, rect_path, solid, stored, white};
 use graphics_core::geom::RectF;
 use render2d::blend::{BlendMode, Operator};
 use render2d::filter::{Channel, FilterGraph, FilterNode};
@@ -30,6 +36,18 @@ fn filtered(build: impl Fn(&mut FilterGraph)) -> Result<Frame, crate::Trouble> {
 /// Whether `at` lies in the half-open span `from..to`, as a coverage of nothing or everything.
 fn inside(at: i64, from: i64, to: i64) -> f64 {
 	if (from..to).contains(&at) { 1.0 } else { 0.0 }
+}
+
+/// EVERY PIXEL OF A PICTURE OF WHOLE PIXELS: an opaque straight colour - or nothing - inside the half-open
+/// rectangle `left, top, right, bottom`, and another outside it, compared exactly at every pixel of the target.
+fn whole(frame: &Frame, (left, top, right, bottom): (u32, u32, u32, u32), within: Option<[f32; 3]>, outside: Option<[f32; 3]>) -> Outcome {
+	every_pixel(frame, |x, y| {
+		let shown = if (left..right).contains(&x) && (top..bottom).contains(&y) { within } else { outside };
+		match shown {
+			Some(colour) => [stored(colour[0], x, y), stored(colour[1], x, y), stored(colour[2], x, y), byte(1.0)],
+			None => [0; 4],
+		}
+	})
 }
 
 // @covers: FilterGaussianBlur
@@ -108,10 +126,8 @@ pub fn filter_color_matrix() -> Outcome {
 		canvas.fill_path(rect_path(RectF::new(12.0, 12.0, 8.0, 8.0)), solid(0.8, 0.0, 0.0, 1.0), FillRule::NonZero)?;
 		canvas.end_layer()
 	})?;
-	// A PIXEL THE SQUARE COVERS WHOLLY, so it is compared exactly: red moved into blue, and the alpha row left
-	// the coverage alone.
-	require!(frame.holds(16, 16, [0.0, 0.0, 0.8], 1.0), "the red channel was moved into blue at full alpha: {:?}", frame.pixel(16, 16));
-	Ok(())
+	// Red moved into blue, and the alpha row left the coverage alone - where the square is and nowhere else.
+	whole(&frame, (12, 12, 20, 20), Some([0.0, 0.0, 0.8]), None)
 }
 
 // @covers: FilterComposite
@@ -124,9 +140,8 @@ pub fn filter_composite() -> Outcome {
 		// THE FLOOD KEPT ONLY WHERE THE SOURCE IS NOT, which is `SourceOut` and is a shape's surround.
 		graph.push(FilterNode::Composite { source: flood, backdrop: source, operator: Operator::SrcOut }).expect("a composite");
 	})?;
-	require!(frame.empty(16, 16), "where the shape is, the flood was cut away: {:?}", frame.pixel(16, 16));
-	require!(frame.pixel(4, 4)[2] > 200, "and where it is not, the flood survives: {:?}", frame.pixel(4, 4));
-	Ok(())
+	// Where the shape is the flood was cut away, and everywhere else it survives.
+	whole(&frame, (12, 12, 20, 20), None, Some([0.0, 0.0, 1.0]))
 }
 
 // @covers: FilterBlend
@@ -143,8 +158,9 @@ pub fn filter_blend() -> Outcome {
 		canvas.fill_path(rect_path(RectF::new(12.0, 12.0, 8.0, 8.0)), solid(0.8, 0.8, 0.8, 1.0), FillRule::NonZero)?;
 		canvas.end_layer()
 	})?;
-	require!(frame.holds(16, 16, [0.4, 0.4, 0.4], 1.0), "half multiplied by four fifths is two fifths, exactly where the square covers the pixel: {:?}", frame.pixel(16, 16));
-	Ok(())
+	// Half multiplied by four fifths is two fifths where the square is; everywhere else the backdrop is
+	// nothing, and the flood over nothing is the flood.
+	whole(&frame, (12, 12, 20, 20), Some([0.4, 0.4, 0.4]), Some([0.5, 0.5, 0.5]))
 }
 
 // @covers: FilterConvolution
@@ -170,9 +186,8 @@ pub fn filter_morphology_dilate() -> Outcome {
 		let source = graph.push(FilterNode::Source).expect("a node");
 		graph.push(FilterNode::MorphologyDilate { input: source, x: 2.0, y: 2.0 }).expect("a dilation");
 	})?;
-	require!(frame.covered(10, 16), "two pixels out is now inside the shape: {:?}", frame.pixel(10, 16));
-	require!(frame.empty(9, 16), "and three is not, so it grew by the radius and not by more: {:?}", frame.pixel(9, 16));
-	Ok(())
+	// Two pixels out is now inside the shape and three is not: it grew by the radius on every side, not more.
+	whole(&frame, (10, 10, 22, 22), Some([1.0; 3]), None)
 }
 
 // @covers: FilterMorphologyErode
@@ -183,9 +198,8 @@ pub fn filter_morphology_erode() -> Outcome {
 		let source = graph.push(FilterNode::Source).expect("a node");
 		graph.push(FilterNode::MorphologyErode { input: source, x: 2.0, y: 2.0 }).expect("an erosion");
 	})?;
-	require!(frame.empty(13, 16), "a pixel that was inside the edge is eroded away: {:?}", frame.pixel(13, 16));
-	require!(frame.covered(16, 16), "and the middle survives: {:?}", frame.pixel(16, 16));
-	Ok(())
+	// The two pixels inside every edge are eroded away and the middle survives.
+	whole(&frame, (14, 14, 18, 18), Some([1.0; 3]), None)
 }
 
 // @covers: FilterDisplacementMap
@@ -197,15 +211,15 @@ pub fn filter_displacement_map() -> Outcome {
 		let map = graph.push(FilterNode::Flood { color: render2d::paint::Color::new(0.5, 0.5, 0.5, 1.0, graphics_core::ColorSpace::SrgbLinear) }).expect("a flat map");
 		graph.push(FilterNode::DisplacementMap { input: source, map, scale: 8.0, x_channel: Channel::Red, y_channel: Channel::Green }).expect("a displacement");
 	})?;
-	require!(still.covered(16, 16), "a flat half-grey map is the identity: {:?}", still.pixel(16, 16));
+	// A flat half-grey map is the identity.
+	whole(&still, (12, 12, 20, 20), Some([1.0; 3]), None)?;
 	let moved = filtered(|graph| {
 		let source = graph.push(FilterNode::Source).expect("a node");
 		let map = graph.push(FilterNode::Flood { color: render2d::paint::Color::new(1.0, 0.5, 0.5, 1.0, graphics_core::ColorSpace::SrgbLinear) }).expect("a map");
 		graph.push(FilterNode::DisplacementMap { input: source, map, scale: 8.0, x_channel: Channel::Red, y_channel: Channel::Green }).expect("a displacement");
 	})?;
-	require!(moved.covered(12, 16), "a map at one reads four pixels to the right, so the shape appears four to the left: {:?}", moved.pixel(12, 16));
-	require!(moved.empty(18, 16), "and its far edge moved with it: {:?}", moved.pixel(18, 16));
-	Ok(())
+	// A map at one reads four pixels to the right, so the shape appears four to the left, far edge and all.
+	whole(&moved, (8, 12, 16, 20), Some([1.0; 3]), None)
 }
 
 // @covers: FilterCrop
@@ -215,9 +229,8 @@ pub fn filter_crop() -> Outcome {
 		let source = graph.push(FilterNode::Source).expect("a node");
 		graph.push(FilterNode::Crop { input: source, rect: RectF::new(12.0, 12.0, 4.0, 8.0) }).expect("a crop");
 	})?;
-	require!(frame.covered(13, 16), "inside the crop the shape is there: {:?}", frame.pixel(13, 16));
-	require!(frame.empty(17, 16), "and outside it there is nothing: {:?}", frame.pixel(17, 16));
-	Ok(())
+	// Inside the crop the shape is there, and outside it there is nothing.
+	whole(&frame, (12, 12, 16, 20), Some([1.0; 3]), None)
 }
 
 // @covers: FilterTile
@@ -228,10 +241,9 @@ pub fn filter_tile() -> Outcome {
 		let source = graph.push(FilterNode::Source).expect("a node");
 		graph.push(FilterNode::Tile { input: source, rect: RectF::new(12.0, 12.0, 8.0, 8.0) }).expect("a tile");
 	})?;
-	require!(frame.covered(16, 16), "the tile itself is unchanged: {:?}", frame.pixel(16, 16));
-	require!(frame.covered(24, 24), "and repeats a period along: {:?}", frame.pixel(24, 24));
-	require!(frame.covered(4, 4), "in the negative direction too: {:?}", frame.pixel(4, 4));
-	Ok(())
+	// The rectangle is the square's own inside, so its repetition - a period along, and in the negative
+	// direction too - covers the whole target.
+	whole(&frame, (0, 0, 32, 32), Some([1.0; 3]), None)
 }
 
 // @covers: FilterBackdrop

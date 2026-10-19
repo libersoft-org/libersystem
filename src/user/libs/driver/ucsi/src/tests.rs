@@ -184,6 +184,18 @@ fn a_change_is_reported_and_acknowledged_only_beside_the_status_that_reads_it() 
 }
 
 #[test]
+fn a_change_the_acknowledgement_names_after_another_is_reported_too() {
+	// TWO CHANGES PENDING: the status of connector 1 is read and its change acknowledged, and the acknowledgement's
+	// completion names connector 2's - which this PPM names nowhere else.
+	let mut ppm = Model::new(|control| if control as u8 == ACK_CC_CI { vec![(1, ACKED | change(2), Vec::new())] } else { vec![(1, COMPLETE | change(1) | length(19), vec![0; 19])] });
+	let exchange = execute(&mut ppm, &v21(), get_connector_status(1), &[], 2, true).expect("answered");
+	assert_eq!((exchange.change, exchange.after), (Some(1), Some(2)), "the second change is the acknowledgement's, and is reported");
+	// AN ACKNOWLEDGEMENT NAMING A CONNECTOR PAST THE PPM'S COUNT is refused as a command's completion would be.
+	let mut ppm = Model::new(|control| if control as u8 == ACK_CC_CI { vec![(1, ACKED | change(5), Vec::new())] } else { vec![(1, COMPLETE | change(1) | length(19), vec![0; 19])] });
+	assert_eq!(execute(&mut ppm, &v21(), get_connector_status(1), &[], 2, true), Err(Failure::Connector(5)));
+}
+
+#[test]
 fn a_reset_is_polled_through_refresh_alone_and_a_silent_one_fails_at_the_bound() {
 	let mut ppm = Model::new(|_| Vec::new());
 	reset(&mut ppm).expect("completes after three refreshes");

@@ -153,16 +153,18 @@ impl Ucsi {
 		self.capability.map_or(0, |capability| capability.connectors)
 	}
 
-	// ONE COMMAND under the discipline; a connector change it saw is kept for the loop to read.
+	// ONE COMMAND under the discipline; a connector change it saw is kept for the loop to read. A change-acknowledging
+	// exchange's own change is the one it acknowledged - but whatever its acknowledgement's completion named came after
+	// that, and is kept like any other.
 	fn run(&mut self, command: Command, change_ack: bool) -> Result<Exchange, Failure> {
 		let layout = self.layout;
 		let connectors = self.connectors();
 		let exchange = ucsi::execute(self, &layout, command, &[], connectors, change_ack)?;
-		if let Some(number) = exchange.change
-			&& !change_ack
-			&& !self.changes.contains(&number)
-		{
-			self.changes.push(number);
+		let seen = if change_ack { [None, exchange.after] } else { [exchange.change, exchange.after] };
+		for number in seen.into_iter().flatten() {
+			if !self.changes.contains(&number) {
+				self.changes.push(number);
+			}
 		}
 		Ok(exchange)
 	}
@@ -192,6 +194,9 @@ impl Ucsi {
 	// RESET, CONFIGURE, READ: what bind does, and what recovery does again.
 	fn start(&mut self) -> Result<(), Failure> {
 		ucsi::reset(self)?;
+		// CLEARED AT THE RESET, which is what ends every change before it - not after the configuration, whose commands
+		// can carry a change of their own, which the reads below then had to happen to name again.
+		self.changes.clear();
 		match self.run(command::set_notification_enable(command::NOTIFY_ALL), false)?.completion {
 			Completion::Answered(_) => {}
 			_ => return Err(Failure::Malformed),
@@ -223,7 +228,6 @@ impl Ucsi {
 			ports.push(port);
 		}
 		self.ports = ports;
-		self.changes.clear();
 		for at in 0..self.ports.len() {
 			self.read_port(at, false)?;
 		}
@@ -235,11 +239,13 @@ impl Ucsi {
 		// Whatever the PPM said while the machine slept is read again below, as a whole.
 		let mut buf = [0u8; 64];
 		while self.notify != 0 && matches!(try_recv_caps(self.notify, &mut buf), PolledCaps::Message { .. }) {}
+		// Every connector is read again below, so what was queued before the sleep is read with it - and what the command
+		// that enables the notifications indicates is kept.
+		self.changes.clear();
 		match self.run(command::set_notification_enable(command::NOTIFY_ALL), false)?.completion {
 			Completion::Answered(_) => {}
 			_ => return Err(Failure::Malformed),
 		}
-		self.changes.clear();
 		for at in 0..self.ports.len() {
 			self.read_port(at, false)?;
 		}

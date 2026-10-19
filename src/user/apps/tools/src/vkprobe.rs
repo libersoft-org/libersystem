@@ -17,7 +17,10 @@
 //      slot - by the two exports that ICD has and by nothing else;
 //   3. asks the loader for the layer list, which the port makes always empty;
 //   4. asks it to create an instance ENABLING a layer, which must be refused by name;
-//   5. asks it for an instance procedure address, which is the path that reaches the ICD.
+//   5. asks it for an instance procedure address, which is the path that reaches the ICD;
+//   6. asks it to create an instance through `VK_LUNARG_direct_driver_loading`, handing it the bound
+//      ICD's own lookup - a second way to load a driver, which the port removes, so it must be refused
+//      without that lookup ever being called.
 
 #![no_std]
 #![no_main]
@@ -67,10 +70,44 @@ struct InstanceCreateInfo {
 /// `VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO`.
 const INSTANCE_CREATE_INFO: u32 = 1;
 
+/// `VkDirectDriverLoadingInfoLUNARG`: one driver, named by its own instance lookup.
+#[repr(C)]
+struct DirectDriverLoadingInfo {
+	structure_type: u32,
+	next: *mut core::ffi::c_void,
+	flags: u32,
+	get_instance_proc_addr: unsafe extern "C" fn(*mut core::ffi::c_void, *const u8) -> *mut core::ffi::c_void,
+}
+
+/// `VkDirectDriverLoadingListLUNARG`, the structure an instance's create info carries the drivers in.
+#[repr(C)]
+struct DirectDriverLoadingList {
+	structure_type: u32,
+	next: *const core::ffi::c_void,
+	mode: u32,
+	driver_count: u32,
+	drivers: *const DirectDriverLoadingInfo,
+}
+
+/// `VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_INFO_LUNARG` and `..._LIST_LUNARG`.
+const DIRECT_DRIVER_LOADING_INFO: u32 = 1_000_459_000;
+const DIRECT_DRIVER_LOADING_LIST: u32 = 1_000_459_001;
+/// `VK_DIRECT_DRIVER_LOADING_MODE_EXCLUSIVE_LUNARG`: the listed drivers and no others.
+const DIRECT_DRIVER_LOADING_MODE_EXCLUSIVE: u32 = 0;
+
+/// `VkExtensionProperties`: a name of `VK_MAX_EXTENSION_NAME_SIZE` bytes, and its version.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExtensionProperties {
+	name: [u8; 256],
+	spec_version: u32,
+}
+
 /// The Vulkan result values this program compares against, spelled here because the pinned headers
 /// are audit-only and this program is built from this tree.
 const VK_SUCCESS: i32 = 0;
 const VK_ERROR_LAYER_NOT_PRESENT: i32 = -6;
+const VK_ERROR_EXTENSION_NOT_PRESENT: i32 = -7;
 
 // THE ICD IS REACHED THROUGH SHIMS, AND THAT IS WHAT MAKES IT OBSERVABLE. The loader opens a
 // provider through the substrate's replaced lookup and then calls the two entry points it was
@@ -79,6 +116,9 @@ const VK_ERROR_LAYER_NOT_PRESENT: i32 = -6;
 // the kind's own rule, and a counter would be a third.
 static NEGOTIATED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static LOOKED_UP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+// AND THE LOOKUP HANDED TO THE LOADER THE OTHER WAY - in an instance's create info - counted apart, so
+// a loader that called it is told from one that reached the driver through the record.
+static DIRECT_LOOKED_UP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 unsafe extern "C" fn negotiate_shim(version: *mut u32) -> i32 {
 	NEGOTIATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -89,6 +129,12 @@ unsafe extern "C" fn negotiate_shim(version: *mut u32) -> i32 {
 
 unsafe extern "C" fn get_instance_proc_addr_shim(instance: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void {
 	LOOKED_UP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+	// SAFETY: as above - the arguments are the loader's own and are forwarded unchanged.
+	unsafe { vk_icdGetInstanceProcAddr(instance, name) }
+}
+
+unsafe extern "C" fn direct_lookup_shim(instance: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void {
+	DIRECT_LOOKED_UP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 	// SAFETY: as above - the arguments are the loader's own and are forwarded unchanged.
 	unsafe { vk_icdGetInstanceProcAddr(instance, name) }
 }
@@ -195,6 +241,37 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// SAFETY: as above.
 	let refused_create = unsafe { vkCreateInstance(&raw const with_layer, core::ptr::null(), &raw mut refused_instance) };
 	print(if refused_create == VK_ERROR_LAYER_NOT_PRESENT { b"vkprobe: instance with a layer refused by name\n" } else { b"vkprobe: instance with a layer NOT refused\n" });
+
+	// 9. AND A SECOND WAY TO LOAD A DRIVER, WHICH THIS SYSTEM DOES NOT HAVE. `VK_LUNARG_direct_driver_loading`
+	//    hands the loader a driver's own lookup in the instance's create info, and the upstream loader
+	//    negotiates with that driver directly - at the version it asks for, with no substrate between
+	//    them - and then takes the physical-device function out of the same lookup: the bounded
+	//    negotiation and the two-export rule, both passed by anything that holds a driver's lookup. The
+	//    port removes the path: the extension is not advertised, and a list in the create info calls
+	//    nothing. So the extension is not listed, enabling it with the bound driver's own lookup is
+	//    refused as an extension that is not there, and that lookup is never called.
+	let mut listed = [ExtensionProperties { name: [0; 256], spec_version: 0 }; 16];
+	let mut listed_count: u32 = listed.len() as u32;
+	// SAFETY: `listed_count` says how many entries `listed` holds, and the loader writes at most that many.
+	let _ = unsafe { vkEnumerateInstanceExtensionProperties(core::ptr::null(), &raw mut listed_count, listed.as_mut_ptr().cast()) };
+	let wanted: &[u8] = b"VK_LUNARG_direct_driver_loading\0";
+	let advertised = listed.iter().take(listed_count.min(listed.len() as u32) as usize).any(|entry| entry.name.starts_with(wanted));
+	print(if advertised { b"vkprobe: direct driver loading advertised\n" } else { b"vkprobe: direct driver loading not advertised\n" });
+	let driver = DirectDriverLoadingInfo { structure_type: DIRECT_DRIVER_LOADING_INFO, next: core::ptr::null_mut(), flags: 0, get_instance_proc_addr: direct_lookup_shim };
+	let drivers = DirectDriverLoadingList { structure_type: DIRECT_DRIVER_LOADING_LIST, next: core::ptr::null(), mode: DIRECT_DRIVER_LOADING_MODE_EXCLUSIVE, driver_count: 1, drivers: &raw const driver };
+	let extension: *const u8 = wanted.as_ptr();
+	let direct = InstanceCreateInfo { next: (&raw const drivers).cast(), enabled_extension_count: 1, enabled_extension_names: &raw const extension, ..info };
+	let mut direct_instance: *mut core::ffi::c_void = core::ptr::null_mut();
+	// SAFETY: as above; the driver list and the name it carries outlive the call.
+	let direct_create = unsafe { vkCreateInstance(&raw const direct, core::ptr::null(), &raw mut direct_instance) };
+	let direct_lookups = DIRECT_LOOKED_UP.load(core::sync::atomic::Ordering::Relaxed);
+	number(b"vkprobe: direct driver instance result=", direct_create as u32);
+	number(b"vkprobe: direct driver lookups=", direct_lookups);
+	print(if direct_create == VK_ERROR_EXTENSION_NOT_PRESENT && direct_lookups == 0 { b"vkprobe: direct driver loading refused\n" } else { b"vkprobe: direct driver loading NOT refused\n" });
+	if direct_create == VK_SUCCESS && !direct_instance.is_null() {
+		// SAFETY: the handle came from the call above and is destroyed exactly once.
+		unsafe { vkDestroyInstance(direct_instance, core::ptr::null()) };
+	}
 
 	print(b"vkprobe: done\n");
 	exit();

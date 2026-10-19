@@ -1,4 +1,4 @@
-THE PLATFORM PORT: no environment, and no layers.
+THE PLATFORM PORT: no environment, no layers, and one way to load a driver.
 
 WHAT THIS PATCH IS FOR, AND WHY IT IS SEPARATE FROM 0001. The portable-static-target patch declares
 the platform surface and defines nothing; it is what makes the candidate surface measurable. This one
@@ -9,7 +9,7 @@ IT IS APPLIED TO A COPY, NEVER TO THE PINNED TREE. The static-target pin froze t
 WITHOUT it, and both builds have to stay reproducible, so the ported sources live beside the pinned
 ones and the builder is told which of the two to compile.
 
-WHAT IT CHANGES, IN TWO PLACES:
+WHAT IT CHANGES, IN TWO FILES:
 
   loader_environment.c  TWO CHANGES. LiberSystem takes upstream's own third shape - the one its `#else` branch
                           already provides for a platform with no environment variables - rather than
@@ -36,11 +36,23 @@ WHAT IT CHANGES, IN TWO PLACES:
                           functions are the ONLY entry points into the layer manifest search, so
                           replacing them removes the filesystem walk, the settings-file override and
                           the environment-steered layer paths in one place rather than in fifty.
+                        AND `VK_LUNARG_direct_driver_loading` IS REMOVED. The extension hands the
+                          loader a driver's own lookup in an instance's create info, and upstream then
+                          negotiates with that driver directly - at the version it asks for, with no
+                          substrate between them - and takes the physical-device function out of the
+                          same lookup: both the bounded negotiation and the two-export rule, passed by
+                          anything that holds a driver's lookup, and its exclusive mode skips the scan
+                          the record answers. A list in the create info now calls nothing,
+                          `loader_add_direct_driver` goes with it, and the extension is not advertised,
+                          so an instance that enables it is refused with
+                          `VK_ERROR_EXTENSION_NOT_PRESENT` by upstream's own validation - which runs
+                          after the driver scan and before any driver is created.
 
 WHAT IT MEASURABLY REMOVES FROM THE SURFACE: `getenv`, the four identity queries `is_high_integrity`
 needed, and `strtoul`, which was reached only to parse a number an environment variable carried. Six
 symbols, 58 to 52, on all three targets - and six declarations out of the profile sysroot with them,
-because what the substrate does not provide is not declared.
+because what the substrate does not provide is not declared. The direct-driver path takes nothing
+out of it: that path called only the loader's own functions and the pointers it was handed.
 
 WHAT IT DOES NOT REMOVE, AND WHY IT CANNOT: the provider-open and manifest-read facilities the layer
 path SHARED with the ICD path stay, because they are the same symbols and the ICD path is what this
@@ -136,7 +148,71 @@ than an ambient directory - the discovery item's decision, not an accident of th
          if ((filter_struct->filters[i].begin <= id) && (id <= filter_struct->filters[i].end)) {
 --- a/loader/loader.c
 +++ b/loader/loader.c
-@@ -4278,6 +4278,44 @@
+@@ -1650,6 +1650,10 @@
+         goto out;
+     }
+ 
++#if !defined(__LiberSystem__)
++    // NOT ADVERTISED ON LIBERSYSTEM. The extension is a second way to load a driver and the port removes
++    // it - see `loader_scan_for_direct_drivers` - so an instance that enables it is refused as one asking
++    // for an extension that is not there, by the validation every other unknown extension goes through.
+     const VkExtensionProperties direct_driver_loading_extension_info[] = {
+         {VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME, VK_LUNARG_DIRECT_DRIVER_LOADING_SPEC_VERSION}};
+ 
+@@ -1659,6 +1663,7 @@
+     if (res == VK_ERROR_OUT_OF_HOST_MEMORY) {
+         goto out;
+     }
++#endif  // !defined(__LiberSystem__)
+ 
+ out:
+     return res;
+@@ -1888,6 +1893,35 @@
+     return res;
+ }
+ 
++#if defined(__LiberSystem__)
++
++// THIS SYSTEM LOADS A DRIVER ONE WAY, AND `VK_LUNARG_direct_driver_loading` IS A SECOND.
++//
++// The extension hands the loader a driver's own `vkGetInstanceProcAddr` in the instance's create info,
++// and upstream then negotiates with that driver DIRECTLY - at the version it asks for, with no
++// substrate between them - and takes `vk_icdGetPhysicalDeviceProcAddr` out of the same lookup. That
++// passes both the bounded negotiation and the two-export rule for anything that holds a driver's
++// lookup, and its exclusive mode skips the scan the substrate's record answers. The record is the
++// one discovery model here.
++//
++// SO A LIST IN THE CREATE INFO CALLS NOTHING, and that is a definite answer rather than a missing one:
++// no driver in it is asked anything, the record's scan runs as it always does, and the extension is
++// not advertised - so an instance that ENABLES it is refused with `VK_ERROR_EXTENSION_NOT_PRESENT` by
++// upstream's own validation, which runs after this scan and before any driver is created.
++//
++// `loader_add_direct_driver` GOES WITH IT rather than staying unreachable: a path nothing calls is
++// still a path the closure admits.
++VkResult loader_scan_for_direct_drivers(const struct loader_instance *inst, const VkInstanceCreateInfo *pCreateInfo,
++                                        struct loader_icd_tramp_list *icd_tramp_list, bool *direct_driver_loading_exclusive_mode) {
++    (void)inst;
++    (void)pCreateInfo;
++    (void)icd_tramp_list;
++    *direct_driver_loading_exclusive_mode = false;
++    return VK_SUCCESS;
++}
++
++#else
++
+ VkResult loader_add_direct_driver(const struct loader_instance *inst, uint32_t index,
+                                   const VkDirectDriverLoadingInfoLUNARG *pDriver, struct loader_icd_tramp_list *icd_tramp_list) {
+     // Assume pDriver is valid, since there is no real way to check it. Calling code should make sure the pointer to the array
+@@ -2105,6 +2139,8 @@
+     return VK_SUCCESS;
+ }
+ 
++#endif  // defined(__LiberSystem__)
++
+ VkResult loader_scanned_icd_add(const struct loader_instance *inst, struct loader_icd_tramp_list *icd_tramp_list,
+                                 const char *filename, uint32_t api_version, enum loader_layer_library_status *lib_status) {
+     loader_platform_dl_handle handle = NULL;
+@@ -4278,6 +4314,44 @@
      }
  }
  
@@ -181,7 +257,7 @@ than an ambient directory - the discovery item's decision, not an accident of th
  VkResult loader_scan_for_layers(struct loader_instance *inst, struct loader_layer_list *instance_layers,
                                  const struct loader_envvar_all_filters *filters) {
      VkResult res = VK_SUCCESS;
-@@ -4464,6 +4502,8 @@
+@@ -4464,6 +4538,8 @@
      return res;
  }
  

@@ -62,3 +62,21 @@ fn bounds_and_capacity_refuse_before_anything_is_held() {
 	assert_eq!(operations.prepare(1, &[], &[1], LIFETIME - 1, LIFETIME).map(|_| ()), Err(Refusal::Busy), "still inside their lifetime");
 	assert!(operations.prepare(1, &[], &[1], LIFETIME, LIFETIME).is_ok(), "expired ones make room");
 }
+
+#[test]
+fn what_the_executor_let_go_of_it_no_longer_holds() {
+	// AN EXECUTOR'S OWN RECORD OF WHAT IT PREPARED follows this answer, so it must turn false for exactly what the seam
+	// dropped to make room - a cancelled, a started and an expired preparation - and stay true for a live one.
+	let mut operations = Operations::new(7);
+	let cancelled = operations.prepare(1, &[], &[1], 0, LIFETIME).unwrap().operation;
+	let started = operations.prepare(1, &[], &[1], 0, LIFETIME).unwrap().operation;
+	let live = operations.prepare(1, &[], &[1], 0, LIFETIME).unwrap().operation;
+	let expiring = operations.prepare(1, &[], &[1], 0, 10).unwrap().operation;
+	operations.cancel(cancelled).unwrap();
+	operations.start(started, 7, 1, 1).unwrap();
+	assert!([cancelled, started, live, expiring].iter().all(|&operation| operations.holds(operation)), "nothing is let go of before room is made");
+	let next = operations.prepare(1, &[], &[1], LIFETIME / 2, LIFETIME).unwrap().operation;
+	assert!(!operations.holds(cancelled) && !operations.holds(started) && !operations.holds(expiring), "what made room is gone");
+	assert!(operations.holds(live) && operations.holds(next));
+	assert!(!operations.holds(99), "and an operation never prepared was never held");
+}

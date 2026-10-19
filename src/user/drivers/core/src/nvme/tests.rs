@@ -371,3 +371,81 @@ fn a_shutdown_is_complete_only_when_the_controller_says_its_processing_is() {
 	assert_eq!(CC_SHUTDOWN_NORMAL & CC_SHUTDOWN_MASK, CC_SHUTDOWN_NORMAL);
 	assert_eq!(CC_SHUTDOWN_NORMAL >> 14, 0b01);
 }
+
+// A CONTROLLER THE RECOVERY IS DRIVEN AGAINST: each issue answers the next scripted outcome, each reset the next
+// scripted answer, and every step is written down, so the order the recovery took them in can be read back.
+struct Model {
+	issues: Vec<Result<(), Fault>>,
+	resets: Vec<bool>,
+	down: bool,
+	steps: Vec<&'static str>,
+}
+
+impl Model {
+	fn new(issues: &[Result<(), Fault>], resets: &[bool]) -> Model {
+		Model { issues: issues.iter().rev().copied().collect(), resets: resets.iter().rev().copied().collect(), down: false, steps: Vec::new() }
+	}
+}
+
+impl Recover for Model {
+	type Io = ();
+
+	fn issue(&mut self, _: ()) -> Result<(), Fault> {
+		self.steps.push("issue");
+		self.issues.pop().expect("an issue the script did not plan")
+	}
+
+	fn reset(&mut self) -> bool {
+		self.steps.push("reset");
+		let back = self.resets.pop().expect("a reset the script did not plan");
+		self.down = !back;
+		back
+	}
+
+	fn down(&self) -> bool {
+		self.down
+	}
+
+	fn say(&mut self, _: &[u8]) {}
+}
+
+#[test]
+fn a_command_that_did_not_come_back_is_answered_only_after_the_controller_is_reset() {
+	// IT TIMES OUT, AND THE RETRY IS ANSWERED: the reset comes between the two, before anyone is answered.
+	let mut model = Model::new(&[Err(Fault::Timeout), Ok(())], &[true]);
+	assert_eq!(recovered(&mut model, ()), Ok(()));
+	assert_eq!(model.steps, ["issue", "reset", "issue"]);
+	// AND IT TIMES OUT AGAIN: reset again before the failure is reported, never answered with a command still moving.
+	let mut model = Model::new(&[Err(Fault::Timeout), Err(Fault::Timeout)], &[true, true]);
+	assert_eq!(recovered(&mut model, ()), Err(Fault::Timeout));
+	assert_eq!(model.steps, ["issue", "reset", "issue", "reset"]);
+	// THE DELAY LIFTED, THE NEXT REQUEST IS SERVED, as it is: the controller came back from both resets.
+	model.issues.push(Ok(()));
+	assert_eq!(recovered(&mut model, ()), Ok(()));
+	assert_eq!(model.steps[4..], ["issue"]);
+	// A COMPLETION FOR ANOTHER COMMAND is the same case as none at all.
+	let mut model = Model::new(&[Err(Fault::Unexpected { saw: 3, expected: 4, dw2: 0, dw3: 0 }), Ok(())], &[true]);
+	assert_eq!(recovered(&mut model, ()), Ok(()));
+	assert_eq!(model.steps, ["issue", "reset", "issue"]);
+}
+
+#[test]
+fn an_answered_refusal_is_reported_at_once_and_a_controller_that_will_not_reset_is_issued_nothing() {
+	// A STATUS IS AN ANSWER: reported as it is, with no reset and no retry.
+	let refused = Fault::Failed { status_type: 0, status_code: 0x0B };
+	let mut model = Model::new(&[Err(refused)], &[]);
+	assert_eq!(recovered(&mut model, ()), Err(refused));
+	assert_eq!(model.steps, ["issue"]);
+	// A RESET THAT FAILS answers the first fault, issues nothing more, and leaves the controller down...
+	let mut model = Model::new(&[Err(Fault::Timeout)], &[false, false]);
+	assert_eq!(recovered(&mut model, ()), Err(Fault::Timeout));
+	assert_eq!(model.steps, ["issue", "reset"]);
+	// ...so the next request tries the reset first and is refused while it fails...
+	assert_eq!(recovered(&mut model, ()), Err(Fault::Down));
+	assert_eq!(model.steps[2..], ["reset"]);
+	// ...and served once one succeeds.
+	model.resets.push(true);
+	model.issues.push(Ok(()));
+	assert_eq!(recovered(&mut model, ()), Ok(()));
+	assert_eq!(model.steps[3..], ["reset", "issue"]);
+}

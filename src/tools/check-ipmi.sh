@@ -14,8 +14,9 @@
 #      form polls - and SSIF, `smbus-ipmi` at 0x10) or through their class (PCI KCS and BT), each answering its own
 #      product ID: ISA KCS alone and SSIF alone, both simulated - the SMBIOS type 38 record's match id on the node, the
 #      sensors and the FRU as the files hold them, the boot's event once, and the BMC service killed and restarted
-#      writing no second one; ISA BT alone, the harness's, with its match id; and PCI KCS (the harness's) beside PCI BT
-#      (simulated, given no GUID, so named by its device and its binding, and never a pair).
+#      writing no second one; ISA BT alone, the harness's, with its match id and its watchdog read before anything
+#      else is asked; and PCI KCS (the harness's) beside PCI BT (simulated, given no GUID, so named by its device and
+#      its binding, and never a pair).
 #   2. A PAIR: a simulated BMC on ISA KCS and the harness's on ISA BT given ONE GUID, reported as one BMC reached
 #      twice, its boot event written through exactly one of the two.
 #   3. THE HARNESS BMC: LAN configuration and users as scripted, identify on and off, a scripted temperature reaching a
@@ -333,8 +334,21 @@ expect "^$bt" "the BMC must be named by its GUID"
 expect "product 0x0022" "the BMC must answer its own product ID"
 expect "firmware: acpi:[^ ]+ agrees with smbios:38#" "the ISA BT node must carry its SMBIOS type 38 record's match id"
 refuse "which no SMBIOS record describes" "the only IPMI node must agree with the SMBIOS record"
+# THE WATCHDOG IS THE BIND'S FIRST ACT: Get Watchdog Timer reaches the BMC before Get Device ID and before any command
+# of the SDR repository's, so a timer found running is petted before anything slow is read.
+python3 - "$state/record-bt.log" <<'EOF' || fail "the driver's first act on its BMC must be the watchdog's read (see $kept/record-bt.log)"
+import sys
+lines = [line.split() for line in open(sys.argv[1])]
+def first(netfn, commands):
+    return next((at for at, words in enumerate(lines) if len(words) >= 2 and words[0] == netfn and words[1] in commands), None)
+watchdog = first('0x06', {'0x25'})
+identify = first('0x06', {'0x01'})
+repository = first('0x0a', {'0x20', '0x21', '0x22', '0x23'})
+if watchdog is None or any(other is not None and other < watchdog for other in (identify, repository)):
+    sys.exit(f'ipmi: bt: Get Watchdog Timer was command {watchdog}, Get Device ID {identify}, the repository\'s first {repository}')
+EOF
 take_down
-echo "ipmi: ISA BT through IPI0001 agreeing with SMBIOS"
+echo "ipmi: ISA BT through IPI0001 agreeing with SMBIOS, its watchdog read before anything else was asked"
 
 # 1d. PCI KCS, the harness's, and PCI BT, simulated with no GUID.
 start_harness pci --guid "$(harness_guid 4)" --product-id 0x24
@@ -629,7 +643,13 @@ done
 grep -q "IP Address  *: 192.168.77.10" <<<"$(outside lan print 1 || true)" || fail "oob: the LAN configuration written from outside did not read back from outside"
 export QEMU_EXTRA="-chardev socket,id=simbmc,host=127.0.0.1,port=$oob_vm,reconnect-ms=1000 -device ipmi-bmc-extern,id=bmcs,chardev=simbmc -device isa-ipmi-kcs,bmc=bmcs,irq=0"
 boot oob
-boot_events 1
+# THE BOOT'S EVENT, SENT ONCE - and judged by the record it made, not by `ipmi_sim`'s answer: OpenIPMI's Platform Event
+# Message handler (`handle_platform_event`, lanserv/bmc_sensor.c, 2.0.37) writes neither a completion code nor a length
+# into a response buffer its caller leaves uninitialised, so the answer is whatever that stack held - a Get SDR's 0xCB,
+# once the watchdog was read ahead of the repository - while the event is logged all the same. The record is read
+# below, inside and over the LAN; the answer's own path is the simulated BMCs' and the harness BMC's, above.
+await_line "the system's event 'boot completed' was sent to the BMC's log" "oob: the boot's event was not sent" 0
+[[ "$(seen "the system's event 'boot completed' was sent to the BMC's log")" == 1 ]] || fail "oob: the boot's event must be sent once"
 sh_line "bmc lan"
 sh_line "bmc users"
 sh_line "bmc sel"

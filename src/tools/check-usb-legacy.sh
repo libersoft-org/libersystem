@@ -16,6 +16,8 @@
 #                  the OHCI's stick out - the volume follows to the EHCI's high-speed one and reads it - takes that out
 #                  too - the read is refused - and plugs a stick of its own behind the UHCI's hub, one on the OHCI and
 #                  one on the EHCI, each with a file no other stick has, read through `vol://usb` after each arrival
+#   GIVEN BACK     each controller's DMA memory, as `lsdev` reads its driver's Domain, is the same after a stick it
+#                  carried has left as before the stick arrived: behind the UHCI's hub, on the OHCI and on the EHCI
 #
 # THE HOST'S HALF ANSWERS THE PROBE'S CUES: every phase prints the line the helper below waits for before it watches,
 # so nothing is typed, moved or plugged ahead of a reader. The sticks the host plugs are this run's own images.
@@ -205,11 +207,17 @@ host_side() {
 	wait_for "hidcheck: usb wait - act now" 4 || return 0
 	unplug plug-ohci
 	plug ehci lehci.0 1
+	wait_for "hidcheck: usb wait - act now" 5 || return 0
+	unplug plug-ehci
 }
 
 host_side &
 helper=$!
-guest_gate_run $'hidcheck usb keys\nhidcheck usb keys\nhidcheck usb pointer\nhidcheck usb pointer\ncat vol://usb/hello.txt\nhidcheck usb wait\ncat vol://usb/hello.txt\nhidcheck usb wait\ncat vol://usb/hello.txt\nhidcheck usb wait\ncat vol://usb/hub.txt\nhidcheck usb wait\ncat vol://usb/ohci.txt\nhidcheck usb wait\ncat vol://usb/ehci.txt\necho usb-legacy-done' ""
+# THE DMA MEMORY EACH CONTROLLER HOLDS is read with `lsdev` - its driver's Domain, through DeviceManager - once with
+# no stick on any of them, and again after each stick plugged since has left its controller: behind the UHCI's hub at
+# the fourth pause, on the OHCI at the fifth, on the EHCI at the sixth. Each reading is marked, so the checks below
+# read the right one.
+guest_gate_run $'hidcheck usb keys\nhidcheck usb keys\nhidcheck usb pointer\nhidcheck usb pointer\ncat vol://usb/hello.txt\nhidcheck usb wait\ncat vol://usb/hello.txt\nhidcheck usb wait\ncat vol://usb/hello.txt\necho usb-legacy-dma before\nlsdev\nhidcheck usb wait\ncat vol://usb/hub.txt\nhidcheck usb wait\necho usb-legacy-dma uhci\nlsdev\ncat vol://usb/ohci.txt\nhidcheck usb wait\necho usb-legacy-dma ohci\nlsdev\ncat vol://usb/ehci.txt\nhidcheck usb wait\necho usb-legacy-dma ehci\nlsdev\necho usb-legacy-done' ""
 wait "$helper" 2>/dev/null || true
 helper=""
 
@@ -263,4 +271,10 @@ expect 'driver\.uhci: the disk left' "and seen leaving"
 expect 'the ohci stick, plugged after the boot' "the stick plugged on the OHCI must be read"
 expect 'the ehci stick, plugged after the boot' "the stick plugged on the EHCI must be read"
 echo "usb-legacy: vol://usb followed every stick out and in - behind the UHCI's hub, on the OHCI and on the EHCI - and read each one"
+
+# GIVEN BACK: the DMA memory each controller's driver holds, after the stick it carried left, is what it held before
+# that stick arrived. The PIIX3 UHCI is the one not on the EHCI's slot 1d, whose three UHCIs are its companions.
+python3 "$root/tools/usb-dma-readings.py" "$GUEST_LINES" usb-legacy-dma before uhci:uhci ohci:ohci ehci:ehci ||
+	fail "a controller kept DMA memory a stick that left had held"
+echo "usb-legacy: every controller gave back what each stick it carried had held"
 echo "usb-legacy: PASS"

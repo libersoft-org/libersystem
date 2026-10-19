@@ -32,6 +32,19 @@ fn receive(channel: &Channel, why: &str) -> Message {
 	panic!("no reply: {why}")
 }
 
+// WHETHER THE SERVICE CLOSED `channel`'s peer, within the bound a reply is waited for: a message the service answers by
+// closing what it carried is not always handled within the one pump that delivered it - a late completion printing
+// that its backlight answered again took a second.
+fn peer_closed(channel: &Channel) -> bool {
+	for _ in 0..100 {
+		if channel.is_peer_closed() {
+			return true;
+		}
+		pump();
+	}
+	channel.is_peer_closed()
+}
+
 fn reply(channel: &Channel, corr: u32, body: impl FnOnce(&mut wire::VecWriter)) {
 	let mut writer = wire::VecWriter::new();
 	writer.u32(corr).unwrap();
@@ -185,8 +198,19 @@ fn display_service_keeps_serving_while_backlights_stall() {
 	assert_eq!(display_v1::Error::read(&mut wire::Reader::new(&timeout.bytes[5..])), Some(display_v1::Error::TimedOut));
 	assert!(snapshot(&read, 13)[0].failed);
 
-	// A LATE ANSWER IS AN ANSWER: the write's completion, after its deadline, lets the provider back into the join -
-	// and finishes nothing, changes no level, and closes the handle it smuggles.
+	// A LATE ANSWER IS AN ANSWER: the write's completion, after its deadline, lets the provider back into the join, and
+	// the level it answers is the panel's - published as a timely answer's would have been, while the writer who was
+	// told it timed out is answered nothing more. It carries no handle: one that did would be more than a set's answer
+	// accounts for, and refused as a timely one is.
+	reply(&driver, le_u32(&old_set.bytes, 2), |writer| writer.u32(77).unwrap());
+	pump();
+	let recovered = snapshot(&read, 32);
+	assert!(!recovered[0].failed, "a late answer recovers the provider");
+	assert_eq!(recovered[0].level, Some(77), "and the level it set is the one reported");
+	assert!(control.recv().is_err(), "the writer that timed out is answered nothing more");
+
+	// A device event moves the level. The old write's response, arriving again, cannot finish or modify a new write on
+	// that same channel, even when it smuggles a stream handle - and the handle is closed.
 	let late = |handle| {
 		let mut late_bytes = le_u32(&old_set.bytes, 2).to_le_bytes().to_vec();
 		late_bytes.push(1);
@@ -194,15 +218,6 @@ fn display_service_keeps_serving_while_backlights_stall() {
 		send_cap(&driver, &late_bytes, handle, Rights::ALL).unwrap();
 		pump();
 	};
-	let (leaked, late_handle) = Channel::create();
-	late(late_handle);
-	assert!(leaked.is_peer_closed(), "a late completion closes every transferred handle");
-	let recovered = snapshot(&read, 32);
-	assert!(!recovered[0].failed, "a late answer recovers the provider");
-	assert_eq!(recovered[0].level, Some(50), "and sets no level");
-
-	// A device event moves the level. The old write's response, arriving again, cannot finish or modify a new write on
-	// that same channel, even when it smuggles a stream handle.
 	device_level(&events, 33);
 	assert!(!snapshot(&read, 14)[0].failed);
 	set(&control, "native:async-primary", 21, 60);
@@ -210,7 +225,7 @@ fn display_service_keeps_serving_while_backlights_stall() {
 	assert_ne!(le_u32(&old_set.bytes, 2), le_u32(&new_set.bytes, 2));
 	let (leaked, late_handle) = Channel::create();
 	late(late_handle);
-	assert!(leaked.is_peer_closed(), "a late completion closes every transferred handle");
+	assert!(peer_closed(&leaked), "a late completion closes every transferred handle");
 	assert!(control.recv().is_err(), "the new writer is still waiting for its own correlation");
 	assert_eq!(snapshot(&read, 15)[0].level, Some(33));
 	reply(&driver, le_u32(&new_set.bytes, 2), |writer| writer.u32(60).unwrap());

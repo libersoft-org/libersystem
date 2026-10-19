@@ -143,6 +143,11 @@ class Ppm:
 		self.notifications = 0
 		self.partners = {1: None, 2: None}
 		self.pending = []
+		# NAMING EACH PENDING CHANGE ONCE, as a PPM may: in one CCI - a completion, an acknowledgement or a notification -
+		# and never again, so an OPM that drops the one CCI that named a change never reads it. `once on` from the
+		# control socket; `named` is what has been named.
+		self.once = False
+		self.named = set()
 		self.outstanding = None
 		self.last_status = None
 		self.error = 0
@@ -170,7 +175,16 @@ class Ppm:
 			self.pending.append(number)
 
 	def indicator(self):
+		if self.once:
+			for number in self.pending:
+				if number not in self.named:
+					self.named.add(number)
+					return number << 1
+			return 0
 		return (self.pending[0] << 1) if self.pending else 0
+
+	def unnamed(self):
+		return any(number not in self.named for number in self.pending)
 
 	def answer(self, control, message_out=b''):
 		"""(cci, message, notify, delay) for one command: what goes into the inbound area, whether a notification
@@ -191,6 +205,7 @@ class Ppm:
 					self.violate('a connector change acknowledged beside something other than its status')
 				elif self.last_status in self.pending:
 					self.pending.remove(self.last_status)
+					self.named.discard(self.last_status)
 			self.outstanding = None
 			return ACK_COMPLETE | self.indicator(), b'', True, delay
 		# A RESET MAY COME AT ANY TIME - it is how an OPM recovers a PPM it gave up on - and clears everything.
@@ -198,6 +213,7 @@ class Ppm:
 			self.notifications = 0
 			self.outstanding = None
 			self.pending = []
+			self.named = set()
 			return RESET_COMPLETE, b'', False, delay
 		if self.outstanding is not None:
 			self.violate(f'{NAMES.get(code, hex(code))} sent while the completion of {NAMES.get(self.outstanding, hex(self.outstanding))} was unacknowledged')
@@ -287,7 +303,8 @@ class Ppm:
 		else:
 			cci |= NOT_SUPPORTED
 		cci |= len(data) << 8
-		cci |= self.indicator() if not (cci & (0x7F << 1)) else 0
+		if not (cci & (0x7F << 1)):
+			cci |= self.indicator()
 		return cci, data, True, delay
 
 	# ---------------------------------------------------------------- driving the partners
@@ -457,7 +474,7 @@ def serve(args):
 			ppm.violate(f'the completion of {NAMES.get(ppm.outstanding, hex(ppm.outstanding))} was left unacknowledged')
 			unacked_since = None
 		# A CONNECTOR CHANGE while idle is notified at once.
-		if ppm.pending and ppm.outstanding is None and not queued and ppm.notifications and now >= ppm.silent_until and getattr(ppm, 'announced', None) != tuple(ppm.pending):
+		if ppm.pending and ppm.outstanding is None and not queued and ppm.notifications and now >= ppm.silent_until and getattr(ppm, 'announced', None) != tuple(ppm.pending) and (not ppm.once or ppm.unnamed()):
 			ppm.announced = tuple(ppm.pending)
 			box.answer(ppm.version, ppm.indicator(), b'')
 			ppm.record(f'change {ppm.pending}')
@@ -485,6 +502,13 @@ def command(ppm, text):
 			ppm.attach(int(words[1]), words[2])
 		elif words[0] == 'detach':
 			ppm.detach(int(words[1]))
+		elif words[0] == 'detach-both':
+			# Both changes pending before either is named.
+			ppm.detach(1)
+			ppm.detach(2)
+		elif words[0] == 'once':
+			ppm.once = words[1] == 'on'
+			ppm.named = set()
 		elif words[0] == 'ppm-enter':
 			if not ppm.ppm_enter(int(words[1])):
 				return 'error no partner with a mode'
@@ -547,6 +571,20 @@ def self_test():
 	check('DisplayPort entered under the override', (cci & COMMAND_COMPLETE != 0, ppm.partners[2].cam, ppm.partners[2].configuration), (True, 0, 0x0806))
 	check('the 1.2 status is nine bytes', len(ppm.partners[2].status(0x0120)), 9)
 	check('the slow profile delays three commands', PROFILES['slow']['slow'], 3)
+	# NAMED ONCE: two changes pending, the first named by the completion that reads it, the second by that
+	# completion's acknowledgement and by nothing after it.
+	ppm = Ppm('v21')
+	ppm.once = True
+	ppm.attach(1, 'charger')
+	ppm.attach(2, 'host')
+	cci, _, _, _ = ppm.answer(GET_CONNECTOR_STATUS | 1 << 16)
+	check('once: the first change is named with the status that reads it', (cci >> 1) & 0x7F, 1)
+	cci, _, _, _ = ppm.answer(ACK_CC_CI | 1 << 16 | 1 << 17)
+	check('once: the acknowledgement names the second', ((cci >> 1) & 0x7F, ppm.pending), (2, [2]))
+	cci, _, _, _ = ppm.answer(GET_CAPABILITY)
+	check('once: and nothing names it again', (cci >> 1) & 0x7F, 0)
+	ppm.answer(ACK_CC_CI | 1 << 17)
+	check('once: it stays pending, unnamed no more', (ppm.pending, ppm.unnamed()), ([2], False))
 	if failures:
 		for failure in failures:
 			print(f'ucsi-ppm: {failure}', file=sys.stderr)

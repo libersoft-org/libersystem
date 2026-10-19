@@ -1,4 +1,4 @@
-"""Independent Bumble classic peers for P02M0194's production USB guest gate.
+"""Independent Bumble classic peers for the production Bluetooth USB guest gate.
 
 Only scenario data and observations live here. Bumble owns SDP, L2CAP, HID,
 RFCOMM, AVDTP, AVRCP, HFP and pairing; RootCanal owns the radio/controller.
@@ -317,7 +317,7 @@ class ScenarioAvrcp(avrcp.Protocol):
         if pdu_id != avrcp.PduId.GET_ELEMENT_ATTRIBUTES:
             return super()._on_command_pdu(pdu_id, pdu)
         command = avrcp.Command.from_bytes(pdu_id, pdu)
-        metadata = {avrcp.MediaAttributeId.TITLE: 'Independent radio tone', avrcp.MediaAttributeId.ARTIST_NAME: 'Bumble oracle', avrcp.MediaAttributeId.ALBUM_NAME: 'P02M0194'}
+        metadata = {avrcp.MediaAttributeId.TITLE: 'Independent radio tone', avrcp.MediaAttributeId.ARTIST_NAME: 'Bumble oracle', avrcp.MediaAttributeId.ALBUM_NAME: 'Independent oracle'}
         requested = command.attribute_ids or list(metadata)
         attributes = [avrcp.MediaAttribute(identifier, 106, metadata.get(identifier, '')) for identifier in requested]
         self.send_avrcp_response(self.receive_command_state.transaction_label, avc.ResponseFrame.ResponseCode.IMPLEMENTED_OR_STABLE, avrcp.GetElementAttributesResponse(attributes))

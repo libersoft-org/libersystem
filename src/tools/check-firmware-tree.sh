@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P02M0196's dedicated tree fixture on the two device-tree ports. A fixture-only node names the GPIO
+# The platform devices' dedicated tree fixture on the two device-tree ports. A fixture-only node names the GPIO
 # controller's virtio child through interrupts-extended; its driver verifies the scoped connection and
 # absence of a wired interrupt, then acknowledges two edges raised by the host backend.
 set -euo pipefail

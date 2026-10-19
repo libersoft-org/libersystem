@@ -12,7 +12,8 @@
 #   2. v21 (UCSI 2.1, no override, power readings, SET_PDR refused): the charger's contract and its MEASURED VBUS; the
 #      configuration's SET_PDR refused and said; DisplayPort refused before any command without the override, then
 #      entered by the PPM on its own and reported; a connector status past its size and one naming connector 7, each
-#      refused and the PPM reset and read again.
+#      refused and the PPM reset and read again; and two changes pending at once from a PPM that names each in one CCI
+#      only - the second in the acknowledgement of the first's status - both read and announced.
 #   3. slow: the first reset and the two commands after it each over five seconds - the binding ready inside
 #      DeviceManager's deadline and its connectors published once the slow start is over.
 #   4. spoiling: a PPM that spoils its inbound copy once it has notified - an attach and a detach served as on the others.
@@ -269,6 +270,13 @@ ppm "attach 1 charger" >/dev/null
 await_line "the PPM failed (Connector(7))" "an answer naming connector 7 must be refused" 0 60
 await_line "the PPM answers again after its reset" "and the PPM reset and read again" 1 60
 probe await 1 contract 9000
+# A CHANGE THE PPM NAMES ONCE: both connectors' detaches pending before either is named, each named in one CCI and never
+# again - the second only by the acknowledgement of the status that reads the first.
+ppm "once on" >/dev/null
+ppm "detach-both" >/dev/null
+probe await 1 detached
+probe await 2 detached
+echo "typec-ucsi: v21: two changes the PPM named once each, the second only by an acknowledgement, both read and announced"
 take_down
 
 # ------------------------------------------------------------------ 3. the slow PPM

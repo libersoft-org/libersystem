@@ -878,7 +878,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 
-	// THE SECOND SURFACE, WHICH IS THE OBJECT MODEL'S OWN PROOF. `P02M0103a-wsi` introduced more than
+	// THE SECOND SURFACE, WHICH IS THE OBJECT MODEL'S OWN PROOF. The window-system interface brought more than
 	// one surface per client, and an object model nobody opened twice is a claim: this opens a second
 	// one, presents to it while it owns the screen, and closes it - and the first one's resources and
 	// generation survive that.

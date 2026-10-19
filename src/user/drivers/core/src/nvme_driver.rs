@@ -384,6 +384,30 @@ enum Io {
 	Flush,
 }
 
+// THE DRIVER'S CONTROLLER, AS ITS RECOVERY SEES IT. Its registers and queues are its own for the life of the binding,
+// which is what makes issuing and resetting through them sound from here.
+impl nvme::Recover for Controller {
+	type Io = Io;
+
+	fn issue(&mut self, io: Io) -> Result<(), Fault> {
+		// SAFETY: the controller's registers and queue memory are this binding's, mapped for its life.
+		unsafe { Controller::issue(self, io) }
+	}
+
+	fn reset(&mut self) -> bool {
+		// SAFETY: as above.
+		unsafe { Controller::reset(self, false) }
+	}
+
+	fn down(&self) -> bool {
+		self.down
+	}
+
+	fn say(&mut self, line: &[u8]) {
+		print(line);
+	}
+}
+
 impl Controller {
 	// ZERO IS NEVER ISSUED, and that is a rule this driver keeps rather than a fact that happens to
 	// hold. It makes "command id 0" mean exactly one thing on the completion side: an entry that has
@@ -585,47 +609,10 @@ impl Controller {
 		}
 	}
 
-	// ONE I/O COMMAND, RECOVERED.
-	//
-	// A command the controller answered is answered with its status. One that never came back, or
-	// came back as another command's, may still be running against the data span
-	// (`Fault::needs_reset`): the controller is reset, which ends it, its queues are made again, and
-	// the command is issued once more - a read or a write of the same blocks from the same span, or a
-	// flush, is the same request twice. NOTHING IS ANSWERED WHILE A COMMAND THIS DRIVER GAVE UP ON MAY
-	// STILL BE MOVING BYTES, so a second failure of that kind resets the controller again before it is
-	// reported. A controller that could not be reset is tried again at the next request, and nothing
-	// is issued to it until a reset succeeds.
+	// ONE I/O COMMAND, RECOVERED - by `nvme::recovered`, which the host tests drive against a model of a controller that
+	// stops answering, gives up its reset, or comes back.
 	unsafe fn io(&mut self, io: Io) -> Result<(), Fault> {
-		unsafe {
-			if self.down {
-				if !self.reset(false) {
-					return Err(Fault::Down);
-				}
-				print(b"driver.nvme: the controller is back from its reset and its queues are made again\n");
-			}
-			let first = self.issue(io);
-			let Err(fault) = first else { return first };
-			if !fault.needs_reset() || !self.recover() {
-				return first;
-			}
-			let again = self.issue(io);
-			if let Err(fault) = again
-				&& fault.needs_reset()
-			{
-				self.recover();
-			}
-			again
-		}
-	}
-
-	// Reset after a command that did not come back as itself, and say so.
-	unsafe fn recover(&mut self) -> bool {
-		print(b"driver.nvme: a command did not come back as itself - the controller is reset before anyone is answered\n");
-		let back = unsafe { self.reset(false) };
-		if !back {
-			print(b"driver.nvme: the controller did not come back from its reset - requests are refused until it does\n");
-		}
-		back
+		nvme::recovered(self, io)
 	}
 
 	// Every write this controller has taken must reach the medium.

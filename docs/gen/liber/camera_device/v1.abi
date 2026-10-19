@@ -25,3 +25,4 @@ method camera-fixture.delay-stop op=5 (delay-ms:u32:rights=) -> result<unit, lib
 method camera-fixture.withdraw op=6 () -> result<unit, liber:base@1::error>
 method camera-fixture.republish op=7 () -> result<unit, liber:base@1::error>
 method camera-fixture.stats op=8 () -> result<camera-fixture-stats, liber:base@1::error>
+method camera-fixture.delay-negotiate op=9 (delay-ms:u32:rights=) -> result<unit, liber:base@1::error>

@@ -138,16 +138,12 @@ impl Net {
 		self.ring_out.release();
 		if let Some(note) = self.note.as_mut() {
 			note.ring.release();
-			if note.handle != 0 {
-				close(note.handle);
-				note.handle = 0;
-			}
+			common::release_dma(note.handle);
+			note.handle = 0;
 		}
 		for handle in [&mut self.rx_handle, &mut self.tx_handle] {
-			if *handle != 0 {
-				close(*handle);
-				*handle = 0;
-			}
+			common::release_dma(*handle);
+			*handle = 0;
 		}
 	}
 
@@ -204,7 +200,7 @@ impl Net {
 						ring.release();
 					}
 					for (handle, _, _) in [rx, tx, note_page].into_iter().flatten() {
-						close(handle);
+						common::release_dma(handle);
 					}
 					None
 				}
@@ -396,6 +392,7 @@ pub unsafe fn configure_network(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Ne
 			true
 		};
 		if !configured {
+			crate::deconfigure(hc, dev);
 			net.release();
 			return None;
 		}
