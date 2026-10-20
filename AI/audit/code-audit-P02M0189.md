@@ -581,3 +581,30 @@ No published number is affected.
   - "Kernel and test kernel build" and "kernel suite passed": not checkable statically.
   - x86 PASS in 541 s, aarch64 in 557 s, riscv64 in 817 s, and the first aarch64 failure: consistent with the retained directories' timestamps, logs and account files.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0189 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the port branch's start-up wait can fire on the IOMMU probe's short-lived QEMU, and the one capture attempt then fails the run (Low): ACCEPTED.**
+- `src/harness/frame-account-conditions.py`: a QEMU process counts as the guest's only when the cold runner staged a
+  boot ESP for it (`.build/boot/esp-<arch>.<pid>.img`). The IOMMU probe's QEMU has none, so it is never captured; the
+  message says it looked for "one guest QEMU with its boot ESP".
+- `src/tools/check-qemu-2d-account.sh`: the port branch's start-up wait now retries the capture itself until it succeeds
+  or the wait is over, instead of breaking on the first QEMU it sees and capturing once - a capture taken against the
+  probe, or in the moment it ended, no longer fails the run.
+- Run on the port branch: `qemu-2d-account --arch aarch64` PASS on the final tree (645 s, emulated) - the conditions
+  record the guest's own QEMU (its pid and its boot ESP's digest), and the scaled account closed within five percent.
+  One run cannot show the probe being skipped, since whether a poll lands on it is timing; the tool's ESP rule is what
+  excludes it.
+
+**Finding 2 - the milestone's documents name other milestones outside `docs/todo` and point at the audit (Low): ACCEPTED.**
+- `docs/PERF.md`: the frame-account sections name what they measured instead of milestone ids; the pointer at the audit
+  is gone, and the overrides the section listed are stated in place.
+- `docs/todo/P02M0189.md`: the status sentence that pointed at the audit is gone.
+
+**Verification:**
+- `qemu-2d-account` PASS on x86_64 (571 s, four accounts closed within five percent).
+- Finding 2: `docs/PERF.md` holds no milestone id and no pointer at the audit (searched), and neither does the
+  milestone's status.
+
+**Milestone status (verified after these changes):** COMPLETE. Every item is done and both findings are fixed; the
+account closes on x86_64 and aarch64 on the final tree.

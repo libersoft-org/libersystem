@@ -4208,21 +4208,37 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 	// service's OBSERVATION root is asked what the display path still holds once the process has
 	// ended. The reclamation is the process's death and not a polite close: the demo exits without
 	// destroying anything, which is exactly what a crash looks like from here.
-	for _ in 0..4_000u32 {
-		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
-		if focus_input.recv().is_ok() {
-			focus_input.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
+	//
+	// AND ASKED WITHOUT STARVING THE ANSWER. The console the service shows again is presented to the display, and the
+	// service answers nothing while that present waits for its acknowledgement - which is this harness's to give, as
+	// the display's stand-in. `display_resources` waits one pass for its answer, and a pass that found the service
+	// inside a present found none: the emulated targets' whole suite failed there on a question asked between this
+	// loop's acknowledgements. So the presents are answered while the answer is waited for.
+	let ask = |corr: u32| -> display_v1::DisplayResources {
+		stats_root.send(request(display_v1::display_stats::OP_RESOURCES, corr, &[])).expect("a display resources request");
+		for _ in 0..4_000u32 {
+			sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			if focus_input.recv().is_ok() {
+				focus_input.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
+			}
+			while let Ok(present) = gpu_kernel.recv() {
+				let mut reply = le_u32(&present.bytes, 2).to_le_bytes().to_vec();
+				reply.push(1);
+				gpu_kernel.send(Message::new(reply, alloc::vec::Vec::new())).expect("present acknowledgement");
+			}
+			if let Ok(reply) = stats_root.recv() {
+				assert_eq!(le_u32(&reply.bytes, 0), corr, "the resources echo their correlation id");
+				return display_v1::DisplayResources::decode(&reply.bytes[4..]).expect("the resources decode");
+			}
 		}
-		while let Ok(present) = gpu_kernel.recv() {
-			let mut reply = le_u32(&present.bytes, 2).to_le_bytes().to_vec();
-			reply.push(1);
-			gpu_kernel.send(Message::new(reply, alloc::vec::Vec::new())).expect("present acknowledgement");
-		}
-		if display_resources(&stats_root, 800).surfaces == 0 {
+		panic!("the display service did not say what it holds");
+	};
+	for corr in 800..4_800u32 {
+		if ask(corr).surfaces == 0 {
 			break;
 		}
 	}
-	let held = display_resources(&stats_root, 801);
+	let held = ask(4_800);
 	assert_eq!(held.surfaces, 0, "every surface the demo held is reclaimed when its process ends: {held:?}");
 	assert_eq!(held.present_images, 0, "and so is every image of every queue it supplied");
 }

@@ -911,7 +911,7 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 // enumerated stops being denied out loud - so each new one is added here, once, rather than to every string.
 macro_rules! later_denials {
 	() => {
-		" bluetooth=deny bluetooth-operator=deny power-state=deny power-control=deny fixture-control=deny smartcard=deny camera=deny camera-capture=deny midi=deny midi-input=deny midi-output=deny modem-state=deny modem-data=deny modem-identity=deny modem-manage=deny spool=deny media-import=deny admin-request=deny admin-audit=deny admin-test=deny input-gamepad=deny tpm=deny tpm-measure=deny tpm-seal=deny bmc=deny typec=deny typec-control=deny system-sleep=deny sleep-wake=deny processor-power=deny brightness=deny brightness-control=deny bluetooth-gatt=deny audio-control=deny audio-voice=deny bluetooth-serial=deny"
+		" bluetooth=deny bluetooth-operator=deny power-state=deny power-control=deny fixture-control=deny smartcard=deny camera=deny camera-capture=deny midi=deny midi-input=deny midi-output=deny modem-state=deny modem-data=deny modem-identity=deny modem-manage=deny spool=deny media-import=deny admin-request=deny admin-audit=deny admin-test=deny input-gamepad=deny tpm=deny tpm-measure=deny tpm-seal=deny bmc=deny typec=deny typec-control=deny system-sleep=deny sleep-wake=deny processor-power=deny brightness=deny brightness-control=deny bluetooth-gatt=deny audio-control=deny audio-voice=deny bluetooth-serial=deny host-share=deny"
 	};
 }
 
@@ -2152,9 +2152,11 @@ fn the_text_stack_draws_its_corpus_to_the_analytic_oracle() {
 		assert_eq!(listed.bytes.get(5..), list.bytes.get(5..), "with the same listing");
 		crate::serial_println!("  two catalogue clients interleaved a LIST and a RESOLVE-INFO, each answered on its own connection");
 	}
-	// THE ROOT IS HELD HERE TOO, not only handed on: the catalogue's serve loop ends when its root closes, and the program
-	// closes its end when it exits - before the watch below is checked.
-	send_cap(&boot_kernel, b"FONT", serve_client.clone(), Rights::ALL).expect("the program's font catalogue");
+	// THE PROGRAM HOLDS WHAT A GRANT GIVES AN APPLICATION: a connection minted fresh from the root, as PermissionManager
+	// mints one for every application granted `font-catalogue`, narrowed to the grant's four rights. The root stays here,
+	// because the catalogue's serve loop ends when its root closes.
+	let granted = storage.connect_from(&serve_client);
+	send_cap(&boot_kernel, b"FONT", granted, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the program's font catalogue");
 
 	// EVERY LINE IT PRINTS, and a bound on the waiting. A run that never answers is a failure with
 	// something to show rather than a suite that stops.
@@ -2260,6 +2262,352 @@ fn the_text_stack_draws_its_corpus_to_the_analytic_oracle() {
 	}
 	assert!(withdrawn, "the catalogue withdrew a face removed from its watched directory, with no rescan asked for");
 	crate::serial_println!("  the face removed from the watched directory was withdrawn with no rescan asked for");
+}
+
+tagged_test!(the_font_catalogue_refuses_a_face_replaced_behind_it_and_keeps_nothing_of_a_client, [Text, Service, Storage], id = "kernel.applications.the_font_catalogue_refuses_a_face_replaced_behind_it_and_keeps_nothing_of_a_client", covers = ["bin.font_catalogue", "bin.lsfont", "services"]);
+// THE CATALOGUE'S OWN GATES THAT THE CORPUS RUN ABOVE DOES NOT REACH, on one catalogue in a Domain of its own.
+//
+// THE `Factory` ROUTE. A service the manifest declares with a `factory` role on the catalogue is handed what the
+// supervisor's bootstrap mints for it: CONNECT on the SERVE root end the supervisor keeps, the connection narrowed to a
+// client's four rights. An application granted `font-catalogue` is handed what PermissionManager mints: CONNECT on its
+// copy of the same root, narrowed to the same four. The corpus run above hands its program the second; `lsfont` here
+// holds the first, and lists through it.
+//
+// A FACE REPLACED BEHIND ITS BACK, WITH THE HINT NEVER DELIVERED. The catalogue's directory is carried through this
+// test, which answers its watch with a stream nothing is sent on - the dropped hint, driven by not delivering the event
+// at all. The face is replaced after its INFO; RESOLVE-INTO under the identity and generation that INFO answered must
+// refuse rather than hand over the replacement's bytes under the old identity, and the next LIST and INFO must name the
+// new identity at a new generation. The hint delivered late, after the refusal, then changes nothing.
+//
+// NOTHING OF A CLIENT IS KEPT. A client that retains N resolved faces carries them in its own Domain while the
+// catalogue's stays where it was; the catalogue's handle count is the same after every resolve; every refusal - an
+// object too small, a stale generation, a handle of the wrong type or short of `write` - is typed and leaves the
+// catalogue's handle table and Domain as they were; and a client that exits gives back every face it held, with the
+// catalogue doing nothing.
+fn the_font_catalogue_refuses_a_face_replaced_behind_it_and_keeps_nothing_of_a_client() {
+	use alloc::sync::Arc;
+	use alloc::vec::Vec;
+	use object::address_space::AddressSpace;
+	use object::channel::{Channel, Message};
+	use object::domain::{Domain, UNLIMITED};
+	use object::handle::Capability;
+	use object::memory_object::MemoryObject;
+	use object::process::Process;
+	use object::rights::Rights;
+	use storage_proto::generated::liber::storage::v1::volume;
+
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	const FACE: &[u8] = b"vol://system/share/fonts/replaced.ttf";
+	const DECLARATION: &[u8] = b"vol://system/share/fonts/replaced.ttf.face";
+	const ALPHA: &[u8] = include_bytes!("../../tests/fonts/conformance-alpha.ttf");
+	const ALPHA_DECLARED: &str = include_str!("../../tests/fonts/conformance-alpha.ttf.face");
+	const FAMILY: &[u8] = b"LiberSystem Conformance Alpha";
+	const RETAINED: usize = 8;
+
+	// THE CATALOGUE'S DIRECTORY, CARRIED THROUGH THIS TEST. Every request passes on to the read-only scope and every answer
+	// back, except that a watch is answered with a stream this test holds and sends nothing on; the stream the service
+	// opened is kept here, unread, for the late delivery below.
+	struct Carrier {
+		catalogue: Arc<Channel>,
+		scope: Arc<Channel>,
+		watches: Vec<u32>,
+		silent: Vec<Arc<Channel>>,
+		withheld: Vec<Arc<Channel>>,
+		passed: usize,
+	}
+
+	impl Carrier {
+		fn pass(&mut self) {
+			while let Ok(mut request) = self.catalogue.recv() {
+				if request.bytes.len() >= 6 && le_u16(&request.bytes, 0) == volume::OP_WATCH {
+					self.watches.push(le_u32(&request.bytes, 2));
+				}
+				let (bytes, caps) = (core::mem::take(&mut request.bytes), core::mem::take(&mut request.caps));
+				self.scope.send(Message::new(bytes, caps)).expect("the catalogue's request, passed on");
+				self.passed += 1;
+			}
+			while let Ok(mut reply) = self.scope.recv() {
+				let (bytes, mut caps) = (core::mem::take(&mut reply.bytes), core::mem::take(&mut reply.caps));
+				let corr = if bytes.len() >= 4 { le_u32(&bytes, 0) } else { 0 };
+				if let Some(at) = self.watches.iter().position(|watch| *watch == corr) {
+					self.watches.remove(at);
+					if let Some(stream) = caps.pop() {
+						let (consumer, producer) = Channel::create();
+						caps.push(Capability::new(consumer, stream.rights()));
+						self.silent.push(producer);
+						self.withheld.push(stream.object().into_any_arc().downcast::<Channel>().expect("a watch is a stream"));
+					}
+				}
+				self.catalogue.send(Message::new(bytes, caps)).expect("the scope's answer, passed back");
+			}
+		}
+
+		// What the service sent on the watches it opened, delivered now.
+		fn deliver_late(&mut self) -> usize {
+			let mut delivered = 0;
+			for (real, silent) in self.withheld.iter().zip(self.silent.iter()) {
+				while let Ok(mut event) = real.recv() {
+					let (bytes, caps) = (core::mem::take(&mut event.bytes), core::mem::take(&mut event.caps));
+					silent.send(Message::new(bytes, caps)).expect("a hint, delivered late");
+					delivered += 1;
+				}
+			}
+			delivered
+		}
+	}
+
+	// The machine, one step: the services, the stand-in disk and the directory this test carries.
+	fn turn(storage: &mut StorageHarness, carrier: &mut Carrier) {
+		storage.pump();
+		carrier.pass();
+	}
+
+	// One request and its answer, the machine turning while it is waited for.
+	fn ask(storage: &mut StorageHarness, carrier: &mut Carrier, connection: &Channel, op: u16, corr: u32, body: &[u8], caps: Vec<Capability>) -> Vec<u8> {
+		let mut request = Vec::new();
+		request.extend_from_slice(&op.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(body);
+		connection.send(Message::new(request, caps)).expect("a catalogue request");
+		for _ in 0..100_000 {
+			turn(storage, carrier);
+			if let Ok(mut reply) = connection.recv() {
+				assert_eq!(le_u32(&reply.bytes, 0), corr, "the answer is to the request asked");
+				return core::mem::take(&mut reply.bytes);
+			}
+		}
+		panic!("the font catalogue did not answer operation {op}");
+	}
+
+	// A connection minted from the root the way both routes mint one: CONNECT, answered with the client end.
+	fn mint(storage: &mut StorageHarness, carrier: &mut Carrier, root: &Channel) -> Arc<Channel> {
+		root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), Vec::new())).expect("a connect request");
+		for _ in 0..100_000 {
+			turn(storage, carrier);
+			if let Ok(reply) = root.recv() {
+				let cap = reply.caps.first().expect("the minted connection");
+				return cap.object().into_any_arc().downcast::<Channel>().expect("a connection is a channel");
+			}
+		}
+		panic!("the font catalogue did not mint a connection");
+	}
+
+	// The faces a LIST names, each as its identity the way the wire carries it (the digest's length, the digest, the
+	// index) and its family.
+	fn listed(reply: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+		assert_eq!(reply.get(4), Some(&1), "the listing was answered: {reply:?}");
+		let length_at = |at: usize| usize::from(le_u16(reply, at));
+		let mut faces = Vec::new();
+		let mut at = 7;
+		for _ in 0..length_at(5) {
+			let start = at;
+			at += 2 + length_at(at) + 4;
+			let identity = reply[start..at].to_vec();
+			let family = reply[at + 2..at + 2 + length_at(at)].to_vec();
+			at += 2 + length_at(at);
+			// The style; the format, weight, width and slant; and the axes, sixteen bytes each.
+			at += 2 + length_at(at);
+			at += 1 + 2 + 1 + 1;
+			at += 2 + length_at(at) * 16;
+			faces.push((identity, family));
+		}
+		faces
+	}
+
+	// What RESOLVE-INFO answered: the generation the answer is about, and the face's length.
+	fn info(reply: &[u8], identity: &[u8]) -> (u64, u64) {
+		assert_eq!(reply.get(4), Some(&1), "RESOLVE-INFO was answered: {reply:?}");
+		assert_eq!(reply.get(5..5 + identity.len()), Some(identity), "about the face it named");
+		(le_u64(reply, 5 + identity.len()), le_u64(reply, 13 + identity.len()))
+	}
+
+	#[derive(Debug, PartialEq)]
+	enum Resolved {
+		Filled(u64),
+		Stale(u64),
+		TooSmall(u64),
+		Refused(u8),
+	}
+
+	// RESOLVE-INTO, the caller's object handed over as `target`.
+	fn into(storage: &mut StorageHarness, carrier: &mut Carrier, connection: &Channel, corr: u32, identity: &[u8], generation: u64, target: Capability) -> Resolved {
+		let mut body = identity.to_vec();
+		body.extend_from_slice(&generation.to_le_bytes());
+		body.extend_from_slice(&0u32.to_le_bytes());
+		let reply = ask(storage, carrier, connection, 3, corr, &body, alloc::vec![target]);
+		match (reply.get(4), reply.get(5)) {
+			(Some(1), Some(0)) => Resolved::Filled(le_u64(&reply, 6)),
+			(Some(1), Some(1)) => Resolved::Stale(le_u64(&reply, 6)),
+			(Some(1), Some(2)) => Resolved::TooSmall(le_u64(&reply, 6)),
+			(Some(0), Some(error)) => Resolved::Refused(*error),
+			_ => panic!("RESOLVE-INTO answered something it has no answer for: {reply:?}"),
+		}
+	}
+
+	let (volume_bytes, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let catalogue_elf = program_elf(&package, volume_bytes, b"font_catalogue").expect("font_catalogue in the package or volume");
+	let lsfont_elf = program_elf(&package, volume_bytes, b"lsfont").expect("lsfont in the package or volume");
+	let mut storage = StorageHarness::start_system(storage_elf, b"BLOCK", volume_bytes, SYSTEM_CAPACITY);
+	assert!(storage.write(FACE, ALPHA, 0xf4_0001), "the face was installed");
+	assert!(storage.write(DECLARATION, ALPHA_DECLARED.as_bytes(), 0xf4_0002), "with its declaration");
+
+	// THE REPLACEMENT: the same face declared again over new bytes, as an update installs it - the alpha face padded to
+	// 256 KiB, and its declaration naming the new digest. The catalogue parses no face, so what the bytes are is the
+	// declaration's business and the digest's. THE SIZE IS FOR THE RETAINED FACES BELOW: eight copies are two megabytes,
+	// more than a catalogue keeping them could hide in the heap region it already holds, so its Domain would show them.
+	let mut newer = ALPHA.to_vec();
+	newer.resize(256 * 1024, 0);
+	let newer_digest = bootproto::sha256::digest(&newer);
+	let mut newer_declared = alloc::string::String::new();
+	for line in ALPHA_DECLARED.lines() {
+		if line.starts_with("digest = ") {
+			newer_declared.push_str("digest = ");
+			for byte in newer_digest.iter() {
+				newer_declared.push_str(&alloc::format!("{byte:02x}"));
+			}
+		} else {
+			newer_declared.push_str(line);
+		}
+		newer_declared.push('\n');
+	}
+
+	// THE CATALOGUE, in a Domain of its own so what it holds can be read apart from everything else, its directory carried
+	// through this test, and the rights the supervisor hands it.
+	let catalogue_domain = Domain::new_child(&sched::root_domain(), UNLIMITED, UNLIMITED, UNLIMITED).expect("the catalogue's Domain");
+	let scope = storage.open_directory_scope(b"vol://system/share/fonts", false);
+	let (fontdir, carried) = Channel::create();
+	let mut carrier = Carrier { catalogue: carried, scope, watches: Vec::new(), silent: Vec::new(), withheld: Vec::new(), passed: 0 };
+	let (boot_kernel, boot_user) = Channel::create();
+	let (admin_server, _admin_client) = Channel::create();
+	let (serve_server, root) = Channel::create();
+	let catalogue = loader::spawn_elf_process(catalogue_domain.clone(), catalogue_elf, boot_user, Rights::ALL).expect("spawn FontCatalogue");
+	let client_rights = Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER;
+	send_cap(&boot_kernel, b"FONTDIR", fontdir, client_rights).expect("the catalogue's font directory");
+	send_cap(&boot_kernel, b"ADMIN", admin_server, client_rights).expect("the catalogue's admin root");
+	send_cap(&boot_kernel, b"SERVE", serve_server, client_rights).expect("the catalogue's serve root");
+	let mut online = None;
+	for _ in 0..100_000 {
+		turn(&mut storage, &mut carrier);
+		if let Ok(message) = boot_kernel.recv() {
+			online = Some(message.bytes.clone());
+			break;
+		}
+	}
+	assert_eq!(online.as_deref(), Some(&b"FontCatalogue: online"[..]), "the catalogue started over the carried directory");
+	assert_eq!(carrier.silent.len(), 1, "and opened its watch through it, on a stream nothing is delivered on");
+
+	// 1. THE `Factory` ROUTE, consumed by a program holding exactly what the supervisor hands a role of that kind.
+	let factory = mint(&mut storage, &mut carrier, &root);
+	let (lsfont_boot, lsfont_user) = Channel::create();
+	let (console, lsfont_console) = Channel::create();
+	let lsfont = spawn_dynamic_test_process(sched::root_domain(), lsfont_elf, lsfont_user);
+	send_cap(&lsfont_boot, b"STDOUT", lsfont_console, Rights::ALL).expect("lsfont's console");
+	lsfont_boot.send(Message::new(b"READY".to_vec(), Vec::new())).expect("endpoint run terminator");
+	lsfont_boot.send(Message::new(launch_context(b"", b"vol://system"), Vec::new())).expect("lsfont's launch context");
+	send_cap(&lsfont_boot, b"FONT", factory, client_rights).expect("lsfont's catalogue, minted as a Factory role's is");
+	lsfont_boot.send(Message::new(b"FONTADMIN".to_vec(), Vec::new())).expect("and no operator path");
+	let mut printed: Vec<u8> = Vec::new();
+	for _ in 0..200_000 {
+		turn(&mut storage, &mut carrier);
+		while let Ok(message) = console.recv() {
+			printed.extend_from_slice(&message.bytes);
+		}
+		if lsfont.is_terminated() {
+			break;
+		}
+	}
+	while let Ok(message) = console.recv() {
+		printed.extend_from_slice(&message.bytes);
+	}
+	let shown = alloc::string::String::from_utf8_lossy(&printed).into_owned();
+	assert!(lsfont.is_terminated(), "lsfont listed and left: {shown}");
+	assert!(printed.split(|byte| *byte == b'\n').any(|line| line.starts_with(FAMILY)), "and named the installed face, which it reached through the Factory route: {shown}");
+	crate::serial_println!("  lsfont listed the installed faces through a connection minted as a Factory role's is");
+
+	// 2. A FACE REPLACED AFTER ITS INFO, AND THE HINT NEVER DELIVERED.
+	let client = mint(&mut storage, &mut carrier, &root);
+	let faces = listed(&ask(&mut storage, &mut carrier, &client, 1, 0xf4_0010, &[], Vec::new()));
+	let alpha = faces.iter().find(|(_, family)| family.as_slice() == FAMILY).map(|(identity, _)| identity.clone()).expect("the installed face is listed");
+	let (generation, length) = info(&ask(&mut storage, &mut carrier, &client, 2, 0xf4_0011, &alpha, Vec::new()), &alpha);
+	assert_eq!(length, ALPHA.len() as u64, "INFO answered the installed face's length");
+	assert!(storage.write(FACE, &newer, 0xf4_0012), "the face was replaced");
+	assert!(storage.write(DECLARATION, newer_declared.as_bytes(), 0xf4_0013), "with a declaration naming the new bytes");
+	// MARKED, so that "nothing was written" is about this call and not about what the frames held before.
+	let object = MemoryObject::create(newer.len()).expect("the caller's object");
+	crate::copy_into_object(&object, &alloc::vec![0x5a; newer.len()]);
+	let answer = into(&mut storage, &mut carrier, &client, 0xf4_0014, &alpha, generation, Capability::new(object.clone(), Rights::MAP | Rights::WRITE));
+	let Resolved::Stale(current) = answer else { panic!("RESOLVE-INTO under the old identity answered {answer:?} rather than refusing it") };
+	assert!(current > generation, "the refusal names a new generation: {current} after {generation}");
+	assert!(read_from_object(&object, newer.len()).iter().all(|byte| *byte == 0x5a), "and nothing was written into the caller's object");
+	let faces = listed(&ask(&mut storage, &mut carrier, &client, 1, 0xf4_0015, &[], Vec::new()));
+	assert!(!faces.iter().any(|(identity, _)| *identity == alpha), "the old identity is no longer listed");
+	let replaced = faces.iter().find(|(_, family)| family.as_slice() == FAMILY).map(|(identity, _)| identity.clone()).expect("the replaced face is listed");
+	assert_eq!(replaced.get(2..2 + newer_digest.len()), Some(&newer_digest[..]), "under the identity of the bytes that replaced it");
+	let (now, now_length) = info(&ask(&mut storage, &mut carrier, &client, 2, 0xf4_0016, &replaced, Vec::new()), &replaced);
+	assert_eq!((now, now_length), (current, newer.len() as u64), "and INFO answers it at the generation the refusal named");
+	crate::serial_println!("  a face replaced with its hint withheld was refused under its old identity, generation {generation} -> {now}");
+	// AND THE HINT, DELIVERED LATE, CHANGES NOTHING: the catalogue reads the directory again and finds it as the refusal
+	// left it.
+	let reads = carrier.passed;
+	let late = carrier.deliver_late();
+	assert!(late >= 1, "the service did send a hint, which this test withheld until now");
+	let deadline = arch::apic::ticks().saturating_add(500);
+	while carrier.passed == reads && arch::apic::ticks() < deadline {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(10));
+		turn(&mut storage, &mut carrier);
+	}
+	assert!(carrier.passed > reads, "the catalogue acted on the late hint and read its directory again");
+	let (after, _) = info(&ask(&mut storage, &mut carrier, &client, 2, 0xf4_0017, &replaced, Vec::new()), &replaced);
+	assert_eq!(after, now, "and the generation did not move: the replacement was published when the refusal was made");
+
+	// 3. NOTHING OF A CLIENT IS KEPT. The client is a process in a Domain of its own, holding every object it is handed.
+	let client_domain = Domain::new_child(&sched::root_domain(), UNLIMITED, UNLIMITED, UNLIMITED).expect("the client's Domain");
+	let holder = Process::new(AddressSpace::create_in(&client_domain).expect("the client's address space"), client_domain.clone()).expect("the client");
+	// ONE RESOLVE FIRST, so the catalogue has read and handed over a face once before anything is measured.
+	let warm = MemoryObject::create(newer.len()).expect("a first object");
+	assert_eq!(into(&mut storage, &mut carrier, &client, 0xf4_0020, &replaced, now, Capability::new(warm.clone(), Rights::MAP | Rights::WRITE)), Resolved::Filled(newer.len() as u64), "a first resolve");
+	drop(warm);
+	let handles = catalogue.handle_count();
+	let held = catalogue_domain.account().memory().used();
+	let carried_before = client_domain.account().memory().used();
+	for n in 0..RETAINED {
+		let object = MemoryObject::create_in(&client_domain, newer.len()).ok().expect("the client's object");
+		holder.install(object.clone(), Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER).expect("held by the client");
+		let answer = into(&mut storage, &mut carrier, &client, 0xf4_0030 + n as u32, &replaced, now, Capability::new(object.clone(), Rights::MAP | Rights::WRITE));
+		assert_eq!(answer, Resolved::Filled(newer.len() as u64), "resolve {n} filled the client's object");
+		assert!(read_from_object(&object, newer.len()) == newer, "with the face's bytes (resolve {n})");
+		// THE DOMAIN FIRST: a copy kept in the catalogue's own memory grows its heap by a mapped region, which is a handle
+		// too, and is reported here as what it is.
+		assert_eq!(catalogue_domain.account().memory().used(), held, "and the catalogue's Domain carries nothing of it (resolve {n})");
+		assert_eq!(catalogue.handle_count(), handles, "and the catalogue holds no handle more than it did: no client object kept across the reply (resolve {n})");
+	}
+	let page = crate::mem::frame::PAGE_SIZE;
+	let face_charge = (newer.len() as u64).div_ceil(page) * page;
+	assert_eq!(client_domain.account().memory().used(), carried_before + RETAINED as u64 * face_charge, "the client's Domain carries the {RETAINED} faces it retains");
+	assert_eq!(catalogue_domain.account().memory().used(), held, "and the catalogue's Domain carries none of them");
+	// EVERY REFUSAL IS TYPED, and none is a fallback to the catalogue's own memory.
+	{
+		let small = MemoryObject::create_in(&client_domain, newer.len() - 4096).ok().expect("an object a page too small");
+		crate::copy_into_object(&small, &alloc::vec![0x5a; newer.len() - 4096]);
+		assert_eq!(into(&mut storage, &mut carrier, &client, 0xf4_0040, &replaced, now, Capability::new(small.clone(), Rights::MAP | Rights::WRITE)), Resolved::TooSmall(newer.len() as u64), "an object too small is refused with the length the face needs");
+		assert!(read_from_object(&small, newer.len() - 4096).iter().all(|byte| *byte == 0x5a), "and is left as it was");
+		let object = MemoryObject::create_in(&client_domain, newer.len()).ok().expect("the client's object");
+		crate::copy_into_object(&object, &alloc::vec![0x5a; newer.len()]);
+		assert_eq!(into(&mut storage, &mut carrier, &client, 0xf4_0041, &replaced, now + 1, Capability::new(object.clone(), Rights::MAP | Rights::WRITE)), Resolved::Stale(now), "a generation that is not current is refused with the current one");
+		let (wrong, _peer) = Channel::create();
+		assert_eq!(into(&mut storage, &mut carrier, &client, 0xf4_0042, &replaced, now, Capability::new(wrong, Rights::ALL)), Resolved::Refused(0), "a handle that is not a memory object is refused as denied");
+		assert_eq!(into(&mut storage, &mut carrier, &client, 0xf4_0043, &replaced, now, Capability::new(object.clone(), Rights::MAP | Rights::READ)), Resolved::Refused(0), "and so is one without `write`");
+		assert!(read_from_object(&object, newer.len()).iter().all(|byte| *byte == 0x5a), "and nothing was written into the objects the refusals were handed");
+	}
+	assert_eq!(catalogue.handle_count(), handles, "every refusal left the catalogue's handle table as it was");
+	assert_eq!(catalogue_domain.account().memory().used(), held, "and its Domain");
+	// THE CLIENT EXITS, and every face it held goes with it - with the catalogue doing nothing.
+	holder.terminate();
+	assert_eq!(client_domain.account().memory().used(), carried_before, "the client's exit gave back every face it held");
+	assert_eq!(catalogue.handle_count(), handles, "with the catalogue's handle table untouched");
+	assert_eq!(catalogue_domain.account().memory().used(), held, "and its Domain");
+	crate::serial_println!("  {RETAINED} retained faces were the client's {} bytes and none of the catalogue's; four refusals typed; the exit gave them back", RETAINED as u64 * face_charge);
 }
 
 tagged_test!(the_2d_profile_conforms_on_the_target, [Image, Process, Slow], id = "kernel.applications.the_2d_profile_conforms_on_the_target", covers = ["bin.test2d-conformance-sw", "render2d", "soft2d", "kernel"]);
@@ -2504,8 +2852,11 @@ fn the_3d_demo_renders_a_lit_scene_and_survives_a_resize() {
 		// MOVE THE SURFACE UNDER IT ONCE IT HAS DRAWN. A changed extent is a new generation: every
 		// image is stale, the scene's own attachments are the wrong size, and what this checks is
 		// that the demo rebuilds BOTH and keeps drawing - with the camera and the animation where
-		// they were, which is what its report's frame count says.
-		if !resized && host.presents >= 4 && !later_frame.is_empty() {
+		// they were, which is what its report's frame count says. AND IT MOVES WHILE A FRAME IS
+		// ACQUIRED, between the acquire and its present: that frame is presented for the generation
+		// it was drawn for and refused, which is the window a live resize can land in - the demo
+		// used to leave on that refusal - and the demo has to go on to the rebuild.
+		if !resized && host.presents >= 4 && !later_frame.is_empty() && host.acquired.is_some() {
 			presents_before_resize = host.presents;
 			host.reconfigure(WIDTH + 32, HEIGHT + 16);
 			resized = true;
@@ -2557,6 +2908,8 @@ fn the_3d_demo_renders_a_lit_scene_and_survives_a_resize() {
 	// THE RESIZE, WHICH THE DEMO'S OWN REPORT COUNTS. A rebuild recreates the two prepared plans, the
 	// three attachments and the shared image; the camera and the spin are not in any of them.
 	assert!(resized, "the surface was moved under the demo");
+	assert_eq!(host.refused, 1, "the frame it had acquired was presented for the old configuration and refused: {output:?}");
+	assert!(contains(b"test3d-sw: 1 present(s) refused for a configuration that had moved, and the loop went on"), "and the demo said so and went on: {output:?}");
 	assert!(contains(b"rebuilt=1"), "and the demo rebuilt for it exactly once: {output:?}");
 	// THE KEY, AND THE EXIT IT CAUSES. The stream came through the focus proof the surface minted,
 	// so this is the whole path and not a flag the demo set itself.

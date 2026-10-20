@@ -43,8 +43,8 @@
 #     DRIVER                    in the create info, and upstream negotiates with it directly - at 7, with
 #                               no substrate between them - and takes the physical-device function out of
 #                               it. The port removes the path: the extension is not listed, and an
-#                               instance enabling it with the bound ICD's own lookup is refused with
-#                               `VK_ERROR_EXTENSION_NOT_PRESENT` without that lookup being called once.
+#                               instance enabling it with the bound ICD's own lookup is not created and
+#                               never calls that lookup - it fails as the ordinary one below does.
 #   AND THE INSTANCE FAILS    with `VK_ERROR_INCOMPATIBLE_DRIVER`, which is the honest outcome and
 #                               not a shortfall: the synthetic ICD implements no Vulkan entry point,
 #                               because this milestone exports no Vulkan ABI. The loader found a
@@ -108,7 +108,7 @@ expect "instance with a layer refused by name" "an instance creation enabling a 
 expect "loader lookup address" "the loader must answer out of its own table, which is its own code running"
 expect "instance result=4294967287" "with a driver that implements nothing, VK_ERROR_INCOMPATIBLE_DRIVER is the honest answer"
 expect "direct driver loading not advertised" "the port removes VK_LUNARG_direct_driver_loading, so the loader must not list it"
-expect "direct driver instance result=4294967289" "an instance enabling VK_LUNARG_direct_driver_loading must be refused with VK_ERROR_EXTENSION_NOT_PRESENT"
+expect "direct driver instance result=4294967287" "an instance enabling VK_LUNARG_direct_driver_loading must fail as the ordinary one does - the loader stops at the driver that implements nothing"
 expect "direct driver lookups=0" "the driver lookup handed to the loader in the create info must never be called"
 expect "direct driver loading refused" "a driver handed to the loader in the create info must not be loaded"
 # THE NEGOTIATION'S LINE, read from the whole log: the probe's filtered lines stop at a colon, and this one has three.

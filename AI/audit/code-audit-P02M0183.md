@@ -1246,3 +1246,54 @@ AUDITOR'S RE-AUDIT ON P02M0183 (2026-10-18T17:36:02Z):
   - **`qemu-modem-service` passed with `uncertain-retired`:** confirmed as a run by /data/yellow/libersystem/.build/claude-work/implementer/runs/gate-qemu-modem-service.log (2026-10-16, `RESULT ok exit=0 seconds=1100`). It is not evidence for the fix.
   - **The rejection of the revocation finding:** the substance is partly fair, the premise is not (finding 3).
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0183 (2026-10-19T22:00:37Z):
+
+**Finding 1 - a retired grant's deactivation that expires is still never reconciled, so the modem keeps refusing every state change (Medium): ACCEPTED.**
+- `src/user/services/core/src/modem_service.rs`: `deactivated` now takes the key of the modem the deactivation was for,
+  and decides by whether the context it ends is still the one deactivating there (`ours`).
+  - `Done` and an unknown outcome end the context only when it is ours: a grant retired while its deactivation was out
+    has had its context ended already, and a context there now is a newer activation's.
+  - Whatever a deactivation nobody owns any more ends with but `Done` - an expiry above all, or a refusal - is settled
+    by a query (`reconcile(key)`): the modem was asked to take a context down and nobody knows whether it did. The
+    query's answer takes such a context down. Before, an expiry left the modem refusing every state change until
+    something else queried it, and a refusal left a context up that nobody held.
+
+**Finding 2 - `modemcheck uncertain-retired` passes without the fix, so the claimed verification does not support it (Low): ACCEPTED.**
+- `src/user/services/core/src/modemcheck.rs`: `uncertain-retired` no longer passes on the SIM reading ready (which it
+  did whether or not the outcome was reconciled). After the grant's deadline has passed (6 s) it requires a state change
+  to be ADMITTED - an activation that completes and can be taken down again; a modem still refusing as busy fails the
+  step by name.
+- Two new steps for finding 1, the same way: `deactivate-retired` holds a deactivation's answer at the fixture, ends the
+  data grant while it is out, and `readmit` then requires a fresh activation to be admitted after its deadline.
+- `src/tools/check-modem-service.sh` runs them and requires their lines.
+- Watched failing in a guest, each against the defect it is for: with a PIN out at the modem dropped along with its
+  grant (the service before 2026-10-15), `uncertain-retired` fails - "the modem refused a state change as busy - the
+  unknown outcome was never reconciled"; with the old branch, which reconciled an unknown deactivation only while a
+  context was still installed, `uncertain-retired` passes and `readmit` fails the same way. (A first attempt broke the
+  refusal branch instead, and `readmit` passed: a deadline completes a deactivation as an unknown outcome, never as a
+  refusal. The refusal branch's query for a deactivation nobody owns has no guest step; it is the same call.)
+
+**Finding 3 - "admin revocation" is still claimed as done with no path behind it, and the rejection's no-oracle premise does not hold (Low): ACCEPTED.**
+- The finding is right: the service's own administrative interface is the path and a kernel-suite rig is the oracle.
+- `src/idl/modem.lsidl`: `modem-admin` gains `revoke` (op 2): every grant on one modem - data, identity and management -
+  ends as a closed connection's would, its context torn down, and the number of grants ended is answered. Regenerated
+  with `./gen.sh`.
+- `modem_service.rs`: `AdminView::revoke` retires each grant on the modem through the same `retire` a closed connection
+  takes, and says so.
+- `src/kernel/test_suites/services.rs`: the modem rig mints and revokes through the admin root, and
+  `kernel.services.modem_admin_revocation_retires_every_grant_on_its_modem` requires a revocation to end both of a
+  modem's grants, close both connections, give their client slots back, and a second revocation to find none. Its first
+  run failed before it reached the revocation: the rig named the grants' owner as "the calling thread's process", and a
+  kernel test runs on no thread of its own. The test now makes the owner, a process that stays alive throughout - one
+  that ended would retire the grants first - and passes. Watched failing: with `revoke` counting the grants and retiring
+  none, the test fails at "and closed both connections, as a closed connection's grant would be".
+
+**Verification:**
+- `qemu-modem-service` PASS on the final tree (1113 s), with `uncertain-retired`, `deactivate-retired` and `readmit` and
+  the bounds scenario.
+- The two watch-fails in the guest and the revocation test's are given under findings 1-3; the revocation test passes on
+  the tree.
+
+**Milestone status (verified after these changes):** COMPLETE. Every item is done and all three findings are fixed,
+admin revocation with a kernel oracle.

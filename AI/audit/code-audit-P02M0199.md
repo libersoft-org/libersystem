@@ -452,3 +452,40 @@ No gate exercises the 0x82 path or a timed-out set.
   - F3, watch at `DEFAULT_IDLE_SECONDS` with idle off and automatic on, retargeted by `set_automatic`: confirmed (brightness_policy.rs:298-314, 494). `Policy::idle` dims nothing when idle is off (logic brightness.rs:645-649).
   - `brightness-acpi` passed: confirmed by .build/claude-work/implementer/runs/gate-brightness-acpi.log (2026-10-16 06:01, after the fix commit, RESULT ok in 253 s). `brightness-usb` was not rerun after the corrections; the response does not claim it.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0199 (2026-10-19T22:00:37Z):
+
+**Finding 1 - DisplayService's backlight deadline now equals the brightness policy's own call deadline, so a set that times out leaves its answer queued and every later policy set reads the answer before it (Medium): ACCEPTED.**
+- `src/user/services/core/src/brightness_policy.rs`: a set's own deadline is `SET_TICKS` = `ASK_TICKS` + one second -
+  longer than the two seconds DisplayService gives the backlight it forwards to - so DisplayService's answer, a level or
+  `timed-out`, always arrives before the policy gives up. And before each set the policy drains whatever is waiting on
+  the control channel (closing any handles it carries): every call starts its correlation afresh, so a reply left by one
+  that gave up would read as the next one's.
+
+**Finding 2 - a late answer to a timed-out set lets the backlight back into the join but throws its level away (Low): ACCEPTED.**
+- `src/user/services/core/src/display_service/brightness.rs`: a set that expires is remembered on its backlight (`late`:
+  its correlation and cause). When that set's answer arrives after all, its level - when it is inside the backlight's
+  scale - becomes the backlight's level and the change is published as a timely answer's would have been; the writer who
+  was told it timed out is answered nothing more. A provider stream that speaks again forgets it, since its level is the
+  panel's from there. And an answer that arrived is read as an answer even in its deadline's own tick: taken as the
+  timeout it was consumed, and nothing let the backlight back into the join.
+- `src/kernel/test_suites/display_brightness.rs`
+  (`kernel.services.display_service_keeps_serving_while_backlights_stall`): the late completion's level must be the one
+  reported (77, the level it set - it was 50 before), and the writer that timed out must be answered nothing more.
+- Two corrections to the test the runs forced. The late answer that carries the level now carries no handle: one that
+  smuggled a handle is more than a set's answer accounts for, `finish` refuses it as it refuses a timely one, and its
+  level was rightly not applied - the first run of the changed test failed exactly there (50). The smuggled handle stays
+  on the old write's answer arriving again, later in the test. And the check that a late completion's handle is closed
+  waited one pump, which no longer holds on this tree - with the brightness module as it was before this change too: the
+  service closes what the message carried on the second pump (measured). It now waits within the bound a reply is waited
+  for (`peer_closed`), as `receive` waits for a message. Nothing leaked; the check was bound to one tick.
+- Watched failing: with the brightness module as it was before this change, the test fails at "and the level it set is
+  the one reported" (50, where 77 was set) - the late answer's level was thrown away.
+
+**Verification:**
+- The stall test PASS on the final tree; `brightness-acpi` PASS (263 s), `brightness-usb` PASS (761 s).
+- The policy's deadline and drain (finding 1) have no guest step of their own; `brightness-acpi` drives the policy's
+  sets through the same path.
+
+**Milestone status (verified after these changes):** COMPLETE for phase 2. Every item is done and both findings are
+fixed. DDC/CI and real hardware are out of phase 2 (the item and the owner's decision of 2026-10-13 say why).

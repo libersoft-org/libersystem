@@ -2771,3 +2771,80 @@ fn input_that_arrived_with_no_console_is_not_the_next_console_s_input() {
 	drop(live_near);
 	assert!(!crate::console_input::shell_listening(), "the stand-in goes away with the test");
 }
+
+tagged_test!(two_deliveries_at_once_hand_the_console_every_byte_once_and_in_order, [Kernel, Console, Channel], id = "kernel.console.two_deliveries_at_once_hand_the_console_every_byte_once_and_in_order", covers = ["kernel"]);
+// THE INPUT RING IS EMPTIED FROM MORE THAN ONE PLACE: every byte queued delivers what the console will take, and the idle
+// hook empties what a full console left waiting. A delivery reads the byte at the front, sends it, and then takes it off
+// the front, so two at once sent the same byte twice and the second take dropped one nobody had sent - a command line with
+// a character doubled and another missing. Driven here as two cores: this one queues a numbered stream and reads it back,
+// while the second delivers in a loop; what the console receives must be exactly what was queued.
+fn two_deliveries_at_once_hand_the_console_every_byte_once_and_in_order() {
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	use object::channel::Channel;
+
+	static STOP: AtomicBool = AtomicBool::new(false);
+	static ENDED: AtomicBool = AtomicBool::new(false);
+	static PASSES: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn deliverer(_: u64) {
+		while !STOP.load(Ordering::Acquire) {
+			crate::console_input::drain();
+			PASSES.fetch_add(1, Ordering::Relaxed);
+		}
+		ENDED.store(true, Ordering::Release);
+	}
+
+	if crate::smp::cpu_count() < 2 || !crate::smp::is_online(1) {
+		crate::serial_println!("  NOT RUN: one core, and the two deliveries need two");
+		return;
+	}
+	let (far, near) = Channel::create();
+	crate::console_input::attach(far);
+	STOP.store(false, Ordering::Release);
+	ENDED.store(false, Ordering::Release);
+	PASSES.store(0, Ordering::Release);
+	sched::spawn_on(1, deliverer, 0);
+	let started = arch::apic::ticks().saturating_add(500);
+	while PASSES.load(Ordering::Acquire) == 0 && arch::apic::ticks() < started {
+		core::hint::spin_loop();
+	}
+	assert!(PASSES.load(Ordering::Acquire) > 0, "the second core is delivering");
+
+	// A NUMBERED STREAM over 251 values, a prime, so a byte doubled or dropped shifts everything after it.
+	const BYTES: usize = 40_000;
+	let mut queued: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(BYTES);
+	let mut received: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(BYTES + 64);
+	let take = |received: &mut alloc::vec::Vec<u8>| {
+		while let Ok(message) = near.recv() {
+			assert_eq!(message.bytes.len(), 2, "one serial byte per message");
+			received.push(message.bytes[1]);
+		}
+	};
+	for index in 0..BYTES {
+		let byte = (index % 251) as u8;
+		if crate::console_input::feed_serial(byte) {
+			queued.push(byte);
+		}
+		take(&mut received);
+	}
+	STOP.store(true, Ordering::Release);
+	let ended = arch::apic::ticks().saturating_add(500);
+	while !ENDED.load(Ordering::Acquire) && arch::apic::ticks() < ended {
+		core::hint::spin_loop();
+	}
+	assert!(ENDED.load(Ordering::Acquire), "the second core stopped delivering");
+	for _ in 0..1000 {
+		crate::console_input::drain();
+		take(&mut received);
+		if !crate::console_input::held() {
+			break;
+		}
+	}
+	take(&mut received);
+	let first = queued.iter().zip(received.iter()).position(|(a, b)| a != b);
+	assert!(first.is_none() && queued.len() == received.len(), "the console received {} byte(s) for {} queued, the first difference at {:?}, over {} delivery pass(es) on the second core", received.len(), queued.len(), first, PASSES.load(Ordering::Acquire));
+	crate::serial_println!("  {} byte(s) queued and received once each, in order, beside {} delivery pass(es) on the second core", queued.len(), PASSES.load(Ordering::Acquire));
+
+	// AND NO CONSOLE IS LEFT BEHIND.
+	drop(near);
+	assert!(!crate::console_input::shell_listening(), "the stand-in goes away with the test");
+}

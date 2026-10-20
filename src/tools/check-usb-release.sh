@@ -4,6 +4,11 @@
 # through `vol://usb`, and taken out again - and the DMA memory the xHCI driver's Domain holds, as `lsdev` reads it
 # through DeviceManager, is the same after the second stick left as it was before that stick arrived.
 #
+# AND THE SECOND STICK IS READ AS ITSELF, with no request to `vol://usb` between the two. The xHCI published one block
+# wire for every stick it carried and let it stand across a detach, and the USB volume lets a mount go only when its
+# provider is withdrawn or a request fails - so the stick plugged second was read through the first one's mount, and
+# its file was not there. A stick that leaves takes its publication with it now, and the driver says so.
+#
 # WHY IT IS A GATE OF ITS OWN. The driver closed the handles of what a departed device had - its rings, its transfer
 # pages, its data buffer - without unmapping them, and a mapped buffer is kept, frames and charge, until the process
 # ends: every plug and unplug kept its pages for good while the class budget was refunded. Nothing read the figure that
@@ -112,11 +117,9 @@ helper=$!
 # THE READINGS: the xHCI driver's DMA memory once the boot's stick has left, and again once the stick plugged after it
 # has been read through `vol://usb` - its data buffer grown to the read - and has left too.
 #
-# A READ WHILE NO STICK IS IN, which fails, between the two sticks. The xHCI's block channel is one channel for every
-# stick it carries, and the USB volume drops a mount only on an I/O failure: with no request between them, the stick
-# plugged second was read through the first one's mount and its file was not there. `usb-legacy` makes the same read,
-# where each stick is a publication of its own.
-guest_gate_run $'cat vol://usb/hello.txt\nhidcheck usb wait\ncat vol://usb/hello.txt\necho usb-release-dma before\nlsdev\nhidcheck usb wait\ncat vol://usb/release.txt\nhidcheck usb wait\necho usb-release-dma after\nlsdev\necho usb-release-done' ""
+# NO READ BETWEEN THE TWO STICKS: the second is read straight after the first left, which is the swap a stale mount
+# would answer from the first one's directory.
+guest_gate_run $'cat vol://usb/hello.txt\nhidcheck usb wait\necho usb-release-dma before\nlsdev\nhidcheck usb wait\ncat vol://usb/release.txt\nhidcheck usb wait\necho usb-release-dma after\nlsdev\necho usb-release-done' ""
 wait "$helper" 2>/dev/null || true
 helper=""
 
@@ -127,8 +130,9 @@ expect() {
 grep -aq 'usb-release-done' "$GUEST_LINES" || fail "the script did not run to its end"
 ! grep -aq 'panicked at' "$GUEST_LINES" || fail "something panicked"
 expect 'Hello from the OS ramdisk!' "the boot's stick must be read through vol://usb"
-expect 'the release stick, plugged after the boot' "the stick plugged after the boot must be read through vol://usb"
+expect 'the release stick, plugged after the boot' "the stick plugged after the boot must be read through vol://usb, with no request between it and the stick before it"
+expect 'driver.xhci: the stick left - its block wire is withdrawn and offered again' "a stick that left must take its publication with it"
 python3 "$root/tools/usb-dma-readings.py" "$GUEST_LINES" usb-release-dma before after:xhci ||
 	fail "the xHCI driver kept DMA memory the stick that left had held"
-echo "usb-release: the boot's stick out, a stick plugged in, read and taken out - and the xHCI driver holds the DMA memory it held before that stick came"
+echo "usb-release: the boot's stick out, a stick plugged in and read as itself with no request between the two, and taken out - and the xHCI driver holds the DMA memory it held before that stick came"
 echo "usb-release: PASS"

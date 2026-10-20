@@ -761,3 +761,41 @@ What remains:
   - `typec-ucsi` passed: consistent with the retained logs of 2026-10-16 04:19-04:33.
   - `host-tests` passed: not verifiable by a static review.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0202 (2026-10-19T22:00:37Z):
+
+**Finding 1 - a connector change the PPM names only once is still never acknowledged (Low): ACCEPTED.**
+- `src/user/libs/driver/ucsi/src/lib.rs`: an `Exchange` now carries `after`, the change the acknowledgement's own
+  completion named, whatever came before it. The exchange's `change` stays what it was (the command's own completion, or
+  `after` when that named none). A connector number past the PPM's connector count in `after` is refused as
+  `Failure::Connector`, as everywhere else.
+- `src/user/drivers/core/src/ucsi_acpi.rs`: `run()` queues `after` like any other change, and a read that acknowledges a
+  connector's change drops only that connector from its own completion - it used to drop the completion's change
+  whatever connector it named. The queued changes are cleared at the PPM reset and before the command that enables the
+  notifications (both of which are followed by reading every connector again), and no longer after the configuration
+  commands, whose completions can carry a change of their own.
+- The second half came from the final run. With `after` alone, v21 still failed: the PPM had named connector 1 in its
+  notification, so the status read for connector 1 named the NEXT pending change, connector 2, in its own completion -
+  and the driver dropped a change-acknowledging read's completion change as the one being acknowledged. The PPM's log
+  shows it: the status of 1 read and acknowledged, and nothing asked of 2.
+- `src/user/libs/driver/ucsi/src/tests.rs`: `a_change_the_acknowledgement_names_after_another_is_reported_too` (15
+  tests). Watched failing: with `after` dropped, the test fails.
+- `src/harness/ucsi-ppm.py`: a `once` mode, in which the PPM names each pending change in exactly one CCI and never
+  again, and a `detach-both` command that leaves both connectors' detaches pending before either is named; its self-test
+  covers both.
+- `src/tools/check-typec-ucsi.sh`: step v21 - `once on`, `detach-both`, and both connectors must be read and announced
+  detached. Watched failing twice: on the driver as it was, and with `after` kept but the read's own completion change
+  still dropped - both stop at "await 2 detached".
+
+**Finding 2 - the milestone document points at its audit file and still states superseded statuses (Low): ACCEPTED.**
+- `docs/todo/P02M0202.md`: the pointers are gone; the superseded status paragraphs are marked as superseded by the
+  current status, and `docs/todo/TODO.md`'s row matches it.
+
+**Verification:**
+- The `ucsi` library's 15 host tests; the PPM model's self-test with the `once` mode.
+- `typec-ucsi` PASS on the corrected driver (980 s), v21 among its steps; it failed at v21 on the driver as it was and
+  with only the acknowledgement's change kept.
+
+**Milestone status (verified after these changes):** COMPLETE for phase 2. Every item is done and every finding is
+fixed; both connectors' changes are announced on the final tree. Not tested on real hardware - not part of phase 2, by
+the owner's decision of 2026-10-13.

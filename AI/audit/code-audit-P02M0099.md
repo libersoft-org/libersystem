@@ -5618,3 +5618,162 @@ No gate reaches any of the Medium defects.
     - `vol://host` read-only, not in the volumes bundle, granted only to `share`; refused launch now printed: confirmed.
     - The gate scripts check what the DONE notes say they check: confirmed statically.
 - **Not done.** This was a static review only: nothing was built or run. QEMU's virtio-crypto reset behaviour could not be checked against source, because none is available here.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0099 (2026-10-19T22:00:37Z):
+
+Fourteen findings were verified and accepted; one (9) is rejected as a redesign, with the bound finding 7 now gives it.
+
+**Finding 1 - with virtio-mem memory online, the balloon's floor counts plugged frames but takes boot-pool frames only (Medium): ACCEPTED.**
+- `src/kernel/mem/frame/mod.rs`: `boot_totals()` answers the boot pools' own frames and free frames, which plugged
+  memory is never part of. `balloon_take` judges its floor against it - the frame it takes comes from the boot pools,
+  since `allocate` never serves plugged memory - and the movable allocator and `totals` read it too instead of their own
+  copies.
+- `src/kernel/mem/hotplug/tests.rs`: the hot-plug test requires the boot count to exclude what was plugged, and
+  `kernel.mem.hotplug.a_balloon_stops_at_the_boot_pools_floor_while_plugged_memory_is_free` drives the floor: a plugged
+  range online and free (sixteen megabytes), and the balloon asked for frames until it refuses. It stops at the boot
+  pools' floor (963048 frames taken, and 64411 left free against a floor of 64411, beside 4096 free plugged frames) and
+  takes none of the plugged frames. Watched failing: with the floor judged against every frame the machine has, as
+  before, it went below the floor (60571 frames left free against the floor of 64411 - 3840 below it - after 966888
+  taken).
+
+**Finding 2 - the virtio-crypto and balloon kernel tests run on every architecture, but only the x86_64 test machine has their devices (Medium): ACCEPTED.**
+- `src/kernel/test_suites/hardware.rs`: both are tagged `ArchX86_64` and, since that tag excludes nothing by itself,
+  each body says NOT RUN on the other targets, with why, and returns.
+
+**Finding 3 - the `driver-mutations` gate fails on the current tree before it counts anything (Medium): ACCEPTED.**
+- `src/tools/check-driver-mutations.sh`: the Bulk-Only stanza is anchored to the code as it reads now.
+- `src/tools/xhci_event_retention.py` and `src/tools/xhci-event-retention.rs`: the exact-source proof follows the HID
+  class into the `usb_input` module it moved to, with its class constants and its fixture (the `rt` alias, the sinks,
+  the HID constructor). The proof passes 20 of 20, and the gate's 166 anchors resolve.
+
+**Finding 4 - every USB release path closes DMA handles without unmapping them (Medium): ACCEPTED.**
+- `src/user/drivers/core/src/common.rs`: `release_dma` unmaps a mapped DMA buffer and then closes it - closing alone
+  gives nothing back while the process lives.
+- Every release of a ring, page or data buffer goes through it: `xhci.rs`, `usb_hid.rs`, `usb_net.rs`, `usb_storage.rs`,
+  `usb_serial.rs`, `usb_uas.rs`, `usb_audio.rs` (its port release now hands back the audio states with their devices),
+  `classes.rs`, `iso.rs` and the legacy core `usb_host.rs`.
+- The order is fixed with it: a detach disables the slot before its rings go; a storage, UAS or network configuration
+  that fails after the device was configured deconfigures it first (`xhci::deconfigure`, Configure Endpoint with DC); a
+  legacy pipe released while busy abandons its transfer first; an isochronous stream is stopped before its buffers go.
+- `src/idl/device.lsidl`: `binding-record` gains `dma-used` (appended; `./gen.sh --accept-breaking`), and DeviceManager
+  fills it from the binding's Domain, so `lsdev` prints what a driver holds.
+- `src/tools/check-usb-legacy.sh` reads it before the sticks and after each left, and requires UHCI's, OHCI's and EHCI's
+  to be what it was (`src/tools/usb-dma-readings.py`). The new `src/tools/check-usb-release.sh` (`usb-release`) does the
+  same for xHCI: the boot's stick out, a stick of its own plugged, read through `vol://usb` and taken out. It is
+  registered in `check.sh`, the verify-model catalogue and `release-required.toml`.
+- Watched failing: with `release_dma` closing without unmapping, every controller holds more after its stick left than
+  before it came - UHCI, OHCI and EHCI 36864 bytes, then 57344; the xHCI 106496, then 135168. On the tree: `usb-legacy`
+  PASS (32768, 28672 and 28672 bytes after each stick left, as before it came), `usb-release` PASS (77824).
+- Two defects of my own the runs found, both fixed before any result was taken from them: the readings' helper looked
+  for space-separated fields - it had been tried on a sample written by hand, not on `lsdev`'s output - and `lsdev`
+  prints a record's text form with commas, so it found no reading at all; and the stick `usb-release` plugged after the
+  boot read as missing its file. The second was the system's, and is fixed:
+- A STICK SWAPPED FOR ANOTHER WITH NO REQUEST BETWEEN THEM WAS READ THROUGH THE FIRST ONE'S MOUNT, on the xHCI. Its
+  block wire was one publication for every stick it carried, standing across a detach, and the USB volume lets a FAT
+  mount go only when its provider is withdrawn or a request fails; the legacy controllers publish each stick on its own.
+  The milestone's ownership table gives this detach work to the first item that attaches a USB child at runtime, which
+  the legacy controllers and the class modules are, so it is made here: `src/user/drivers/core/src/xhci.rs`
+  (`follow_disks`) withdraws the stick's publication when the stick leaves and offers it again at once under a fresh
+  token - standing and empty for the next stick, as at boot - and withdraws the UAS target's when the target leaves,
+  offering it under a fresh token when the next one arrives, as it was published at boot only when one was there; the
+  tokens come from the counter the class modules take theirs from (`Classes::take_token`), and the driver says what it
+  withdrew. `usb-release` no longer reads between the two sticks and requires that line: PASS (572 s) - the withdrawal
+  line at each departure, the second stick read as itself, and the xHCI holding 77824 bytes of DMA memory after the
+  stick left, as before it came; with the old driver it fails (the second stick's file "cannot open", and no withdrawal
+  line).
+
+**Finding 5 - the legacy-USB run loop serves a consumer by an index taken before `reconcile` + `follow` may have retired publications (Medium): ACCEPTED.**
+- `usb_host.rs`: the consumer is found again by its endpoint after `reconcile` and `follow`, so a stick that left during
+  I/O cannot hand its slot's request to another consumer.
+
+**Finding 6 - a root-port change seen by a wait inside a transfer is remembered, but the loop then blocks without acting on it (Medium): ACCEPTED.**
+- `usb_host.rs`: the loop takes a remembered port change at its top (`take_port_change` then `reconcile`) before it
+  waits, so OHCI's root-hub interrupt is not left masked until an unrelated wake.
+
+**Finding 7 - a holder of a shared wired line that goes away without its function's pin turned off unmasks a level line its controller may still be asserting (Medium): ACCEPTED.**
+- `src/kernel/object/interrupt.rs`: an interrupt object records the PCI function a platform line was acquired for
+  (`set_function`, called by `platform_line_acquire` in `syscall/mod.rs`), and its `Drop` disables that function's INTx
+  before it unbinds - so a holder that died or was killed cannot leave the line unmasked under an asserting controller.
+- `src/kernel/test_suites/platform_rows.rs`: the INTx test gains a holder whose handle is closed while its function
+  asserts, and requires the function's INTx to be disabled.
+
+**Finding 8 - NVMe's timeout branch has never run (Low): ACCEPTED.**
+- `src/user/drivers/core/src/nvme.rs`: the recovery is one function, `recovered`, over a `Recover` trait - down, reset,
+  issue, say - which the driver implements (`nvme_driver.rs`, whose `io` now calls it).
+- `nvme/tests.rs`: a model controller drives it - a command that times out is answered only after the controller is
+  reset and the command retried; an answered refusal is reported at once, and a controller that will not reset is issued
+  nothing. 31 `nvme` host tests; each new one watched failing under a mutation of `recovered`.
+
+**Finding 9 - one holder that does not acknowledge holds the shared line masked for every other holder and for the hot-plug port, with no bound (Low): REJECTED.**
+- Masking per function instead of per line is a different interrupt design for every shared-line holder, not a fix of
+  this milestone's code. The case that had no bound at all - a holder that went away still holding its pin asserted - is
+  bounded by finding 7. A live holder that never acknowledges is a driver defect; the cost to its line's neighbours is
+  stated in the milestone's Corrections of 2026-10-19.
+
+**Finding 10 - EHCI ships while the companion drivers it hands full- and low-speed devices to are development-only (Low): ACCEPTED (stated, not changed).**
+- `src/user/drivers/core/src/ehci.rs`: in a shipping image the hand-over says what it is - the device is left on a
+  companion controller this image does not drive.
+- `docs/todo/P02M0099.md`: the EHCI item says a shipping image drives high-speed devices only, which is the owner's to
+  change (staging OHCI/UHCI there, or holding EHCI back).
+
+**Finding 11 - class parity beyond HID and Bulk-Only storage on the legacy controllers is neither built nor recorded (Low): ACCEPTED (recorded).**
+- `usb_host.rs`'s header and the milestone say the legacy controllers carry the HID and Bulk-Only classes and that the
+  other classes are not built for them.
+
+**Finding 12 - `SYS_MEMORY_PLUG_STATE` writes at most 32768 block states but returns the region's full block count (Low): ACCEPTED.**
+- `src/kernel/mem/hotplug.rs`: `MAX_BLOCKS` = 32768 (64 GiB in 2 MiB blocks), and `check` refuses a larger region with
+  `TooMany`, so a region is never larger than one state call reports. `syscall/mod.rs` reads the bound from there.
+- `mem/hotplug/tests.rs`: the bound is held at 32768 blocks and refused at one more.
+
+**Finding 13 - a stopped virtio-crypto driver exits without destroying its sessions at the device (Low): ACCEPTED.**
+- `src/user/drivers/core/src/virtio_crypto.rs`: `Clients::destroy_all` destroys every client's sessions at the device,
+  and the driver calls it before it stops or exits.
+
+**Finding 14 - the ticked CDC-ECM/NCM item still says its oracle has not run (Low): ACCEPTED.**
+- `docs/todo/P02M0099.md`: the item records the run (`USB_GADGET=ncm`, PASS 2026-10-15).
+
+**Finding 15 - the milestone document points at audit files for its evidence (Low): ACCEPTED.**
+- `docs/todo/P02M0099.md`: every sentence that pointed at an audit file now names the retained evidence or says what was
+  done.
+
+**Also, found by the final runs and fixed:** `src/kernel/mem/hotplug.rs` and `src/kernel/object/balloon.rs` sat beside
+the `tests.rs` of their own directories, which `source-hygiene` refuses (it failed on them; both came with this
+milestone's virtio-mem and balloon work). Each is now its directory's `mod.rs`, unchanged; the gate is clean.
+
+**Also, found by the whole kernel suites on the final tree and fixed:** two kernel tests had not run since this
+milestone's restored items landed, and each pinned a list those items had grown.
+- `src/kernel/dma_policy/tests.rs` (`kernel.dma_policy.the_kernel_registry_is_the_manifest_migration_table`): the
+  persistent-memory driver declares `dma = "none"` - its range is memory it maps, and nothing it drives reaches the bus
+  - and the test still expected every driver it did not name to be trusted-untranslated; it failed on aarch64 ("nvdimm
+  carries the policy it declares": 0 where 2 was expected). `nvdimm` is named with the drivers that master nothing.
+- `src/kernel/test_suites/applications.rs` (the permission probes' summaries): PermissionManager's vocabulary gained
+  `host-share` with the host share, and every summary pins the whole vocabulary; the probes' expected denials did not
+  have it, and the x86_64 suite failed on the first of them. `host-share=deny` is in the shared list of later denials.
+
+**Verification:**
+- `host-tests` PASS (473 s, 5363 tests), the `nvme` suite among them - each new `nvme` test watched failing under a
+  mutation of `recovered`.
+- `driver-mutations` PASS on the final tree: 166 of 166 planted defects caught (718 s); the exact-source retention proof
+  20 of 20.
+- `usb-legacy` PASS (933 s) and `usb-release` PASS (574 s); with `release_dma` closing without unmapping, both fail on
+  their readings (UHCI, OHCI and EHCI 36864 then 57344 bytes; the xHCI 106496 then 135168).
+- `usb-release` again after the xHCI's disks took their publications with them, with no read between the two sticks:
+  PASS (572 s) - the withdrawal line at each departure, the second stick read as itself, and the xHCI holding 77824
+  bytes of DMA memory after the stick left, as before it came; against the old driver it fails (the second stick's file
+  "cannot open", and no withdrawal line). `driver-mutations` on that tree: PASS (708 s), 166 of 166 planted defects
+  caught.
+- Kernel: the selection of this pass's tests PASS on x86_64 (35) and on aarch64 and riscv64 (13 each), where the crypto
+  and balloon tests say NOT RUN with their reason. The balloon's floor with plugged memory online: PASS (963048 frames
+  taken, and 64411 left free against a floor of 64411, beside 4096 free plugged frames), and FAIL with the floor judged
+  against every frame (60571 frames left free against the floor of 64411 - 3840 below it - after 966888 taken). Watched
+  failing: the hot-plug bound ("one block more": `Ok` where `TooMany` is required) and the INTx release ("the pin of a
+  device still asserting it is off").
+- `source-hygiene` clean after the module move; `verify-model` consistent; `release-required.toml` regenerated from the
+  three targets' test kernels (377 keys, `gate.usb-release` among them).
+- Finding 9 is rejected.
+
+**Milestone status (verified after these changes):** COMPLETE for phase 2. Every item is done and every finding of this
+review is fixed but finding 9, which is rejected above with its reason. Recorded as decided, not open: a shipping image
+drives USB high-speed devices only (finding 10, the owner's to change), and the legacy controllers carry the HID and
+Bulk-Only classes (finding 11). The stale mount found by `usb-release` is fixed (finding 4), and finding 1's floor is
+driven by a test. Not tested on real hardware - not part of phase 2, by the owner's decision of 2026-10-13.

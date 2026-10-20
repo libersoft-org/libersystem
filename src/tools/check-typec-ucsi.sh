@@ -13,7 +13,8 @@
 #      configuration's SET_PDR refused and said; DisplayPort refused before any command without the override, then
 #      entered by the PPM on its own and reported; a connector status past its size and one naming connector 7, each
 #      refused and the PPM reset and read again; and two changes pending at once from a PPM that names each in one CCI
-#      only - the second in the acknowledgement of the first's status - both read and announced.
+#      only - the first in its notification, the second in the completion of the first one's status read - both read
+#      and announced.
 #   3. slow: the first reset and the two commands after it each over five seconds - the binding ready inside
 #      DeviceManager's deadline and its connectors published once the slow start is over.
 #   4. spoiling: a PPM that spoils its inbound copy once it has notified - an attach and a detach served as on the others.
@@ -271,12 +272,12 @@ await_line "the PPM failed (Connector(7))" "an answer naming connector 7 must be
 await_line "the PPM answers again after its reset" "and the PPM reset and read again" 1 60
 probe await 1 contract 9000
 # A CHANGE THE PPM NAMES ONCE: both connectors' detaches pending before either is named, each named in one CCI and never
-# again - the second only by the acknowledgement of the status that reads the first.
+# again - the first by the notification, the second by the next completion: the status read of the first.
 ppm "once on" >/dev/null
 ppm "detach-both" >/dev/null
 probe await 1 detached
 probe await 2 detached
-echo "typec-ucsi: v21: two changes the PPM named once each, the second only by an acknowledgement, both read and announced"
+echo "typec-ucsi: v21: two changes the PPM named once each, the second in the first one's status read, both read and announced"
 take_down
 
 # ------------------------------------------------------------------ 3. the slow PPM

@@ -102,6 +102,13 @@ impl Pending {
 
 static PENDING: SpinLock<Pending> = SpinLock::new(Pending::new());
 
+// ONE DELIVERY AT A TIME. `drain` reads the byte at the front, sends it, and only then takes it off the front - so two
+// at once both sent the same byte, and the second one's take removed a byte nobody had sent. Two at once is not
+// exotic: the idle hook's pass and the console line's handler on one core, or any two callers on two. Held across
+// the send, which the receive path already makes with interrupts masked; and a spin lock masks them on its own core,
+// so a handler cannot arrive inside a pass on the core holding it.
+static DELIVERING: SpinLock<()> = SpinLock::new(());
+
 // WHETHER INPUT IS HELD FOR A CONSOLE THAT HAS NOT TAKEN IT: an idle boot processor then sleeps one tick
 // at most, since its idle hook is what delivers the rest.
 pub fn held() -> bool {
@@ -199,6 +206,7 @@ fn enqueue(serial: bool, byte: u8) -> bool {
 /// immediately; the second is what empties the ring once the shell has read what it was given, which
 /// is the half that makes a burst arrive at all rather than merely arrive in order.
 pub fn drain() {
+	let _one = DELIVERING.lock();
 	let Some(channel) = listener() else { return };
 	loop {
 		let Some((serial, byte)) = PENDING.lock().front() else { return };

@@ -1386,3 +1386,16 @@ One Low documentation defect remains: the milestone points at its audit file for
   - "`host-tests` passed": cannot be checked statically.
   - Audit pointers in the milestone: found at :776 and :795 (finding 1). The run directory :795 names, `.build/logs/end-of-job/qemu-only-20261010-shared-host/kernel-media-review/p0197-current-runs/`, still exists.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0197 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the milestone document points at its audit file for the evidence of two runs (Low): ACCEPTED.**
+- `docs/todo/P02M0197.md`: the five sentences that sent the reader to the audit file (the status, and the 2026-10-15 and
+  2026-10-17 run records) now state the runs themselves - what ran, the result and the time - without the pointer.
+- Document only; no code changed.
+
+**Verification:** `grep -n "AI/audit\|appended audit\|the audit" docs/todo/P02M0197.md` finds nothing.
+
+**Milestone status (verified after these changes):** COMPLETE for phase 2. The one finding was the document's pointers
+at the audit, now removed. aarch64 PSCI SYSTEM_SUSPEND, PCI PME and network wake have no emulated oracle and are out of
+phase 2 with real hardware, by the owner's decision of 2026-10-13.

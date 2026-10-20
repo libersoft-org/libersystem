@@ -454,3 +454,58 @@ What remains:
   - `ipmi` passed (1639 s): consistent with the retained 2026-10-16 logs, though the PASS line is not retained. In case 7 the boot event is "Answered" (`/data/yellow/libersystem/.build/logs/ipmi/dev-serial.log:503-504`), and it is read back over the LAN in `oob-sel.log`.
   - Checked, not a finding: the supervisor status read (`bmc_service.rs:279`) still uses a fresh correlation-0 client with a 10 s deadline. The retained run shows one such timeout (`dev-serial.log:477`, "CommitUncertain"). That channel carries only `status`, so a late reply is an older snapshot of the same operation, and it delays the boot event by a few polls at most.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0201 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the rejection of the take-over-at-once requirement rests on an unexplained oracle failure, and the checklist still claims it (Low): ACCEPTED.**
+- The cause is found, and it is the simulator's. OpenIPMI 2.0.37 (the installed `ipmi_sim`): `handle_platform_event`
+  (lanserv/bmc_sensor.c) logs the event and writes neither a completion code nor a length, and `ipmi_mc_handle_msg`
+  (lanserv/bmc.c) hands it `unsigned char rdata[36]` uninitialised with `rdata_len = sizeof(rdata)`. So `ipmi_sim`
+  answers every Platform Event Message with 36 bytes of whatever its stack held, the first taken as the completion code,
+  and logs the event all the same.
+- Seen, not inferred: a run of the cross-check with the watchdog read ahead of the repository and `ipmi_sim -d -d -d`
+  (2026-10-19, retained in `.build/logs/ipmi-oob-debug/ipmi-sim-system-interface.log`). Through KCS the simulator
+  received Get Device ID, Get Device GUID (answered 0xC1), Get Watchdog Timer, Reserve SDR Repository and Get SDR for
+  record 0 of its empty repository, answered 0xCB. The boot's Platform Event Message came next and was answered with 36
+  bytes: `cb 01 00 00 00 00 00 00 00 00 02 0f 00 00 00 00 f0 db 7f 18 ff 7f 00 00 51 e2 27 60 cf 7f 00 00 29 00 00 00` -
+  that 0xCB, the tail of the Get Device ID answer before it, and two host pointers. In the original order the same
+  exchanges run with Get Watchdog Timer last, whose answer begins with 0x00 - which is all that made the event read as
+  accepted there. Nothing on the KCS or `ipmi-bmc-extern` path was at fault; the request went out as built and the
+  answer came back as the simulator sent it.
+- `src/user/drivers/core/src/ipmi_driver.rs`: the watchdog is the bind's first act. Get Watchdog Timer is read, and a
+  running timer taken over, before the BMC is identified or its repository read. The resume path already did this.
+- `src/tools/check-ipmi.sh`:
+  - 1c (ISA BT, the harness BMC) requires, from the harness BMC's record of what it received, Get Watchdog Timer before
+    Get Device ID and before any SDR repository command. Watched failing in a guest, on the order as it was: "Get
+    Watchdog Timer was command 28, Get Device ID 1, the repository's first 3" - the BMC was identified and its
+    repository read before the watchdog was asked about at all.
+  - 7 (the out-of-band cross-check) waits for the boot's event to be sent once and judges it by the record it made -
+    read inside with `bmc sel` and over the LAN with `ipmitool`, field by field, as before - and no longer by
+    `ipmi_sim`'s answer, which is undefined. The answer's own path stays asserted against QEMU's simulated BMCs and the
+    harness BMC in sections 1, 2 and 5.
+- `docs/todo/P02M0201.md`: the checklist item says the take-over is the bind's first act, the 2026-10-15 "tried and not
+  kept" entry points at its successor, and the Corrections of 2026-10-19 record the cause and the change.
+
+**Finding 2 - the milestone document points at its audit file (Low): ACCEPTED.**
+- `docs/todo/P02M0201.md`: both pointers are gone - the sentence that sent the reader to the audit for exact files,
+  commands and limitations, and the one saying the audit records the failed-before regression. The sentences around them
+  already say what was done.
+
+**Finding 3 - the IPMI executors' own lists of prepared operations are never pruned (Low): ACCEPTED.**
+- `src/user/drivers/core/src/admin_operation.rs`: `Operations::holds(operation)` answers whether the seam still holds a
+  preparation - one that has not started, been cancelled or expired.
+- `src/user/drivers/core/src/ipmi_driver.rs`: before each push, `sel_prepared` and `chassis_prepared` keep only the
+  operations the seam still holds (and drop the same id), so each list is bounded by the seam's `MAX_OPERATIONS` = 4
+  whatever the broker does.
+- `src/user/drivers/core/src/admin_operation/tests.rs`: `what_the_executor_let_go_of_it_no_longer_holds` - a started, a
+  cancelled and an expired preparation are no longer held, and a live one is. Watched failing: with `holds` answering
+  true for an id it let go of, the test fails.
+
+**Verification:**
+- `admin_operation` host tests (4), the new one watched failing.
+- `ipmi` PASS on the final tree (1713 s): the ISA BT case's order check passed, and in case 7 `ipmi_sim` answered the
+  boot's event 0xCB - as its handler leaves it - while the record read inside and over the LAN matched field by field.
+- `watchdog` PASS (1792 s), its BMC case taken over at bind; `qemu-ipmi-admin` PASS (1274 s), the erasure and the
+  chassis controls through the pruned executors.
+
+**Milestone status (verified after these changes):** COMPLETE. Every item is done and every finding is fixed.

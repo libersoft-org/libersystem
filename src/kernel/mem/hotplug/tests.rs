@@ -65,3 +65,54 @@ fn a_plugged_block_is_used_last_and_goes_offline_only_when_every_frame_is_free()
 	assert_eq!(state(index, &mut blocks), Some(4));
 	assert_eq!(blocks, [false; 4]);
 }
+
+crate::tagged_test!(a_balloon_stops_at_the_boot_pools_floor_while_plugged_memory_is_free, [Memory, Kernel], id = "kernel.mem.hotplug.a_balloon_stops_at_the_boot_pools_floor_while_plugged_memory_is_free", covers = ["kernel"]);
+// A BALLOON'S FRAMES COME FROM THE BOOT POOLS, so their floor is what stops it - and free plugged memory, which a balloon
+// never takes, must not keep its room open while they drain. Judged against every frame the machine has, sixteen
+// megabytes of free plugged memory let a host's target take the boot pools that far below the floor the kernel's heap,
+// page tables, stacks and DMA buffers are kept by. Driven to the end here: a plugged range online and free, and the
+// balloon asked for frames until it refuses.
+fn a_balloon_stops_at_the_boot_pools_floor_while_plugged_memory_is_free() {
+	use crate::mem::frame::{balloon_floor, balloon_return, balloon_take, boot_totals};
+	const BASE: u64 = 0x50_0000_0000;
+	const BLOCK: u64 = 2 * MIB;
+	const BLOCKS: usize = 8;
+	if !cfg!(target_arch = "x86_64") {
+		crate::serial_println!("hotplug: NOT RUN - plugged memory is x86_64's");
+		return;
+	}
+	let index = register(BASE, BLOCKS as u64 * BLOCK, BLOCK, &[]).expect("a range nothing has");
+	assert_eq!(online(index, 0, BLOCKS), Ok(()));
+	let plugged = totals();
+	let (total, _) = boot_totals();
+	let floor = balloon_floor(total);
+	// THE FRAMES TAKEN ARE KEPT IN A LIST THROUGH THEMSELVES: each holds the address of the one taken before it. A list
+	// on the heap would take what is being measured.
+	let hhdm = crate::mem::hhdm_offset();
+	let mut last: u64 = 0;
+	let mut taken = 0usize;
+	while taken < total {
+		let Some(frame) = balloon_take() else { break };
+		// SAFETY: a free frame the balloon took for this test; nothing else holds or maps it but the direct map.
+		unsafe { ((hhdm + frame) as *mut u64).write_volatile(last) };
+		last = frame;
+		taken += 1;
+	}
+	let (_, free) = boot_totals();
+	let stopped = free;
+	let still = totals();
+	// GIVEN BACK BEFORE ANYTHING IS ASSERTED, so a failure leaves the machine as it found it.
+	while last != 0 {
+		// SAFETY: written above; every frame in the list is one `balloon_take` handed this test, returned once.
+		let before = unsafe { ((hhdm + last) as *const u64).read_volatile() };
+		unsafe { balloon_return(last) };
+		last = before;
+	}
+	assert_eq!(offline(index, 0, BLOCKS), Ok(()), "the plugged range goes back offline");
+	assert!(taken > 0, "the balloon took frames before it stopped");
+	// AT THE FLOOR, give or take what the rest of the kernel allocated or freed while the test drained the pools.
+	assert!(stopped + 256 >= floor, "the balloon stopped at the boot pools' floor of {floor} frames, not below it: {stopped} left free after {taken} taken, with {} plugged frames free", plugged.1);
+	assert!(stopped <= floor + 256, "and not short of it: {stopped} left free against a floor of {floor}");
+	assert_eq!(still, plugged, "and it took none of the plugged frames, which were all still free");
+	crate::serial_println!("  the balloon took {taken} frame(s) and stopped with {stopped} free against the boot pools' floor of {floor}, beside {} free plugged frame(s)", plugged.1);
+}

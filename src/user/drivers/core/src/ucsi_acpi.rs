@@ -153,14 +153,16 @@ impl Ucsi {
 		self.capability.map_or(0, |capability| capability.connectors)
 	}
 
-	// ONE COMMAND under the discipline; a connector change it saw is kept for the loop to read. A change-acknowledging
-	// exchange's own change is the one it acknowledged - but whatever its acknowledgement's completion named came after
-	// that, and is kept like any other.
-	fn run(&mut self, command: Command, change_ack: bool) -> Result<Exchange, Failure> {
+	// ONE COMMAND under the discipline; a connector change it saw is kept for the loop to read. A read that acknowledges
+	// `acknowledges`' change drops only that one from its completion: a PPM names each pending change once, in whatever
+	// completion comes next, so the status read's own completion can name the NEXT connector's change, and dropping it
+	// lost that change for good. Whatever the acknowledgement's completion named came after it, and is kept like any
+	// other.
+	fn run(&mut self, command: Command, acknowledges: Option<u8>) -> Result<Exchange, Failure> {
 		let layout = self.layout;
 		let connectors = self.connectors();
-		let exchange = ucsi::execute(self, &layout, command, &[], connectors, change_ack)?;
-		let seen = if change_ack { [None, exchange.after] } else { [exchange.change, exchange.after] };
+		let exchange = ucsi::execute(self, &layout, command, &[], connectors, acknowledges.is_some())?;
+		let seen = [exchange.change.filter(|&number| Some(number) != acknowledges), exchange.after];
 		for number in seen.into_iter().flatten() {
 			if !self.changes.contains(&number) {
 				self.changes.push(number);
@@ -171,7 +173,7 @@ impl Ucsi {
 
 	// A command's answer, when it gave one; `None` for a command the platform does not support.
 	fn read(&mut self, command: Command) -> Result<Option<Vec<u8>>, Failure> {
-		match self.run(command, false)?.completion {
+		match self.run(command, None)?.completion {
 			Completion::Answered(data) => Ok(Some(data)),
 			Completion::NotSupported => Ok(None),
 			Completion::Error => {
@@ -183,7 +185,7 @@ impl Ucsi {
 	}
 
 	fn error_status(&mut self) -> Result<u32, Failure> {
-		match self.run(command::get_error_status(), false)?.completion {
+		match self.run(command::get_error_status(), None)?.completion {
 			Completion::Answered(data) => Ok(answer::error_status(&data).unwrap_or(0)),
 			_ => Ok(0),
 		}
@@ -197,7 +199,7 @@ impl Ucsi {
 		// CLEARED AT THE RESET, which is what ends every change before it - not after the configuration, whose commands
 		// can carry a change of their own, which the reads below then had to happen to name again.
 		self.changes.clear();
-		match self.run(command::set_notification_enable(command::NOTIFY_ALL), false)?.completion {
+		match self.run(command::set_notification_enable(command::NOTIFY_ALL), None)?.completion {
 			Completion::Answered(_) => {}
 			_ => return Err(Failure::Malformed),
 		}
@@ -242,7 +244,7 @@ impl Ucsi {
 		// Every connector is read again below, so what was queued before the sleep is read with it - and what the command
 		// that enables the notifications indicates is kept.
 		self.changes.clear();
-		match self.run(command::set_notification_enable(command::NOTIFY_ALL), false)?.completion {
+		match self.run(command::set_notification_enable(command::NOTIFY_ALL), None)?.completion {
 			Completion::Answered(_) => {}
 			_ => return Err(Failure::Malformed),
 		}
@@ -270,7 +272,7 @@ impl Ucsi {
 	}
 
 	fn configure(&mut self, command: Command, number: u8, what: &str) -> Result<(), Failure> {
-		match self.run(command, false)?.completion {
+		match self.run(command, None)?.completion {
 			Completion::Answered(_) => Ok(()),
 			Completion::NotSupported => {
 				self.say(&format!("connector {number}: {what} is not supported - its swaps stay as the platform set them"));
@@ -289,7 +291,7 @@ impl Ucsi {
 	fn read_port(&mut self, at: usize, change_ack: bool) -> Result<(), Failure> {
 		let number = self.ports[at].number;
 		let version = self.layout.version;
-		let status = match self.run(command::get_connector_status(number), change_ack)?.completion {
+		let status = match self.run(command::get_connector_status(number), change_ack.then_some(number))?.completion {
 			Completion::Answered(data) => ConnectorStatus::decode(&data, version).ok_or(Failure::Malformed)?,
 			_ => return Err(Failure::Malformed),
 		};
@@ -548,7 +550,7 @@ impl Ucsi {
 				(command::set_new_cam(number, enter, offset, pin.map_or(0, typec_ucsi::dp_configuration)), pin)
 			}
 		};
-		let completion = match self.run(command, false) {
+		let completion = match self.run(command, None) {
 			Ok(exchange) => exchange.completion,
 			Err(failure) => {
 				self.recover(failure);

@@ -862,3 +862,26 @@ AUDITOR'S RE-AUDIT ON P02M0184 (2026-10-18T17:29:39Z):
   - "`qemu-camera-service` passed": confirmed by /data/yellow/libersystem/.build/claude-work/implementer/runs/gate-qemu-camera-service.log. Every row passed, the handles returned to their baseline of 10, and the run came after the edit. It does not reach the fixed window.
   - Recorded under "Corrections of 2026-10-15": confirmed (P02M0184.md:216-222). It does not point at an audit, and the code carries no milestone ids.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0184 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the race fix is not exercised, and the claim that no deterministic oracle can reach the window is contradicted by the fixture's own held-answer mechanism (Low): ACCEPTED.**
+- The finding is right: the fixture can hold its answer, which is the window.
+- `src/idl/camera-device.lsidl`: the camera fixture's device interface gains `delay-negotiate` (op 9) - the next
+  negotiation's answer is held until it is released.
+- `src/user/drivers/core/src/camera_fixture.rs`: a negotiation asked while the hold is armed is answered only when it is
+  released, so the grant that asked can be retired while the provider holds its answer.
+- `src/user/services/core/src/camcheck.rs`: two steps. `retired` arms the hold, negotiates, ends the grant while the
+  answer is held, then releases it: no stream may be made for the retired grant. `free` then shows the camera free to
+  another grant - which is what the fix restores: before it, the camera answered `again` to every grant until the
+  service restarted.
+- `src/tools/check-camera-service.sh`: runs both steps and requires their lines.
+- `docs/todo/P02M0184.md`: the sentence that said no deterministic oracle reaches the window now says which one does.
+
+**Verification:**
+- `qemu-camera-service` PASS on the final tree (672 s), `camcheck retired` and `camcheck free` among its steps.
+- Watched failing: with the retired-grant check switched off, `retired` fails ("the negotiation answered after its grant
+  ended was not stopped at the provider") and so does `free` ("the camera is still held for a grant that ended").
+
+**Milestone status (verified after these changes):** COMPLETE. Every item is done and the finding is fixed, the race
+driven by `camcheck retired` and `camcheck free`.

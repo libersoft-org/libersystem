@@ -1969,3 +1969,46 @@ Separately, four harness lines still carry the milestone id.
   - Fixes found while gating: confirmed. `le_pairing_over` is at le.rs:387, 391 and 405-411, with the matching clear in `on_disconnected` at bluetooth_service.rs:1393-1397. `own_type` counts a pending address (le.rs:78-80). `btgatt` accepts "hello". Both exact-source proofs are updated.
   - Gate runs: the independent run /data/yellow/libersystem/.build/logs/bluetooth-independent/20261016-000657 was imaged at 02:09 on 2026-10-16, after the last Bluetooth source edit (le.rs, 01:51). It holds 70 scenario records through bond persistence and forget, which is consistent with the stated pass. The other guest gates log to temporary directories, so their passes could not be checked.
 - **Not done.** This was a static review only: nothing was built or run. The stall and call-deadline changes in BluetoothService (`CALL_TICKS`, `end_stalled`, `btclassic stall`) belong to other milestones' corrections, and were read here only for regressions.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0194 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the standing attempt's accept-list rebuild is one burst into a 16-command queue, so five or six absent bonded LE peripherals get no standing attempt at all (Medium): ACCEPTED.**
+- `src/user/services/core/src/bluetooth_service/le.rs`: the rebuild is now a queue of its own (`LeState::rebuild`, a
+  `VecDeque` of the clear, the resolving-list and accept-list adds and the enable), with `arming` saying the standing
+  attempt follows it; `clear_rebuild` drops what is left of it.
+- `src/user/services/core/src/bluetooth_service.rs`: `reconnect_bonded` fills that queue instead of sending the burst,
+  and `feed_rebuild` - run from the event pump - moves it into the controller's command queue while it leaves
+  `REBUILD_HEADROOM` (4) free for what a link needs meanwhile, its encryption above all. The attempt itself is queued
+  once the lists are all in. A command the queue refuses ends the rebuild rather than leaving half a list. So any number
+  of bonded peripherals up to the controller's list size gets its standing attempt.
+- `src/tools/bluetooth_le_reconnect.py` and `src/tools/bluetooth-le-reconnect.rs` (the exact-source proof): updated for
+  the queued rebuild; its cases include more bonded peers than the burst could hold.
+
+**Finding 2 - the standing attempt is not taken up again after its own failed completion, nor after an operator connection the controller refuses at Command Status (Low): ACCEPTED.**
+- A standing attempt that completes in failure on its own - a peripheral that missed its first connection events (0x3E),
+  say - is taken up again after `REARM_TICKS` (1 s): `rearm_at` is set, `run_timers` re-arms when it is due and
+  `next_deadline` wakes for it. The pause is what keeps a controller that fails it every time from a loop. A completion
+  with `STATUS_UNKNOWN_CONNECTION` (0x02) is the host's own cancellation and is not re-armed.
+- An operator's connection the controller refuses at Command Status had set the standing attempt aside and never
+  completes, so `on_status` now takes the standing attempt up again there.
+
+**Finding 3 - the `relist` and `rotate` marks can outlive the cancellation they were set for, and no oracle exercises rotation while the attempt is out (Low): ACCEPTED.**
+- The marks are consumed where the cancellation they were set for ends: on the success path a connection that overtook
+  the cancellation takes `rotate` (the address is rotated before the standing attempt is armed again, behind the link's
+  encryption) and the rebuild then takes `relist`; `set_aside` and a refused command clear both when nothing is out for
+  them to be consumed by.
+- The exact-source proof gains a case that rotates the private address while the standing attempt is out, and the
+  "rearmed" order is now `[then, Relist]`. `bluetooth-le-audio-identity.rs` follows the `VecDeque` rebuild.
+
+**Finding 4 - the milestone id is still written in four lines of the milestone's own oracle harness (Low): ACCEPTED.**
+- `src/harness/bluetooth-oracles.md`, `src/harness/bluetooth_classic_peers.py` (two places) and
+  `src/harness/prepare-bluetooth-oracles.py` say what they are instead of naming the milestone.
+
+**Verification:**
+- The exact-source proofs pass - the reconnect proof with the rotation case and more bonded peers than the burst could
+  hold, the LE Audio identity proof - and `bluetooth-le` PASS (605 s), `bluetooth-le-audio` PASS (656 s) and
+  `bluetooth-service` PASS (1117 s) on the final tree.
+
+**Milestone status (verified after these changes):** COMPLETE for phase 2. Every part is done and every finding is
+fixed. The ports cross-build the stack and do not run it, by design; not tested on real hardware - not part of phase 2,
+by the owner's decision of 2026-10-13.

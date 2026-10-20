@@ -797,3 +797,27 @@ The retained logs show `processor-power` (519 s), `acpi` and `host-tests` passin
   - Gate change (`powerctl status` before awaiting C001 at 50): confirmed (check-processor-power.sh:303-310). The broadcast IPI is at /data/yellow/libersystem/src/kernel/mem/tlb.rs:69-136.
   - `processor-power` 519 s, `acpi`, `host-tests`: supported by .build/claude-work/implementer/runs/processor-power-1016.log (RESULT ok, 519 s), gate-acpi.log (RESULT ok) and gate-host-tests.log (144 suites, RESULT ok).
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0198 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the processor handshake still offers software coordination of C-states (`_CSD`, bit 0x0040) (Low): ACCEPTED.**
+- `src/user/libs/acpi/model/src/handshake.rs`: `PROCESSOR_SUPPORT` is now `0x0002 | 0x0008 | 0x0010 | 0x0100 | 0x0200 |
+  0x0800` (0x0B1A).
+  - 0x0040 is gone: nothing evaluates `_CSD`, and each core enters its idle state on its own decision.
+  - 0x1000 is gone too. The finding asked to confirm it: bit 12 of the processor capabilities is collaborative processor
+    performance control (Linux's `ACPI_PROC_CAP_COLLAB_PROC_PERF`, set for HWP), whose `_CPC` registers are
+    model-specific. It is not `_PPC` notification, which the old comment called it, and nothing here implements it. CPPC
+    itself is negotiated through the platform-wide `_OSC` and is unchanged.
+  - The comment now names exactly the forms the kernel executes: C1 as a halt, SMP C1 and C2/C3, the MWAIT hints and
+    hardware coordination of P-states.
+- `src/user/libs/acpi/model/src/tests.rs`: the handshake test now also requires bits 0x0040 and 0x1000 to be clear,
+  beside 0x0020 and 0x0080.
+- `docs/todo/P02M0198.md`: "Corrections of 2026-10-19" records the change.
+
+**Verification:**
+- The acpi model's 28 host tests pass, and `host-tests` passed on the final tree.
+- Watched failing: with 0x0040 put back into `PROCESSOR_SUPPORT`, the handshake test fails.
+- Not rerun: `processor-power` and `acpi` (see the results below if they were run at the end of the job). The ACPI
+  fixture's `_OSC` and `_PDC` do not read these two bits.
+
+**Milestone status (verified after these changes):** COMPLETE. Every item is done and the finding is fixed.

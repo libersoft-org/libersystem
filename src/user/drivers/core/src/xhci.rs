@@ -509,6 +509,9 @@ struct Xhci {
 	// A ROOT PORT WHOSE DEVICES ARE TO BE TAKEN DOWN AND ENUMERATED AGAIN although nothing was unplugged: a DFU
 	// target that waits for the host's reset after a detach, which that enumeration's port reset is.
 	redo_port: Option<u32>,
+	// A STICK OR A UAS TARGET THAT LEFT, which the loop owes a change of publication - see `follow_disks`.
+	stick_left: bool,
+	uas_left: bool,
 }
 
 // One addressed USB device: its slot, root-hub port, route string (the hub-port
@@ -980,7 +983,7 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_RUN | CMD_INTE);
 		wait_clear(op + OP_USBSTS, STS_HCHALTED)?;
 
-		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new(), net_rx: None, net_pending: None, net_notify_rx: None, net_notify_pending: None, hid_rx: Vec::new(), hid_pending: Vec::new(), serial_rx: [None; usb_serial::MAX_PORTS], serial_pending: [None; usb_serial::MAX_PORTS], class_rx: Vec::new(), class_pending: Vec::new(), audio_rx: Vec::new(), audio_pending: Vec::new(), redo_port: None })
+		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new(), net_rx: None, net_pending: None, net_notify_rx: None, net_notify_pending: None, hid_rx: Vec::new(), hid_pending: Vec::new(), serial_rx: [None; usb_serial::MAX_PORTS], serial_pending: [None; usb_serial::MAX_PORTS], class_rx: Vec::new(), class_pending: Vec::new(), audio_rx: Vec::new(), audio_pending: Vec::new(), redo_port: None, stick_left: false, uas_left: false })
 	}
 }
 
@@ -1845,6 +1848,75 @@ fn touching(hids: &Hids) -> bool {
 // The token the gamepad publication holds: its position in the handshake's offer list.
 const GAMEPAD_TOKEN: u16 = 9;
 
+// THE TOKENS THE TWO BLOCK WIRES ARE PUBLISHED UNDER NOW: the stick's, which always stands, and the UAS target's,
+// when one is bound. They start as their positions in the handshake's offer list and move to fresh tokens as disks
+// leave - see `follow_disks`.
+struct Disks {
+	stick: u16,
+	uas: Option<u16>,
+}
+
+// A DISK THAT LEFT TAKES ITS PUBLICATION WITH IT.
+//
+// StorageService's USB volume follows a disk by the publication it was opened through: it lets a mount go when that
+// provider is withdrawn, or when a request fails. The stick's publication used to stand across a detach - it answers
+// with an error status while nothing is behind it - so a stick swapped for another with no request between them
+// was read through the first one's mount: its directory, its allocation table, and a write landing on the second
+// stick as the first one's filesystem. So the stick's publication is withdrawn when the stick leaves and offered
+// again at once under a fresh token, standing and empty for the next stick as it stood at boot; and the UAS
+// target's is withdrawn when the target leaves and offered under a fresh token when the next one arrives, as it was
+// published at boot only when one was there. The legacy controllers publish each disk the same way.
+#[allow(clippy::too_many_arguments)]
+fn follow_disks(hc: &mut Xhci, disks: &mut Disks, uas_bound: bool, pending: &mut Unpublished, classes: &mut classes::Classes, bootstrap: u64, bind: &common::Bind, serving: &mut common::Serving) {
+	if core::mem::take(&mut hc.stick_left) {
+		// THE CONNECTIONS FIRST, as a class device's are: a consumer holding one would otherwise keep a channel to a
+		// disk that is gone.
+		serving.retire(disks.stick);
+		common::withdraw(bootstrap, bind, disks.stick);
+		match publish_disk(classes, bootstrap, bind, serving) {
+			Some(token) => {
+				disks.stick = token;
+				print(b"driver.xhci: the stick left - its block wire is withdrawn and offered again for the next one\n");
+			}
+			None => print(b"driver.xhci: the stick left and its block wire could not be offered again - a stick plugged in now is not published\n"),
+		}
+	}
+	if core::mem::take(&mut hc.uas_left)
+		&& let Some(token) = disks.uas.take()
+	{
+		serving.retire(token);
+		common::withdraw(bootstrap, bind, token);
+		print(b"driver.xhci: the UAS target left - its block wire is withdrawn\n");
+	}
+	// A TARGET THAT ARRIVED: under the token the handshake reserved, the first time, and under a fresh one after that.
+	if uas_bound && disks.uas.is_none() {
+		if pending.uas != 0 {
+			if common::offer(bootstrap, bind, driver_protocol::provider::BLOCK, 4, pending.uas) {
+				pending.uas = 0;
+				disks.uas = Some(4);
+			}
+		} else {
+			disks.uas = publish_disk(classes, bootstrap, bind, serving);
+		}
+	}
+}
+
+// One block wire, offered under a fresh token; the token, or None when there was none to give or no room for it.
+fn publish_disk(classes: &mut classes::Classes, bootstrap: u64, bind: &common::Bind, serving: &mut common::Serving) -> Option<u16> {
+	let token = classes.take_token()?;
+	let (near, far) = channel()?;
+	if !serving.publish(token, near) {
+		close(near);
+		close(far);
+		return None;
+	}
+	if !common::offer(bootstrap, bind, driver_protocol::provider::BLOCK, token, far) {
+		serving.retire(token);
+		return None;
+	}
+	Some(token)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, mut network: Option<(UsbDevice, Net)>, mut uas: Option<(UsbDevice, Uas)>, mut audio: usb_audio::Devices, mut serials: usb_serial::Serials, mut classes: classes::Classes, blk_server: u64, usbq: u64, pointer: u64, net_server: u64, uas_server: u64, audio_server: u64, serial_server: u64, serial2_server: u64, touch_server: u64, gamepad_server: u64, mut pending: Unpublished, irq: u64) -> ! {
 	unsafe {
@@ -1901,6 +1973,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 		// THE CLASS DEVICES FOUND AT BOOT ARE PUBLISHED NOW, after the handshake: their tokens are fresh ones and
 		// not positions in the list above, so they are live offers like a device plugged in later.
 		classes.settle(hc, &mut hids, bootstrap, bind, &mut serving);
+		let mut disks = Disks { stick: 0, uas: if uas.is_some() { Some(4) } else { None } };
 		loop {
 			// THE COMPLETIONS A SYNCHRONOUS WAIT KEPT ARE TAKEN BEFORE THIS LOOP SLEEPS, and not after it wakes.
 			//
@@ -1929,6 +2002,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			if hc.redo_port.is_some() {
 				reconcile_ports(hc, slots, &mut hids, &mut storage, &mut network, &mut uas, &mut audio, &mut serials, &mut classes);
 				classes.settle(hc, &mut hids, bootstrap, bind, &mut serving);
+				follow_disks(hc, &mut disks, uas.is_some(), &mut pending, &mut classes, bootstrap, bind, &mut serving);
 			}
 			// AND A HANDOFF WHOSE DEVICE DID NOT COME BACK is answered and withdrawn once its deadline passes.
 			if classes.waiting() {
@@ -2181,9 +2255,8 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 						pending.net = 0;
 					}
 				}
-				if pending.uas != 0 && uas.is_some() && common::offer(bootstrap, bind, driver_protocol::provider::BLOCK, 4, pending.uas) {
-					pending.uas = 0;
-				}
+				// AND A DISK THAT LEFT OR ARRIVED, ITS PUBLICATION - see `follow_disks`.
+				follow_disks(hc, &mut disks, uas.is_some(), &mut pending, &mut classes, bootstrap, bind, &mut serving);
 				// AND A TOUCH SURFACE THAT WAS PLUGGED IN AFTER THE REPORT. A HID arrives by
 				// hot-plug like anything else, and a digitizer that appears later is the ordinary
 				// case rather than the exception - the publication reserved its token for exactly
@@ -2203,7 +2276,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			let common::ProviderReady::Consumer(at) = ready else { continue };
 			let server = serving.at(at);
 			let closed = match serving.token_at(at) {
-				0 => match try_recv(server, &mut req) {
+				token if token == disks.stick => match try_recv(server, &mut req) {
 					Polled::Message { len, handle } if len >= 16 => {
 						match storage.as_mut() {
 							Some((dev, st)) => serve_block_request(hc, &mut hids, dev, st, server, &req, handle),
@@ -2263,7 +2336,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 					Polled::Empty => false,
 					Polled::Closed => true,
 				},
-				4 => match try_recv(server, &mut req) {
+				token if Some(token) == disks.uas => match try_recv(server, &mut req) {
 					Polled::Message { len, handle } if len >= 16 => {
 						match uas.as_mut() {
 							Some((dev, target)) => {
@@ -2277,7 +2350,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 								// ONLY CONSUMERS THAT ARE ALREADY READY, and only while a tag is free, so this
 								// waits for nobody: it takes what is already queued, up to the cap.
 								for other in 0..serving.as_slice().len() {
-									if other == at || serving.token_at(other) != 4 || !usb_uas::has_free_tag(target) {
+									if other == at || Some(serving.token_at(other)) != disks.uas || !usb_uas::has_free_tag(target) {
 										continue;
 									}
 									let peer = serving.at(other);
@@ -2481,6 +2554,7 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 			st.release();
 			hc.budget.release(ClassKind::Storage);
 			*storage = None;
+			hc.stick_left = true;
 		}
 		if let Some((dev, target)) = uas.as_mut()
 			&& dev.port == port
@@ -2489,6 +2563,7 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 			target.release();
 			hc.budget.release(ClassKind::Uas);
 			*uas = None;
+			hc.uas_left = true;
 		}
 		if let Some((dev, net)) = network.as_mut()
 			&& dev.port == port

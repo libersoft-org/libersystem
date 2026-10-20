@@ -1009,3 +1009,53 @@ Every pinned digest I recomputed matches the tree. What remains is one gap the i
   - Guest and port runs (foreign-loader-guest x86_64 PASS, icd-selection, foreign-facilities-guest, riscv64 and aarch64 kernel test): not confirmable statically. No logs are kept; the gate's work directory is removed on exit.
   - The aarch64 2400 s hang: the cause is unexplained, as the response itself says, and a static reading cannot settle it. abiprobe never goes through the new negotiation code.
 - **Not done.** This was a static review only: nothing was built or run. I used read-only inspection only: tool version queries, `llvm-nm`/`llvm-readelf`/`llvm-objcopy` section dumps to /dev/null, and recomputing digests. No file was changed.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0135 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the admitted interface-version set and the third-export refusal can still be bypassed through the ported loader's `VK_LUNARG_direct_driver_loading` path, yet the milestone is marked COMPLETE (Medium): ACCEPTED.**
+- Verified first: in the derived tree `vkCreateInstance` scans drivers before it validates extensions, the scan calls
+  `loader_scan_for_direct_drivers`, and `loader_add_direct_driver` negotiates at 7 with the application's lookup and
+  takes `vk_icdGetPhysicalDeviceProcAddr` from it - no substrate in between; in exclusive mode it skips the record's
+  scan.
+- `src/foreign/patches/0002-platform-port.patch` gains three `loader.c` hunks under `__LiberSystem__`:
+  - `loader_scan_for_direct_drivers` calls nothing: a `VkDirectDriverLoadingListLUNARG` in the create info is ignored,
+    exclusive mode stays off, and the record's scan runs as it always does;
+  - `loader_add_direct_driver` is removed rather than left unreachable - a path nothing calls is still a path the
+    closure admits;
+  - the extension is no longer advertised, so with a driver that creates instances an instance that ENABLES it is
+    refused with `VK_ERROR_EXTENSION_NOT_PRESENT` by upstream's own validation, which runs after the scan and before any
+    driver is created (read from the code; the guest's driver stops the loader earlier - below).
+  The patch's description says so; the external symbol surface does not change (the path called only the loader's own
+  functions and the pointers it was handed).
+- `src/foreign/PIN-derived.toml`: the 0002 digest, the pass-2 inventory digest and the three ELF sizes refrozen (x86_64
+  618152 to 614720 bytes, aarch64 639992 to 636504, riscv64 957784 to 952816; the relink of all three targets left every
+  other field of the inventory as it was - 52 symbols asked, 48 from the substrate, 12 runtime references, no TLS).
+- `src/user/apps/tools/src/vkprobe.rs`: step 9 lists the instance extensions and creates an instance enabling the
+  extension with a `VkDirectDriverLoadingListLUNARG` (exclusive mode) naming the slot-bound driver's own
+  `vk_icdGetInstanceProcAddr` through a counting shim. It reports whether the extension was advertised, the result, and
+  how often the lookup was called.
+- `src/tools/check-foreign-loader-guest.sh` requires "direct driver loading not advertised", "direct driver lookups=0",
+  "direct driver loading refused", and the creation's result to be the ordinary instance's in that guest, 4294967287
+  (`VK_ERROR_INCOMPATIBLE_DRIVER`).
+- Corrected on the final run: I had required 4294967289 (`VK_ERROR_EXTENSION_NOT_PRESENT`), from reading upstream's
+  order
+  - extensions are validated after the driver scan. The guest answered `VK_ERROR_INCOMPATIBLE_DRIVER`, as its ordinary
+  instance does: its synthetic driver implements nothing, so the loader stops before the validation. The probe's verdict
+  is now "not created, and the lookup never called"; the -7 for a driver that creates instances stays a reading of the
+  code, not a run. With the port as it was, the same step showed the path live: the extension listed and the
+  application's lookup called once (the same -9 result).
+- `docs/todo/P02M0135.md`: the "NOT COVERED" note is closed by the Corrections of 2026-10-19.
+- Also, under the owner's rule on milestone ids: the three PIN files, the bootstrap sysroot's README (whose tree digest
+  is refrozen in `PIN-bootstrap.toml`, "for a README change and nothing else"), `check-foreign-pin.sh` and
+  `docs/DEPENDENCY_POLICY.md` no longer name the milestone.
+
+**Verification:**
+- Host: the discovery and foreign crates' suites pass in `host-tests`.
+- The relink of all three targets reproduces the recorded inventory; `foreign-pin`, `foreign-audit-link`,
+  `foreign-audit-artifact` and `foreign-cxx-abi` PASS; `icd-selection` PASS (473 s).
+- `foreign-loader-guest` PASS (477 s): "direct driver loading not advertised", "direct driver instance
+  result=4294967287", "direct driver lookups=0", "direct driver loading refused". On the port as it was: advertised, the
+  same result, "direct driver lookups=1", "NOT refused" - the path was live.
+
+**Milestone status (verified after these changes):** COMPLETE. Every item is done and every finding is fixed, with
+`foreign-loader-guest` showing the direct-driver path refused on the final tree.

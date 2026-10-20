@@ -2506,3 +2506,113 @@ Three of the catalogue item's own gates are still unbuilt, and the milestone doe
   - Owner decision, shared pixels: `1-(1-a)(1-b)` is in the oracle and stated in the milestone, and the kernel test requires shared pixels. Confirmed.
   - No milestone IDs appear in the changed code.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0136 (2026-10-19T22:00:37Z):
+
+All four findings were verified against the code and accepted. The engine changes follow OpenType's own rules as HarfBuzz
+implements them; every expectation below is computed from a face's design, not recorded from a run.
+
+**Finding 1 - lookup flags are applied only to the glyph a lookup starts at, and `useMarkFilteringSet` and `markAttachmentType` are not applied at all (Medium): ACCEPTED.**
+- `src/user/libs/text/font-shape/src/layout.rs`:
+  - the six flags by name, and `Lookup::skips(info)` reading all of them against what `GDEF` says of a glyph - its
+    class, a mark's attachment class, and for `useMarkFilteringSet` the named mark glyph set (`MarkSets`, from `GDEF`
+    1.2's `MarkGlyphSetsDef`; a set the face does not have holds no mark);
+  - `Lookup::next` and `Lookup::previous`, the one skipping walk every glyph after a match's first is found through;
+  - the layout tables carry the face's mark glyph sets (`with_mark_sets`), and a lookup carries them to its subtables.
+- `src/user/libs/text/font-shape/src/shape.rs`: `GDEF` is read once per run (glyph classes, `MarkAttachClassDef`, mark
+  glyph sets); every glyph gets its class and its mark attachment class; the classes are read again after every
+  substitution lookup that changed something; and the lookup is handed to every subtable.
+- `gsub.rs`: a ligature's components are the next glyphs the lookup sees (`Buffer::ligate_components` keeps what was
+  skipped and records, under the ligature's number, which component each kept mark followed); the reverse chain's
+  backtrack and lookahead skip the same way.
+- `context.rs`: the input, backtrack and lookahead of all six contextual formats are matched through the walk; a matcher
+  answers the positions it found, a sequence index names the glyph found there, and a nested substitution that changes
+  the run's length moves the later positions by HarfBuzz's rule (`reposition`).
+- `gpos.rs`: a pair's second glyph and a cursive join's other half are found through the walk.
+- `gpos.rs` `mark_to_ligature`: the component is the recorded one, else the last - no longer the clusters' byte
+  difference.
+- Corpus: the alpha face gains an accent and a fatha (appended, no glyph moves), its `rlig` ignores marks, and cases pin
+  an accent between a kerned pair and a fatha inside and after lam-alef.
+- Tests: `font-shape` gains five tests for the flags - a ligature across a mark and its component, a pair across a mark
+  with and without the flag, a contextual rule matching across marks in input, backtrack and lookahead and applying
+  where it matched, the mark set and the attachment class each naming the marks a lookup sees, and ignore-bases and
+  ignore-ligatures.
+
+**Finding 2 - mark-to-mark attachment crosses a base to an earlier letter's mark, and positions the mark against the pen of the mark it hangs from rather than where that mark is drawn (Medium): ACCEPTED.**
+- `gpos.rs`: type 6 looks at the ONE glyph before the mark - the nearest the lookup sees once only the marks it does not
+  name are passed over - and that glyph must be a mark of the same base or the same ligature component (HarfBuzz's id
+  and component rule); a base ends the search.
+- `gpos.rs` `propagate`, run once positioning is done: a mark takes its parent's offsets and is moved back over the
+  final advances the pen crossed from the parent, the parent included - so a stacked mark is drawn from where its parent
+  is drawn, a base moved by a placement carries its marks, and a kerning rule after the mark rule is accounted for. The
+  mark rules themselves now record only the anchors' difference.
+- `src/user/libs/text/font-run/src/produce.rs`: the right-to-left correction follows a mark's chain to the glyph it
+  finally hangs from, adding each link's change; `textconf`'s judge of it (`drawn_offset`) does the same from the
+  authored expectations.
+- Corpus: the complex face gains `mkmk` (Thai's tone mark on its upper vowel), with a stacked case and a case where the
+  tone mark follows the next consonant and must not climb the vowel before it.
+- Tests: `font-shape` - a mark on a mark placed where its parent is drawn, a mark after a base not hanging from the
+  previous letter's mark, a placed base carrying its mark; `font-run` - a right-to-left mark on a mark corrected link by
+  link.
+
+**Finding 3 - cursive attachment has only left-to-right arithmetic, applied to the three right-to-left cursive scripts, while the status says every item is implemented (Medium): ACCEPTED.**
+- `shape_run` takes the run's direction (`Buffer::right_to_left`); `text-pipeline` passes the run's level, and the
+  corpus checks pass the case's.
+- `gpos.rs` `cursive`: HarfBuzz's arithmetic for both directions - along the line, left to right the glyph before ends
+  at its exit and this one starts at its entry; right to left the glyph before starts at its exit and this one ends at
+  its entry, both through the advances. Across the line the `rightToLeft` flag (0x0001) decides the parent - set, each
+  glyph hangs from the one after it and the last stays on the baseline; clear, the other way - a glyph already hanging
+  is re-rooted with its old chain reversed (`reroot`), and a parent hanging from its new child is separated. The
+  cross-stream offsets are carried along the chain in `propagate`.
+- Corpus: the alpha face carries a right-to-left `curs` lookup with the `rightToLeft` flag over beh and jeem, and "three
+  give all four forms their turn" now pins the three letters' joins: advances 480, 400, 560, offsets -40/-180, -30/-120
+  and 0/0.
+- Tests: `font-shape` - a right-to-left word joined letter to letter with and without the flag, and a left-to-right one
+  carrying each shift to the next; each checks that every join's anchors meet where the glyphs are drawn.
+- `docs/todo/P02M0136.md`: the "OPEN" note on cursive attachment is closed by the Corrections of 2026-10-19.
+
+**Finding 4 - three of the catalogue item's own gates are still unbuilt, and the milestone keeps the item ticked without saying so (Low): ACCEPTED - the three gates are built.**
+- `src/kernel/test_suites/applications.rs`: a new kernel test,
+  `kernel.applications.the_font_catalogue_refuses_a_face_replaced_behind_it_and_keeps_nothing_of_a_client`, runs one
+  catalogue in a Domain of its own, with its font directory carried through the test.
+  - The `Factory` route: a connection minted the way the supervisor's bootstrap mints a `factory` role (CONNECT on the
+    SERVE root end it keeps, narrowed to send, receive, wait and transfer) is handed to `lsfont`, which lists the
+    installed faces through it. No manifest row takes that role today, so the test stands in for the supervisor, as it
+    already does when it starts the catalogue. The granted route is the corpus test's: `textconf` is now handed a
+    connection minted fresh from the root and narrowed to the grant's rights, as PermissionManager hands one to an
+    application, instead of the root itself with every right.
+  - The RESOLVE-INTO race with the hint dropped: the test answers the catalogue's watch with a stream nothing is ever
+    sent on. The face is replaced, with a declaration naming the new bytes, after its INFO. RESOLVE-INTO under the
+    identity and generation INFO answered is refused as stale with a new generation, and the caller's object is left as
+    it was handed. The next LIST names the face under the new bytes' identity and no longer the old one, and INFO
+    answers it at that generation. The hint then delivered late makes the catalogue read its directory again, and the
+    generation does not move.
+  - The retained faces and the handle count: a client process in a Domain of its own retains eight resolved faces of 256
+    KiB. Its Domain carries exactly the eight objects' pages, the catalogue's Domain is where it was, and the
+    catalogue's handle count is the same after every resolve. Four refusals are typed and leave the objects as they were
+    handed and the catalogue's table and Domain as they were: an object too small (answered with the length the face
+    needs), a stale generation (answered with the current one), a handle that is not a memory object, and one without
+    `write` (both denied). When the client exits, its Domain is back where it started, with the catalogue doing nothing.
+- Watched failing, each against a catalogue changed to do what the gate forbids:
+  - answering only on its roots: `lsfont` is never answered ("lsfont listed and left");
+  - with no digest check: RESOLVE-INTO answers `Filled(262144)` under the old identity;
+  - keeping the caller's handle across the reply: the handle count grows (10 where 9 were held);
+  - keeping a copy of every face it hands over: its Domain grows by a heap region, 1 MiB, at the second resolve (the
+    check that came first then was the handle count, which the region's mapping also moved; the Domain is checked first
+    now, so each change is reported as what it is).
+- `docs/todo/P02M0136.md`: the catalogue item records the three gates as built and the status line no longer excepts
+  them.
+
+**Verification:**
+- `font-shape` 41 host tests, `font-run` 13, `text-pipeline` 22, `font-gen --check`; thirteen mutations of the new
+  engine code each caught by a host test.
+- `text-corpus` PASS (41 cases over 4 pinned faces; seven deliberate shaper defects each caught by the case aimed at
+  it), on the final tree.
+- In the guest, `kernel.applications.the_text_stack_draws_its_corpus_to_the_analytic_oracle` PASS: the Latin corpus to
+  the analytic oracle at both sizes, and 10 script cases and the paragraph shaped, laid out and drawn exactly as
+  authored, now with the connection a grant gives an application.
+- In the guest, `kernel.applications.the_font_catalogue_refuses_a_face_replaced_behind_it_and_keeps_nothing_of_a_client`
+  PASS (19 s in the guest), and FAIL against each of the four changed catalogues (above).
+
+**Milestone status (verified after these changes):** COMPLETE. Every item is implemented, all four findings are fixed,
+and the three catalogue gates that were missing are built; the status line no longer excepts anything.

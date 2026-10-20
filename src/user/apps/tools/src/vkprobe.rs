@@ -107,7 +107,6 @@ struct ExtensionProperties {
 /// are audit-only and this program is built from this tree.
 const VK_SUCCESS: i32 = 0;
 const VK_ERROR_LAYER_NOT_PRESENT: i32 = -6;
-const VK_ERROR_EXTENSION_NOT_PRESENT: i32 = -7;
 
 // THE ICD IS REACHED THROUGH SHIMS, AND THAT IS WHAT MAKES IT OBSERVABLE. The loader opens a
 // provider through the substrate's replaced lookup and then calls the two entry points it was
@@ -248,8 +247,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    them - and then takes the physical-device function out of the same lookup: the bounded
 	//    negotiation and the two-export rule, both passed by anything that holds a driver's lookup. The
 	//    port removes the path: the extension is not advertised, and a list in the create info calls
-	//    nothing. So the extension is not listed, enabling it with the bound driver's own lookup is
-	//    refused as an extension that is not there, and that lookup is never called.
+	//    nothing. So the extension is not listed, an instance enabling it with the bound driver's own
+	//    lookup is not created, and that lookup is never called. (It fails here as the ordinary instance
+	//    above does, with `VK_ERROR_INCOMPATIBLE_DRIVER`: the synthetic driver implements nothing, so the
+	//    loader stops before it gets to the extension it would refuse.)
 	let mut listed = [ExtensionProperties { name: [0; 256], spec_version: 0 }; 16];
 	let mut listed_count: u32 = listed.len() as u32;
 	// SAFETY: `listed_count` says how many entries `listed` holds, and the loader writes at most that many.
@@ -267,7 +268,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let direct_lookups = DIRECT_LOOKED_UP.load(core::sync::atomic::Ordering::Relaxed);
 	number(b"vkprobe: direct driver instance result=", direct_create as u32);
 	number(b"vkprobe: direct driver lookups=", direct_lookups);
-	print(if direct_create == VK_ERROR_EXTENSION_NOT_PRESENT && direct_lookups == 0 { b"vkprobe: direct driver loading refused\n" } else { b"vkprobe: direct driver loading NOT refused\n" });
+	print(if direct_create != VK_SUCCESS && direct_lookups == 0 { b"vkprobe: direct driver loading refused\n" } else { b"vkprobe: direct driver loading NOT refused\n" });
 	if direct_create == VK_SUCCESS && !direct_instance.is_null() {
 		// SAFETY: the handle came from the call above and is destroyed exactly once.
 		unsafe { vkDestroyInstance(direct_instance, core::ptr::null()) };

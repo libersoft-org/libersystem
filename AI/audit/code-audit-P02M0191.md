@@ -331,3 +331,53 @@ What remains: the gate's round-trip check cannot fail on a command the shell ref
   - x86_64 PASS with the sleep step: the sleep is confirmed in the retained log (2905 ms). The same run's kernel-path and post-enable round trips were refusals (finding 1).
   - aarch64 in 450 s and riscv64 in 505 s, with the 2998 ms timed wake: the sleep lines are confirmed in both port logs (aarch64 :529-554, riscv64 :588-611). The durations cannot be checked statically.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0191 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the handoff gate's round trips accept a refused command, and in the latest x86_64 PASS the round trip through the kernel's own path and the one after the enable both failed (Medium): ACCEPTED.**
+- `src/tools/check-serial-handoff.sh`: a round trip passes only when the word comes back as its own whole line and the
+  shell did not answer "unknown command". The word anywhere in the output passed a command the shell refused, whose
+  error quotes it back.
+- `src/harness/scenario.py`: the `serial-sh` step reads only what the command printed after its echo, and refuses an
+  "unknown command" answer the same way.
+- Watched failing, on the outputs the review quoted: the old `round_trip` passes "unknown command: cho handoff-7",
+  "eecho handoff-7" followed by its refusal, and an output that is only the command's echo; the new one refuses all
+  three and passes the answered round trip. The old and new `serial-sh` predicates were put to the same four outputs,
+  with the same result.
+- `src/kernel/main.rs`: one interleaving that reorders received bytes, found by reading, is closed. The serial pump's
+  two sites - `serial_console_pump` and `console_shell_loop` - read a byte and queued it as two steps with interrupts
+  enabled between them, while the console line's interrupt handler (`wired_line_interrupt`) does the same pair on the
+  same core: one taken between them puts the rest of a burst ahead of the byte just read. `take_serial_byte` reads and
+  queues as one step with interrupts masked, and both sites use it.
+- THE GARBLED ROUND TRIP IS REPRODUCED, and its cause is the interleaving above. An ordinary run reaches the window
+  rarely: the pump has to win a burst's first byte, which it does only when the burst lands while its own read holds the
+  line with interrupts masked - which is why four ordinary runs, one of them with a spin widening the wrong gap (after
+  the read, when the line's handler has already taken the burst), never garbled. A reproduction, never kept, made the
+  pump win: when the kernel took COM1 back from the disabled binding it left the UART's receive interrupt off, so the
+  next burst waited in the FIFO and the pump's polling read took its first byte, and then the receive interrupt was
+  turned on again with the rest of the burst still waiting.
+  - With the byte queued as the code did before - after interrupts were open again - the shell received "cho
+    handoff-through-the-kernel", answered "unknown command: cho handoff-through-the-kernel", and the "e" arrived after
+    the line, where it began the next command - the reviewed run's refusals - and the gate failed on it (186 s).
+  - With the byte queued the tree's way - read and queued under one mask - the same timing passed (serial-handoff PASS,
+    195 s, "handoff-through-the-kernel" answered as its own line).
+  - A first form of the reproduction waited for the burst with interrupts masked; it held the boot processor long enough
+    that the disable's own reply never came back, and both of its runs were discarded.
+- `src/kernel/console_input.rs`: a second ordering defect on the same path, found while reading it for the first, is
+  closed. `drain` - which the receive path calls for every byte it queues, and the idle hook calls to empty what a full
+  console left waiting - read the byte at the front, sent it, and only then took it off the front; two at once (the idle
+  hook's pass and the line's handler on one core, or any two callers on two) both sent the same byte, and the second
+  take removed one nobody had sent. Deliveries now hold one lock across the whole pass (`DELIVERING`). The kernel test
+  `kernel.console.two_deliveries_at_once_hand_the_console_every_byte_once_and_in_order` queues a numbered stream on one
+  core while a second core delivers in a loop, and requires the console to receive exactly what was queued: 40000 bytes
+  received once each and in order, beside 1468502 delivery passes on the second core; with the ring as it was, the
+  console received 76915 bytes for the 40000 queued, different from the second byte on.
+
+**Verification:**
+- The predicates, old and new, on the review's outputs (above).
+- The reproduction, both ways (above).
+- `serial-handoff` PASS on the final tree (198 s), with the masking and the single delivery in.
+
+**Milestone status (verified after these changes):** COMPLETE. Every item is done and the finding is fixed: the gate
+refuses a refused command, the garbled round trip's cause is reproduced and closed, and a second way for input to be
+reordered on the same path is closed with it (above).

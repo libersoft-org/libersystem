@@ -3987,3 +3987,93 @@ What remains:
   - **qemu-3d-demo pass: confirmed** by `.build/logs/qemu-3d-demo.tbDaCY`: rebuilt=3, max 622 and total 1866 allocations, and `present_max_us` 11617/9620/9181 in the 640x480 runs.
   - **The failed run: confirmed** by `.build/logs/qemu-3d-demo.7vUoI4`; its cause is still open (finding 1).
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0103 (2026-10-19T22:00:37Z):
+
+**Finding 1 - a live resize to 480x800 was lost in the milestone's own gate, recorded as "not reproduced" with no cause (Medium): ACCEPTED.**
+- The cause, found by reading the retained failed run (`.build/logs/qemu-3d-demo.7vUoI4`) against the code: the resize
+  was not lost - the demo LEFT. `test3d-sw` ended its loop on any refused present. A resize that lands between an
+  acquire and its present makes that frame one of a generation that no longer exists: DisplayService rebuilds the
+  surface's image slots with the new generation and refuses a present of an old one (`Invalid`). The demo then printed
+  its summary (`presented 237 frame(s) rebuilt=1`, `scene 1024x768`) and exited; the window stayed cleared, and the
+  cleanup's own resize back to 1280x800 was not followed either - which no other link in the review's list explains. In
+  the passing runs the resizes simply did not land in that window (the overlay composite, about a sixth of each frame).
+- `src/user/apps/tools/src/test3d_sw.rs`: a refused present is counted with the refused acquires (the loop gives up only
+  on `ACQUIRE_REFUSALS` in a row with nothing presented between them) and the loop goes on to the rebuild the
+  configuration already asked for; the run reports how many presents were refused that way.
+- The links the review named are made diagnosable, as the minimal fix asked:
+  - `src/user/services/core/src/display_service.rs` logs every device `Resized` it accepts or drops (with the
+    framebuffer's size), every `Replaced` it adopts or drops, every native surface's reconfiguration (extent,
+    generation, serial), a configuration event a full stream dropped, and a stream that failed and was closed;
+  - a present settled as `ReplacedByResize` is now released on PRESENT_DONE too, as every completion is - settled only
+    as an event, a dropped event left it in flight for good to a loop waiting on PRESENT_DONE.
+- Not changed: the virtio-gpu serve loop acknowledges the display event and re-arms its interrupt before it reads the
+  size, so a change racing the read raises a new interrupt; a re-read without one is not needed.
+- THE WINDOW IS DRIVEN IN A TEST, not waited for. `src/kernel/tests.rs`: the kernel tests' DisplayService stand-in
+  (`SurfaceHost`) now does what DisplayService does with a present of an image acquired before a reconfiguration - it
+  refuses it as invalid - and counts what it refused. `src/kernel/test_suites/applications.rs`
+  (`kernel.applications.the_3d_demo_renders_a_lit_scene_and_survives_a_resize`) moves the surface while the demo holds
+  an acquired image, which is the window the failed run fell into, and requires exactly one refused present, the demo's
+  "1 present(s) refused ... and the loop went on", a rebuild and further presents. On the tree: 7 frames presented,
+  rebuilt=1, one present refused. Watched failing: with the demo leaving its loop on a refused present, as it did, it
+  stops after four presents with no rebuild ("the display stopped answering"), and the test fails.
+- `qemu-3d-demo` PASS three times on the final tree (187, 191 and 184 s). None of those runs hit the window; the test
+  above drives it on every run.
+
+**Finding 2 - graph reach is still silently capped at 256 px, and the claim that this cap is documented is untrue (Low): ACCEPTED.**
+- `src/user/libs/graphics/soft2d/src/backend.rs` `graph_reach`: the cap is gone. The bounds map is walked node by node
+  from one pixel; a `Crop` is asked as the pixel itself (its answer depends on where the pixel is, and the most it reads
+  anywhere is the pixel), and a `Tile` reaches everything (it reads its rectangle whatever pixel it writes - the probe
+  at the origin could not express that, so a tile far from the rectangle read nothing, even inside the old cap). A reach
+  too large to state, or a sum that overflowed, is the whole target. `margins` still stops every need at the target's
+  larger side, and a frame whose surfaces that makes too large for the prepared scratch is refused before it draws.
+- `src/user/libs/graphics/soft2d/src/tests.rs`: `a_graph_that_reaches_past_any_one_node_is_right_at_every_tile_boundary`
+  draws an offset of 300 pixels, two offsets of 150 and a blur, and a tile of a rectangle at the corner, across a
+  640x192 target, against the same picture with the movement taken away - in the float target to the bit and the
+  eight-bit one to the byte, and through every pool and unit kind. Watched failing: all six drawings differed on the old
+  reach. (The same-tile scenes of `a_filtered_layer_is_the_same_picture_wherever_the_tiles_cut_it` cannot hold a
+  300-pixel reach, so this is a test of its own.)
+
+**Finding 3 - the every-pixel comparison mask is applied in only 8 of the 112 conformance scenes (Low): ACCEPTED.**
+- `src/user/libs/graphics/conformance2d/src/`: every scene whose expected picture is exact at every pixel now compares
+  the whole target - 56 of the 112:
+  - `compositing.rs`: the thirteen operators and the fifteen blend modes;
+  - `filters.rs`: colour matrix, composite, blend, both morphologies, displacement, crop and tile (`whole`), beside the
+    blur, shadow and backdrop that already did;
+  - `geometry.rs`: both fill rules and the rectangle; `clipping.rs`: the rectangle, nested and inverse clips
+    (`harness::white_where`);
+  - `images.rs`: the source rectangle, nearest, the three spreads and opacity;
+  - and, as before, the three layer scenes, the coverage fill and one paint scene.
+  `Frame::holds` had no caller left and went.
+- Watched failing: a dilation that grows only across passed the old probes and fails the new comparison at (10, 10).
+- `docs/todo/P02M0103.md` names the 56 that still read probes and why: curves, strokes, glyphs and the rounded, path and
+  alpha-mask clips (an analytic area needs a second, exact rasteriser); gradients and patterns, the sampled and
+  converted image scenes, the transforms and the output scenes (each needs its function evaluated per pixel); the
+  convolution (its weights cancel, and the profile does not state what a divisor of zero or an out-of-range value
+  becomes); and the queries, which draw nothing.
+
+**Finding 4 - milestone ids remain outside docs/todo in this milestone's own files, and the milestone's head still points at its audit file (Low): ACCEPTED.**
+- `docs/PERF.md`'s sections and `src/user/apps/tools/src/test2d_sw.rs` name what they record instead of the milestone.
+- `docs/todo/P02M0103.md`: the pointer at the audit is gone, every other sentence that sent the reader to the audit says
+  what was done instead, and the 2026-10-09/10 continuation paragraphs under the status are marked as superseded by the
+  2026-10-12 completion.
+
+**Also, found by the whole kernel suites on the final tree and fixed:** the 2D demo's kernel test
+(`kernel.services.the_2d_demo_draws_a_real_scene_with_real_damage`) failed once in the aarch64 suite with "a display
+resources reply: Empty", and passed when run alone. Its last check asks DisplayService what the demo left, and the
+helper it used waits one scheduler pass for the answer; DisplayService answers nothing while its present of the restored
+console waits for the display's acknowledgement, which only the test loop gives, as the display's stand-in. A question
+asked between two of the loop's acknowledgements found the service inside a present.
+`src/kernel/test_suites/services.rs`: the test asks and then waits, bounded, answering the presents and the focus
+requests while it does. It passes on x86_64 (26 s) and aarch64 (46 s).
+
+**Verification:**
+- `soft2d` 48 host tests; the new tile-boundary test fails on the old reach in all six of its drawings.
+- On the target the 2D profile conforms (112 passed, 0 failed), and the 3D demo's kernel test passes with the resize
+  inside the acquire-to-present window, and fails against the demo that left on a refused present (finding 1).
+- `qemu-3d-demo` PASS three times on the final tree (above).
+
+**Milestone status (verified after these changes):** COMPLETE. Every item is done and all four findings are fixed; the
+resize window is driven by a kernel test on every run. What finding 3 allowed to be named instead of built is named in
+the milestone: 56 of the 112 conformance scenes compare the whole target and the other 56 read probes, each group with
+its reason.

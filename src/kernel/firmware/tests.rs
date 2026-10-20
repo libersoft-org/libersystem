@@ -412,7 +412,8 @@ fn a_namespace_row_s_ports_are_minted_from_its_claim_and_never_over_a_bar_or_a_b
 // AN EMBEDDED CONTROLLER AN ECDT DESCRIBES: the instance mints its two ports by address for early access, and the
 // walk then reports the controller's node as firmware-held over those same ports - which is published, because they
 // are the instance's own. The same ports as a claimable row are refused, and so is a firmware-held row over ports the
-// instance never minted.
+// instance never minted. The claimable row is asked FIRST: asked after the firmware-held row, a description over the
+// same ports is taken for that row's device and merged into it, and never reaches the admission.
 #[cfg(target_arch = "x86_64")]
 crate::tagged_test!(a_firmware_held_row_may_name_ports_its_instance_minted_and_no_other_row_may, [Drivers, Kernel, Syscall, ArchX86_64], id = "kernel.firmware.a_firmware_held_row_may_name_ports_its_instance_minted_and_no_other_row_may", covers = ["kernel"]);
 #[cfg(target_arch = "x86_64")]
@@ -425,13 +426,13 @@ fn a_firmware_held_row_may_name_ports_its_instance_minted_and_no_other_row_may()
 		let data = invoke(abi::SYS_PORT_RANGE_FIRMWARE, firmware, 0x62, 1, 0);
 		let command = invoke(abi::SYS_PORT_RANGE_FIRMWARE, firmware, 0x66, 1, 0);
 		assert!(data > 0 && command > 0, "the instance mints the controller's ports by address ({data}, {command})");
+		let mut claimable = namespace_description(b"acpi:\\_SB_.TST_.EC1_", abi::PLATFORM_STATE_CLAIMABLE, crate::dma_policy::SYNTHETIC_PLATFORM_HID);
+		assert!(claimable.add_port(0x62, 1));
+		assert_eq!(device_report(firmware, claimable), syscall::ERR_ACCESS_DENIED, "the instance's ports as a claimable row would be a driver's, and are refused");
 		let mut ec = namespace_description(b"acpi:\\_SB_.TST_.EC0_", abi::PLATFORM_STATE_FIRMWARE_HELD, b"PNP0C09");
 		assert!(ec.add_port(0x62, 1) && ec.add_port(0x66, 1), "the port ranges fit");
 		let row = device_report(firmware, ec);
 		assert!(row > 0, "the firmware-held node over its instance's own ports is published ({row})");
-		let mut claimable = namespace_description(b"acpi:\\_SB_.TST_.EC1_", abi::PLATFORM_STATE_CLAIMABLE, crate::dma_policy::SYNTHETIC_PLATFORM_HID);
-		assert!(claimable.add_port(0x62, 1));
-		assert_eq!(device_report(firmware, claimable), syscall::ERR_ACCESS_DENIED, "the instance's ports as a claimable row would be a driver's, and are refused");
 		// The test build's exit port, which the reserved set holds and no row describes.
 		let mut stranger = namespace_description(b"acpi:\\_SB_.TST_.EC2_", abi::PLATFORM_STATE_FIRMWARE_HELD, b"PNP0C09");
 		assert!(stranger.add_port(0xf4, 1));

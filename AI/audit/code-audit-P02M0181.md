@@ -962,3 +962,15 @@ AUDITOR'S RE-AUDIT ON P02M0181 (2026-10-18T17:39:37Z):
   - **The milestone records the correction:** confirmed (`P02M0181.md:276-282`).
   - **`host-tests`, the `acpi` gate and the aarch64/riscv64 builds:** not re-run. The milestone records the first two (`P02M0181.md:281-282`). It does not record the builds.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0181 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the milestone's status line sends the reader to the audit file for its evidence (Low): ACCEPTED.**
+- `docs/todo/P02M0181.md`: the status line no longer points at the audit. It says what was done and where the evidence
+  is recorded in the milestone itself.
+- Nothing else changed: the fix is to the document only.
+
+**Verification:** `grep -n "AI/audit\|appended audit\|the audit" docs/todo/P02M0181.md` finds nothing.
+
+**Milestone status (verified after these changes):** COMPLETE. The one finding was the status line's pointer at the
+audit, now removed; the milestone's evidence is recorded in it.

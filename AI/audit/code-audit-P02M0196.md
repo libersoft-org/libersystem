@@ -789,3 +789,40 @@ Three Low items remain, and none of them changes behaviour on QEMU:
   - "`acpi` passed twice (325 s, 344 s)": the retained 2026-10-16 log shows both rounds (GSBW/GSBR) and the FWCF merge. The durations and the other run are not in the tree.
   - "`sleep` passed" and "`host-tests` passed": cannot be checked statically. The disarm has no gate oracle, as the plan says.
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0196 (2026-10-19T22:00:37Z):
+
+**Finding 1 - the firmware-held/ECDT port admission has no test, although a runnable in-guest oracle exists (Low): ACCEPTED.**
+- `src/kernel/firmware/tests.rs`:
+  `kernel.firmware.a_firmware_held_row_may_name_ports_its_instance_minted_and_no_other_row_may` (x86_64). The firmware
+  instance mints an embedded controller's two ports (0x62, 0x66) by address, as for an ECDT, and its walk reports the
+  controller's node as firmware-held over them: published. The same ports as a CLAIMABLE row are refused
+  (`ERR_ACCESS_DENIED`), and so is a firmware-held row over a port the instance never minted (the test build's exit
+  port).
+- Its first run on the final tree failed, and so did the variant meant to watch it fail - for the same reason, which was
+  the test's: it asked for the claimable row after the firmware-held one, and a description over the same ports is taken
+  for that row's device and merged into it (the device table's identity rule), so it never reached the admission. The
+  claimable row is now asked first. Watched failing now that it reaches the admission: with every row allowed to name
+  the instance's own ports, the claimable row is published (row 41) where -5 is required. On the tree it passes, alone
+  and in the selection with the claim test.
+
+**Finding 2 - the step-1 claim test depends on which tests ran before it, and fails in scoped selections (Low): ACCEPTED.**
+- `src/kernel/device.rs`: a test's own description, placed through `add_synthetic_platform_row`, is no longer placed
+  against a row the ACPI service published (`PLATFORM_SOURCE_ACPI`), as the suite's console row already is not. A
+  `#[cfg(test)]` flag marks that one placement, under the table's lock. Whether the service had run by then was the
+  order a selection put the tests in: the test's COM2 row merged into the service's COM2 row when it had - and failed on
+  an identity that was the service's - and became a row of its own when it had not.
+- Watched failing: with the flag's condition switched off, the selection the review named -
+  `kernel.boot.init_package_starts_system_manager` then the claim test - fails as the review saw: `init_package` passes,
+  and the claim test's row carries `acpi:\_SB_.PCI0.SF8_.COM2` where `kernel:test-platform-claim` was required.
+
+**Finding 3 - the corrections record describes a refusal the test does not make (Low): ACCEPTED.**
+- `docs/todo/P02M0196.md`: the two sentences now describe what the tests do - and the new ECDT test is the one that
+  makes the refusal of a firmware-held row over ports the instance never minted.
+
+**Verification:**
+- The selection of this pass's kernel tests PASS on x86_64 (35): the ECDT test, the firmware suite, and the claim test
+  after `kernel.boot.init_package_starts_system_manager`.
+
+**Milestone status (verified after these changes):** COMPLETE for phase 2. Every item is done and every finding is
+fixed. Not tested on real hardware - not part of phase 2, by the owner's decision of 2026-10-13.

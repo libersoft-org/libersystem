@@ -6622,11 +6622,13 @@ struct SurfaceHost {
 	done: Option<alloc::sync::Arc<object::channel::Channel>>,
 	/// How many events have been sent, which is the sequence number each frame carries.
 	event_seq: u32,
+	/// How many presents were refused for a configuration that had moved after their image was acquired.
+	refused: usize,
 }
 
 impl SurfaceHost {
 	fn new(display: alloc::sync::Arc<object::channel::Channel>, width: u32, height: u32) -> SurfaceHost {
-		SurfaceHost { display, surface: None, images: alloc::vec::Vec::new(), acquired: None, width, height, serial: 1, generation: 1, next_present: 1, presents: 0, last_whole: false, focus_proof: None, kept: alloc::vec::Vec::new(), events: None, done: None, event_seq: 0 }
+		SurfaceHost { display, surface: None, images: alloc::vec::Vec::new(), acquired: None, width, height, serial: 1, generation: 1, next_present: 1, presents: 0, last_whole: false, focus_proof: None, kept: alloc::vec::Vec::new(), events: None, done: None, event_seq: 0, refused: 0 }
 	}
 
 	fn pitch(&self) -> u32 {
@@ -6854,9 +6856,18 @@ impl SurfaceHost {
 				reader.finish().expect("and the damage is the whole request");
 				self.last_whole = damage.whole;
 				// BOTH MUST MATCH THE ACKNOWLEDGED CONFIGURATION AT ACCEPTANCE, which is what stops
-				// a frame drawn for one size from ever being shown at another.
-				assert_eq!(serial, self.serial, "a present names the configuration serial it was drawn for");
-				assert_eq!(generation, self.generation, "and the generation its image belongs to");
+				// a frame drawn for one size from ever being shown at another. One that does not is
+				// REFUSED as DisplayService refuses it - `invalid`, nothing consumed - because it is
+				// no client fault: a frame drawn while the configuration moved under it presents the
+				// generation it was drawn for, and the client has to go on from the refusal.
+				if serial != self.serial || generation != self.generation {
+					self.refused += 1;
+					let mut reply = corr.to_le_bytes().to_vec();
+					reply.push(0);
+					reply.extend_from_slice(&display_v1::Error::Invalid.encode_vec().expect("an error encodes"));
+					surface.send(Message::new(reply, alloc::vec::Vec::new())).expect("a present refusal");
+					return None;
+				}
 				assert_eq!(self.acquired, Some(image), "a present CONSUMES an acquired image");
 				self.acquired = None;
 				let accepted: u64 = self.next_present;

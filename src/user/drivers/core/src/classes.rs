@@ -590,6 +590,17 @@ impl Classes {
 		self.bound.iter().map(|bound| bound.module.inventory())
 	}
 
+	/// A fresh token for a publication this hold does not own - the controller's own disks, offered again when one
+	/// left (see `xhci.rs`) - from the same counter, so no two publications of this binding ever share one.
+	pub fn take_token(&mut self) -> Option<u16> {
+		let token = self.next_token;
+		if token == u16::MAX {
+			return None;
+		}
+		self.next_token += 1;
+		Some(token)
+	}
+
 	pub fn owns(&self, token: u16) -> bool {
 		token >= FIRST_TOKEN && (self.bound.iter().any(|bound| bound.published && (bound.token == token || bound.second == token)) || self.pending.iter().any(|pending| pending.token == token))
 	}
