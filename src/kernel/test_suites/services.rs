@@ -831,6 +831,55 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	fn closed(stream: &Channel) -> bool {
 		matches!(stream.recv(), Err(ChannelError::PeerClosed))
 	}
+	// WHAT THE SERVICE SAYS ONCE IT HAS HAD THE TIME TO SAY IT. One pass was the time it was given, and on the emulated
+	// targets - the service on another core - a pass could end before it had read the driver at all: the events are
+	// read until `want` have come, or the bound of passes is spent and the assertion that follows says what came.
+	fn settled(stream: &Channel, want: usize, pump: &mut dyn FnMut()) -> alloc::vec::Vec<GamepadEvent> {
+		let mut out = events(stream);
+		for _ in 0..200 {
+			if out.len() >= want {
+				break;
+			}
+			pump();
+			out.extend(events(stream));
+		}
+		out
+	}
+	// The same for a stream the service is about to close: every event it held, once it has closed or the bound is spent.
+	fn until_closed(stream: &Channel, pump: &mut dyn FnMut()) -> alloc::vec::Vec<GamepadEvent> {
+		let mut out = events(stream);
+		for _ in 0..200 {
+			if stream.is_peer_closed() {
+				break;
+			}
+			pump();
+			out.extend(events(stream));
+		}
+		out.extend(events(stream));
+		out
+	}
+	// A focus change's acknowledgement, waited for the same way.
+	fn acknowledged(channel: &Channel, pump: &mut dyn FnMut()) -> alloc::vec::Vec<u8> {
+		for _ in 0..200 {
+			if let Ok(message) = channel.recv() {
+				return message.bytes;
+			}
+			pump();
+		}
+		panic!("the focus change was never acknowledged");
+	}
+	// A frame sent the way a driver sends one: a channel the service has not read yet is waited on, not overrun - what
+	// falls behind in these steps is meant to be the reader, never the driver.
+	fn drive_through(driver: &Channel, frame: alloc::vec::Vec<u8>, pump: &mut dyn FnMut()) {
+		for _ in 0..200 {
+			match driver.send(Message::new(frame.clone(), alloc::vec::Vec::new())) {
+				Ok(()) => return,
+				Err(ChannelError::Full) => pump(),
+				Err(error) => panic!("a driver frame: {error:?}"),
+			}
+		}
+		panic!("the service never read its driver's channel");
+	}
 	// A request that hands a capability over and answers with one - or refuses with the correlation alone.
 	fn call(client: &Channel, op: u16, corr: u32, proof: Option<alloc::sync::Arc<Channel>>, pump: &mut dyn FnMut()) -> Option<alloc::sync::Arc<Channel>> {
 		let mut request = alloc::vec::Vec::new();
@@ -918,9 +967,15 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	// TWO GAMEPADS FROM ONE PROVIDER, with no report yet.
 	drive(&driver_a, arrival(1, b"pad a1"));
 	drive(&driver_a, arrival(2, b"pad a2"));
-	for _ in 0..4 {
+	// Until the service has read both: four rounds were not always enough on an emulated target, and a pad
+	// read after the stream opens is announced as an arrival rather than in the opening snapshot.
+	for _ in 0..200 {
+		if driver_a.peer_unread() == Some(0) {
+			break;
+		}
 		pump();
 	}
+	assert_eq!(driver_a.peer_unread(), Some(0), "InputService read both arrivals");
 
 	// THE CONSOLE PROGRAM'S CONNECTION: the gamepad scope, on which only `observe-gamepads` works.
 	let pads = call(&input_admin, 2, 50, None, &mut pump).expect("a gamepad-scope connection");
@@ -929,7 +984,7 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	assert!(call(&pads, 2, 52, Some(forged), &mut pump).is_none(), "and the key stream");
 	assert!(call(&service_client, 5, 53, None, &mut pump).is_none(), "and `observe-gamepads` is refused on every other scope");
 	let console = call(&pads, 5, 54, None, &mut pump).expect("the console stream opens while no surface holds focus");
-	let opening = events(&console);
+	let opening = settled(&console, 4, &mut pump);
 	assert_eq!(opening.len(), 4, "a present and a state for each gamepad there: {opening:?}");
 	let (a1, a2) = match (&opening[0], &opening[2]) {
 		(GamepadEvent::Present(first), GamepadEvent::Present(second)) => {
@@ -947,8 +1002,7 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 
 	// A STATE ON ONE REACHES THE CONSUMER UNDER THAT ID ALONE.
 	drive(&driver_a, state(2, 1 << 2, 8, MID));
-	pump();
-	let pressed = events(&console);
+	let pressed = settled(&console, 1, &mut pump);
 	assert_eq!(pressed.iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 4, alloc::vec![8])], "button 3 on the second, and nothing for the first");
 
 	// A THIRD FROM A PROVIDER PUBLISHED LATER on the subscription InputService kept open.
@@ -960,7 +1014,7 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	for _ in 0..2 {
 		pump();
 	}
-	let arrived = events(&console);
+	let arrived = settled(&console, 2, &mut pump);
 	let b1 = match arrived.first() {
 		Some(GamepadEvent::Arrived(pad)) => pad.id,
 		other => panic!("the later provider's gamepad arrives: {other:?}"),
@@ -986,8 +1040,7 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	drive(&driver_a, departure(1));
 	drive(&driver_a, state(2, 0, 8, MID));
 	drive(&driver_b, state(1, 0, 2, MID));
-	pump();
-	let after = events(&console);
+	let after = settled(&console, 3, &mut pump);
 	assert!(matches!(after.first(), Some(GamepadEvent::Departed(id)) if *id == a1), "{after:?}");
 	assert_eq!(after.iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 0, alloc::vec![8]), (b1, 0, alloc::vec![2])]);
 
@@ -996,20 +1049,19 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	for _ in 0..2 {
 		pump();
 	}
-	let gone = events(&console);
+	let gone = settled(&console, 1, &mut pump);
 	assert!(matches!(gone.as_slice(), [GamepadEvent::Departed(id)] if *id == b1), "{gone:?}");
 
 	// A SURFACE TAKING FOCUS RELEASES THE CONSOLE STREAM'S HELD BUTTONS AND CLOSES IT.
 	drive(&driver_a, state(2, 1, 8, MID));
-	pump();
-	assert_eq!(events(&console).iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 1, alloc::vec![8])]);
+	assert_eq!(settled(&console, 1, &mut pump).iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 1, alloc::vec![8])]);
 	let (forged, _forged_peer) = Channel::create();
 	assert!(call(&service_client, 4, 60, Some(forged), &mut pump).is_none(), "the graphical stream refuses a forged proof");
 	let (proof, registered) = Channel::create();
 	send_cap(&focus_display, b"SET", registered, Rights::ALL).expect("a surface takes focus");
 	pump();
-	assert_eq!(&focus_display.recv().expect("focus acknowledgement").bytes[..], b"OK");
-	let released = events(&console);
+	assert_eq!(&acknowledged(&focus_display, &mut pump)[..], b"OK", "focus acknowledgement");
+	let released = until_closed(&console, &mut pump);
 	assert_eq!(released.iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 0, alloc::vec![8])], "the held button is released to the console stream");
 	assert!(closed(&console), "and the console stream closes");
 	assert!(call(&pads, 5, 61, None, &mut pump).is_none(), "and is refused while a surface holds focus");
@@ -1021,20 +1073,20 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	assert_eq!(snapshot.iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 1, alloc::vec![8])], "at the gamepad's current state");
 	focus_display.send(Message::new(b"CLEAR".to_vec(), alloc::vec::Vec::new())).expect("revoke focus");
 	pump();
-	assert_eq!(&focus_display.recv().expect("clear acknowledgement").bytes[..], b"OK");
-	assert_eq!(events(&focused).iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 0, alloc::vec![8])], "focus loss releases the held button");
+	assert_eq!(&acknowledged(&focus_display, &mut pump)[..], b"OK", "clear acknowledgement");
+	assert_eq!(until_closed(&focused, &mut pump).iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 0, alloc::vec![8])], "focus loss releases the held button");
 	assert!(closed(&focused), "and closes the stream");
 
 	// A READER THAT FALLS BEHIND ENDS ON EVERY GAMEPAD'S REAL STATE. Past the channel's depth the stream stays
 	// open, and read afterwards its last state is the gamepad's current one.
 	focus_display.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("the console takes focus back");
 	pump();
-	assert_eq!(&focus_display.recv().expect("console acknowledgement").bytes[..], b"OK");
+	assert_eq!(&acknowledged(&focus_display, &mut pump)[..], b"OK", "console acknowledgement");
 	let slow = call(&pads, 5, 63, None, &mut pump).expect("the console stream opens again with no surface focused");
 	// The DRIVER'S channel is as deep as any other, so the service is let to read it as the states go in: what
 	// falls behind is the reader, not the driver.
 	for step in 0..100u32 {
-		drive(&driver_a, state(2, step % 16 + 1, 8, MID));
+		drive_through(&driver_a, state(2, step % 16 + 1, 8, MID), &mut pump);
 		if step % 16 == 15 {
 			pump();
 		}
@@ -1046,7 +1098,10 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	// WHAT IT IS OWED GOES ON THE SERVICE'S ONE-TICK RETRY, and that is a periodic wait - which `run_until_idle`
 	// does not count as work and does not wait out - so between reads the clock is moved past it.
 	let mut last: Option<u32> = None;
-	for _ in 0..8 {
+	for _ in 0..200 {
+		if last == Some(99 % 16 + 1) {
+			break;
+		}
 		for event in events(&slow) {
 			if let GamepadEvent::State(held) = event {
 				last = Some(held.buttons);
@@ -1059,7 +1114,7 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	// AND LEFT UNREAD AGAIN, the next arrival - which is never coalesced - cannot follow the states it owes, and
 	// the stream is closed.
 	for step in 0..100u32 {
-		drive(&driver_a, state(2, step % 8 + 1, 8, MID));
+		drive_through(&driver_a, state(2, step % 8 + 1, 8, MID), &mut pump);
 		if step % 16 == 15 {
 			pump();
 		}
@@ -1071,7 +1126,7 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	for _ in 0..4 {
 		pump();
 	}
-	let drained = events(&slow);
+	let drained = until_closed(&slow, &mut pump);
 	assert!(!drained.iter().any(|event| matches!(event, GamepadEvent::Arrived(_))), "the arrival did not reach a reader that was owed states");
 	assert!(closed(&slow), "the next arrival closed the stream");
 
@@ -1094,7 +1149,7 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	// The protected-input stream carries KEYS, which this test does not read: only drained.
 	while trusted_events.recv().is_ok() {}
 	// RELEASED, THEN CLOSED: the button the second gamepad still holds is let go before the stream ends.
-	let released = events(&watcher);
+	let released = until_closed(&watcher, &mut pump);
 	assert!(released.iter().filter_map(state_of).any(|(id, buttons, hats)| id == a2 && buttons == 0 && hats == [pad_wire::CENTRED]), "the console stream releases what was held before it closes: {released:?}");
 	assert!(closed(&watcher), "the console stream closes when the session is armed");
 	assert!(call(&pads, 5, 66, None, &mut pump).is_none(), "and a console stream is refused while it is up");
@@ -1131,7 +1186,7 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	for _ in 0..2 {
 		pump();
 	}
-	let _ = events(&after_session);
+	let _ = until_closed(&after_session, &mut pump);
 	assert!(closed(&after_session), "the graphical stream closes when the session is armed");
 	core::mem::drop(driver_a);
 }
