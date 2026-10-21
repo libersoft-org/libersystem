@@ -1324,6 +1324,12 @@ impl Stack {
 		// THE LINK BOUND: eight links across both radios. A connection past it is refused rather than held.
 		if controller.links.len() >= bt_bounds::LINKS_PER_CONTROLLER || controller.link_to(&peer).is_some() {
 			controller.disconnect(handle, REASON_USER);
+			// A ROTATION THE STANDING ATTEMPT HELD OFF is made now, though the connection that ended the attempt is refused:
+			// left set, the mark stopped every later rotation. The attempt is not taken up again here - at the bound it
+			// would only connect into the same refusal.
+			if through_list && core::mem::take(&mut self.controllers[at].le.rotate) {
+				self.rotate_address(at);
+			}
 			return;
 		}
 		let pairing_peer = controller.attempt.as_ref().is_some_and(|attempt| attempt.peer == peer && attempt.state == PairingState::Connecting);

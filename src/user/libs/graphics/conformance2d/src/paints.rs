@@ -100,9 +100,9 @@ pub fn paint_image_pattern() -> Outcome {
 		let paint = Paint::Image { image: handle, source: RectF::new(0.0, 0.0, 2.0, 1.0), quality: ImageQuality::Nearest, spread: SpreadMode::Repeat, transform: Transform::scale(8.0, 8.0) };
 		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 32.0, 8.0)), paint, FillRule::NonZero)
 	})?;
-	require!(frame.pixel(4, 4)[0] > 200, "the pattern's first texel fills the first tile: {:?}", frame.pixel(4, 4));
-	require!(frame.pixel(12, 4)[2] > 200, "and its second the next: {:?}", frame.pixel(12, 4));
-	Ok(())
+	// THE PICTURE IS EXACT - nearest texels eight pixels wide on an axis-aligned rectangle - so every pixel is compared:
+	// the first texel, then the second, again every sixteen pixels.
+	every_pixel(&frame, |x, _| if x % 16 < 8 { [255, 0, 0, 255] } else { [0, 0, 255, 255] })
 }
 
 // @covers: GradientMultiStop

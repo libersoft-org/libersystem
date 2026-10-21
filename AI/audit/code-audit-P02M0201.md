@@ -455,7 +455,7 @@ What remains:
   - Checked, not a finding: the supervisor status read (`bmc_service.rs:279`) still uses a fresh correlation-0 client with a 10 s deadline. The retained run shows one such timeout (`dev-serial.log:477`, "CommitUncertain"). That channel carries only `status`, so a late reply is an older snapshot of the same operation, and it delays the boot event by a few polls at most.
 - **Not done.** This was a static review only: nothing was built or run.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0201 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0201 (2026-10-21T12:09:39Z):
 
 **Finding 1 - the rejection of the take-over-at-once requirement rests on an unexplained oracle failure, and the checklist still claims it (Low): ACCEPTED.**
 - The cause is found, and it is the simulator's. OpenIPMI 2.0.37 (the installed `ipmi_sim`): `handle_platform_event`
@@ -509,3 +509,24 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0201 (2026-10-19T22:00:37Z):
   chassis controls through the pruned executors.
 
 **Milestone status (verified after these changes):** COMPLETE. Every item is done and every finding is fixed.
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

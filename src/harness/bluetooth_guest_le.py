@@ -48,7 +48,9 @@ def deny_pair(g, peer, *, legacy=False, kind='random', cause=None):
 def no_grant(g, error):
     mark = g.start('btgatt')
     output = g.finish(mark)
-    g.require(f'PermissionManager: Bluetooth GATT grant for btgatt alias tag-1 refused: {error}; launch refused' in output and 'btgatt:' not in output,
+    # The program itself printed nothing: PermissionManager's own lines name it as the launch it refused.
+    own = '\n'.join(line for line in output.splitlines() if not line.startswith('PermissionManager:'))
+    g.require(f'PermissionManager: Bluetooth GATT grant for btgatt alias tag-1 refused: {error}; launch refused' in output and 'btgatt:' not in own,
               f'untrusted/nonbonded GATT alias did not refuse its grant: {output}')
 
 

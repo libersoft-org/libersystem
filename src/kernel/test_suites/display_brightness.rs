@@ -161,7 +161,7 @@ fn display_service_keeps_serving_while_backlights_stall() {
 	assert!(!states[0].failed);
 	announce(&stream, 1, false);
 	pump();
-	assert!(retried_driver.is_peer_closed() && retried_events.is_peer_closed());
+	assert!(peer_closed(&retried_driver) && peer_closed(&retried_events));
 	assert!(snapshot(&read, 31).is_empty());
 
 	// A late catalogue open cannot be mistaken for a later publication's open, and its transferred
@@ -176,7 +176,7 @@ fn display_service_keeps_serving_while_backlights_stall() {
 	assert_ne!(le_u32(&old_open.bytes, 2), le_u32(&new_open.bytes, 2));
 	let stale = open_reply(&catalogue, le_u32(&old_open.bytes, 2));
 	pump();
-	assert!(stale.is_peer_closed(), "an unmatched late open releases its transferred channel");
+	assert!(peer_closed(&stale), "an unmatched late open releases its transferred channel");
 	let driver = open_reply(&catalogue, le_u32(&new_open.bytes, 2));
 	let events = admit(&driver, "native:async-primary");
 	let states = snapshot(&read, 11);
@@ -246,13 +246,13 @@ fn display_service_keeps_serving_while_backlights_stall() {
 	let closed = receive(&control, "withdrawn writer refusal");
 	refused(&closed, 22);
 	assert_eq!(display_v1::Error::read(&mut wire::Reader::new(&closed.bytes[5..])), Some(display_v1::Error::Closed));
-	assert!(driver.is_peer_closed());
-	assert!(events.is_peer_closed());
+	assert!(peer_closed(&driver));
+	assert!(peer_closed(&events));
 	assert_eq!(snapshot(&read, 17).len(), 1);
 	announce(&stream, 4, false);
 	pump();
-	assert!(second.is_peer_closed());
-	assert!(second_events.is_peer_closed());
+	assert!(peer_closed(&second));
+	assert!(peer_closed(&second_events));
 	assert!(snapshot(&read, 18).is_empty());
 	harness.service.terminate();
 }
@@ -292,7 +292,7 @@ fn display_service_admits_optional_firmware_metadata_without_stalling() {
 			late.extend_from_slice(&0x400u32.to_le_bytes());
 			send_cap(&driver, &late, consumer, Rights::ALL).unwrap();
 			pump();
-			assert!(leaked.is_peer_closed(), "late metadata releases an unclaimed transferred handle");
+			assert!(peer_closed(&leaked), "late metadata releases an unclaimed transferred handle");
 			assert!(driver.recv().is_err(), "late metadata cannot complete the pending GET");
 			complete_admission(&driver, get)
 		} else {
@@ -333,13 +333,13 @@ fn display_service_admits_optional_firmware_metadata_without_stalling() {
 	let _metadata = receive(&withdrawn, "metadata interrupted by withdrawal");
 	announce(&stream, 5, false);
 	pump();
-	assert!(withdrawn.is_peer_closed());
+	assert!(peer_closed(&withdrawn));
 	assert_eq!(snapshot(&read, 20).len(), 4);
 	for (index, (driver, events)) in providers.iter().enumerate() {
 		announce(&stream, index as u32 + 1, false);
 		pump();
-		assert!(driver.is_peer_closed());
-		assert!(events.is_peer_closed());
+		assert!(peer_closed(driver));
+		assert!(peer_closed(events));
 	}
 	assert!(snapshot(&read, 21).is_empty());
 	drop(control);

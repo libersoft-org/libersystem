@@ -196,6 +196,19 @@ fn a_change_the_acknowledgement_names_after_another_is_reported_too() {
 }
 
 #[test]
+fn a_change_an_interim_cci_names_is_reported_beside_the_completions() {
+	// CONNECTOR 1'S CHANGE IN A BUSY CCI, connector 2's in the completion: the completion's overwrote the BUSY one's in
+	// `change`, and connector 1's change - named nowhere else - was never read.
+	let mut ppm = Model::new(|control| if control as u8 == ACK_CC_CI { vec![(1, ACKED, Vec::new())] } else { vec![(1, Cci::BUSY | change(1), Vec::new()), (2, COMPLETE | change(2), Vec::new())] });
+	let exchange = execute(&mut ppm, &v21(), get_capability(), &[], 2, false).expect("answered");
+	assert_eq!(exchange.named, vec![1, 2], "both connectors named are reported, in order");
+	assert_eq!(exchange.change, Some(2));
+	// AN INTERIM CCI NAMING A CONNECTOR PAST THE PPM'S COUNT is refused as a completion naming one is.
+	let mut ppm = Model::new(|_| vec![(1, Cci::BUSY | change(5), Vec::new()), (2, COMPLETE, Vec::new())]);
+	assert_eq!(execute(&mut ppm, &v21(), get_capability(), &[], 2, false), Err(Failure::Connector(5)));
+}
+
+#[test]
 fn a_reset_is_polled_through_refresh_alone_and_a_silent_one_fails_at_the_bound() {
 	let mut ppm = Model::new(|_| Vec::new());
 	reset(&mut ppm).expect("completes after three refreshes");

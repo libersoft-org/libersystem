@@ -223,10 +223,31 @@ impl Service {
 	}
 
 	// A SET OF THE POLICY'S OWN: its serial noted, so its change is neither stored nor taken for someone's hand.
+	//
+	// AND ONE THAT WENT UNANSWERED is noted by the level it lands on: DisplayService may still carry it out after the
+	// deadline, and publishes that change under a serial this never learned.
 	fn set_own(&mut self, key: &str, target: BrightnessTarget) {
-		if let Ok(set) = self.forward(key, &target, false) {
-			self.policy.answered(set.serial);
+		match self.forward(key, &target, false) {
+			Ok(set) => self.policy.answered(set.serial),
+			Err(Error::TimedOut) => {
+				if let Some(level) = self.landing(key, &target) {
+					self.policy.unanswered(key, level);
+				}
+			}
+			Err(_) => {}
 		}
+	}
+
+	// THE LEVEL A SET OF THIS BACKLIGHT LANDS ON, resolved as DisplayService resolves it.
+	fn landing(&self, key: &str, target: &BrightnessTarget) -> Option<u32> {
+		let backlight = self.find(key)?;
+		let levels = scale(&backlight.scale)?;
+		let target = match *target {
+			BrightnessTarget::Level(level) => logic::Target::Level(level),
+			BrightnessTarget::Percent(percent) => logic::Target::Percent(percent),
+			BrightnessTarget::Steps(steps) => logic::Target::Steps(steps),
+		};
+		logic::resolve(&levels, backlight.level, target, false).ok()
 	}
 
 	fn forward(&self, key: &str, target: &BrightnessTarget, allow_zero: bool) -> Result<BrightnessSet, Error> {

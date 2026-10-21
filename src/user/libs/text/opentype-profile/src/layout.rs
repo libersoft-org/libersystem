@@ -69,7 +69,7 @@ pub const GPOS_LOOKUPS: &[GposLookup] = &[
 /// The lookup flags the profile honours. A flag it did not honour would apply a lookup to glyphs the
 /// font excluded from it, which is a positioning error that looks like a font bug.
 pub const LOOKUP_FLAGS: &[LookupFlag] = &[
-	LookupFlag { bit: 0x0001, name: "rightToLeft", effect: "cursive attachment takes its direction from the run rather than the font" },
+	LookupFlag { bit: 0x0001, name: "rightToLeft", effect: "cursive attachment leaves the last glyph of a connected sequence on the baseline rather than the first" },
 	LookupFlag { bit: 0x0002, name: "ignoreBaseGlyphs", effect: "base glyphs are skipped when matching" },
 	LookupFlag { bit: 0x0004, name: "ignoreLigatures", effect: "ligature glyphs are skipped when matching" },
 	LookupFlag { bit: 0x0008, name: "ignoreMarks", effect: "mark glyphs are skipped when matching" },

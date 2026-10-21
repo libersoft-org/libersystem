@@ -762,7 +762,7 @@ What remains:
   - `host-tests` passed: not verifiable by a static review.
 - **Not done.** This was a static review only: nothing was built or run.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0202 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0202 (2026-10-21T12:09:39Z):
 
 **Finding 1 - a connector change the PPM names only once is still never acknowledged (Low): ACCEPTED.**
 - `src/user/libs/driver/ucsi/src/lib.rs`: an `Exchange` now carries `after`, the change the acknowledgement's own
@@ -782,20 +782,48 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0202 (2026-10-19T22:00:37Z):
   tests). Watched failing: with `after` dropped, the test fails.
 - `src/harness/ucsi-ppm.py`: a `once` mode, in which the PPM names each pending change in exactly one CCI and never
   again, and a `detach-both` command that leaves both connectors' detaches pending before either is named; its self-test
-  covers both.
+  covers the `once` mode, and the gate's v21 step drives `detach-both`.
 - `src/tools/check-typec-ucsi.sh`: step v21 - `once on`, `detach-both`, and both connectors must be read and announced
   detached. Watched failing twice: on the driver as it was, and with `after` kept but the read's own completion change
   still dropped - both stop at "await 2 detached".
 
+- AND A CHANGE NAMED IN A BUSY OR INTERIM CCI, found by this response's verification: `await_cci` kept only the last
+  connector a command's CCIs named, so one named in a BUSY CCI and overwritten by the completion's was lost. An
+  `Exchange` now reports every connector its CCIs named (`named`, in order and each once; one past the PPM's count in
+  any of them is refused), and the driver queues them all. A `ucsi` host test, watched failing without it.
+
 **Finding 2 - the milestone document points at its audit file and still states superseded statuses (Low): ACCEPTED.**
-- `docs/todo/P02M0202.md`: the pointers are gone; the superseded status paragraphs are marked as superseded by the
-  current status, and `docs/todo/TODO.md`'s row matches it.
+- `docs/todo/P02M0202.md`: the pointers are gone - the one at the 2026-10-11 record the auditor cited and "final case
+  outcomes will be appended" were left at first and removed after this response's verification - and the superseded
+  status paragraphs are marked as superseded by the current status. `docs/todo/TODO.md`'s row now marks its 2026-10-10/11
+  PARTIAL and BLOCKED records superseded by its status.
 
 **Verification:**
-- The `ucsi` library's 15 host tests; the PPM model's self-test with the `once` mode.
+- The `ucsi` library's 16 host tests; the PPM model's self-test with the `once` mode.
 - `typec-ucsi` PASS on the corrected driver (980 s), v21 among its steps; it failed at v21 on the driver as it was and
   with only the acknowledgement's change kept.
 
 **Milestone status (verified after these changes):** COMPLETE for phase 2. Every item is done and every finding is
 fixed; both connectors' changes are announced on the final tree. Not tested on real hardware - not part of phase 2, by
 the owner's decision of 2026-10-13.
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

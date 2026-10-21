@@ -332,7 +332,7 @@ What remains: the gate's round-trip check cannot fail on a command the shell ref
   - aarch64 in 450 s and riscv64 in 505 s, with the 2998 ms timed wake: the sleep lines are confirmed in both port logs (aarch64 :529-554, riscv64 :588-611). The durations cannot be checked statically.
 - **Not done.** This was a static review only: nothing was built or run.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0191 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0191 (2026-10-21T12:09:39Z):
 
 **Finding 1 - the handoff gate's round trips accept a refused command, and in the latest x86_64 PASS the round trip through the kernel's own path and the one after the enable both failed (Medium): ACCEPTED.**
 - `src/tools/check-serial-handoff.sh`: a round trip passes only when the word comes back as its own whole line and the
@@ -349,7 +349,8 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0191 (2026-10-19T22:00:37Z):
   enabled between them, while the console line's interrupt handler (`wired_line_interrupt`) does the same pair on the
   same core: one taken between them puts the rest of a burst ahead of the byte just read. `take_serial_byte` reads and
   queues as one step with interrupts masked, and both sites use it.
-- THE GARBLED ROUND TRIP IS REPRODUCED, and its cause is the interleaving above. An ordinary run reaches the window
+- THE GARBLED ROUND TRIP IS REPRODUCED, and its most likely cause is the interleaving above - an inference: the
+  reproduction forced the window by leaving the receive interrupt off. An ordinary run reaches the window
   rarely: the pump has to win a burst's first byte, which it does only when the burst lands while its own read holds the
   line with interrupts masked - which is why four ordinary runs, one of them with a spin widening the wrong gap (after
   the read, when the line's handler has already taken the burst), never garbled. A reproduction, never kept, made the
@@ -378,6 +379,33 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0191 (2026-10-19T22:00:37Z):
 - The reproduction, both ways (above).
 - `serial-handoff` PASS on the final tree (198 s), with the masking and the single delivery in.
 
+**Found by the regression run (2026-10-21):** `serial-handoff` PASS (264 s). `tickless-idle`'s riscv64 typed-input check
+predates this milestone's handoff: it counts the interrupt the kernel announced for the console (63), which the handoff
+to the console driver takes off its line, and reads 0 - recorded under P02M0198 and reported. With both console-input
+changes (this review's and that of 2026-10-19) reverted, the ports' idle-sleep clock check fails exactly as before, so
+that failure is not this path.
+
 **Milestone status (verified after these changes):** COMPLETE. Every item is done and the finding is fixed: the gate
 refuses a refused command, the garbled round trip's cause is reproduced and closed, and a second way for input to be
 reordered on the same path is closed with it (above).
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

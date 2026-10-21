@@ -152,6 +152,7 @@ enum Action {
 	Command(u16),
 	Create(Vec<u8>),
 	Rotate,
+	Refused(u16),
 }
 struct BredrState {
 	watcher: u64,
@@ -169,13 +170,25 @@ struct Controller {
 	powered: bool,
 	secure_connections: bool,
 	scan: Option<Scan>,
+	// THE CONTROLLER'S COMMAND QUEUE, as production bounds it: a send past `MAX_QUEUED` is refused.
+	pending: Vec<(u16, Vec<u8>)>,
 }
 impl Controller {
-	fn command(&mut self, opcode: u16, _: &[u8]) -> bool {
+	fn command(&mut self, opcode: u16, parameters: &[u8]) -> bool {
+		if self.pending.len() >= MAX_QUEUED {
+			self.actions.push(Action::Refused(opcode));
+			return false;
+		}
+		self.pending.push((opcode, parameters.to_vec()));
 		self.actions.push(Action::Command(opcode));
 		true
 	}
 	fn le_create_connection(&mut self, parameters: &[u8]) -> bool {
+		if self.pending.len() >= MAX_QUEUED {
+			self.actions.push(Action::Refused(0x200d));
+			return false;
+		}
+		self.pending.push((0x200d, parameters.to_vec()));
 		self.actions.push(Action::Create(parameters.to_vec()));
 		true
 	}
@@ -308,7 +321,7 @@ fn stack(identity: Peer, legacy: bool) -> Stack {
 	let mut le = LeState::new();
 	le.accepting = true;
 	le.irks.push((identity, IRK));
-	Stack { controllers: vec![Controller { le, reconnect: None, attempt: None, links: Vec::new(), actions: Vec::new(), bredr_state: BredrState { watcher: 1 }, public_key: Some([0; 64]), classic: false, classic_sc: false, powered: true, secure_connections: true, scan: None }], bonds: 1, records: RefCell::new(vec![(identity, Record { key: vec![0x42; 16], rand: if legacy { vec![0x19; 8] } else { Vec::new() }, ediv: 0x1234, level: Level { agreement: if legacy { Agreement::Legacy } else { Agreement::SecureConnections } } })]), delete_fails: false, reads: RefCell::new(Vec::new()) }
+	Stack { controllers: vec![Controller { le, reconnect: None, attempt: None, links: Vec::new(), actions: Vec::new(), bredr_state: BredrState { watcher: 1 }, public_key: Some([0; 64]), classic: false, classic_sc: false, powered: true, secure_connections: true, scan: None, pending: Vec::new() }], bonds: 1, records: RefCell::new(vec![(identity, Record { key: vec![0x42; 16], rand: if legacy { vec![0x19; 8] } else { Vec::new() }, ediv: 0x1234, level: Level { agreement: if legacy { Agreement::Legacy } else { Agreement::SecureConnections } } })]), delete_fails: false, reads: RefCell::new(Vec::new()) }
 }
 fn connect(stack: &mut Stack, status: u8, kind: u8, address: [u8; 6]) {
 	// Actual legacy HCI parser, including little-endian address conversion, then
@@ -554,12 +567,56 @@ fn rotation_cases() {
 	ROTATING.with(|rotating| rotating.set(false));
 	assert_eq!(s.controllers[0].actions, [Action::Secure(7, [0x42; 16]), Action::Rotate, Action::Relist], "the overtaken rotation is made before the attempt is taken up again");
 	assert!(!s.controllers[0].le.rotate && !s.controllers[0].le.relist, "and both marks are consumed");
-	println!("1 actual rotation-overtaken case passed");
+	// AND WHEN THAT CONNECTION IS REFUSED - the link bound reached, or the peer already linked - the rotation is still
+	// made: left set, the mark stopped every later rotation. The attempt is not taken up again at the bound.
+	let mut s = stack(IDENTITY, true);
+	s.controllers[0].le.rotate = true;
+	s.controllers[0].links.push(Link::new(6, IDENTITY));
+	ROTATING.with(|rotating| rotating.set(true));
+	connect(&mut s, 0, 1, rpa);
+	ROTATING.with(|rotating| rotating.set(false));
+	assert_eq!(s.controllers[0].actions, [Action::Disconnect(7, REASON_USER), Action::Rotate], "a refused list connection still makes the rotation it held off");
+	assert!(!s.controllers[0].le.rotate, "and consumes its mark");
+	println!("2 actual rotation-overtaken cases passed");
+}
+// THE STANDING ATTEMPT'S REBUILD, through production's `feed_rebuild` and a queue bounded as the controller's is: seven
+// absent bonded peers are eighteen commands, more than the queue holds. Fed as it has room, the rebuild keeps
+// `REBUILD_HEADROOM` places free for a link's encryption, none of it is refused, and the attempt is queued behind the
+// lists - in one burst the queue overran and the attempt, queued last, was the command refused.
+fn rebuild_cases() {
+	let mut s = stack(IDENTITY, false);
+	let controller = &mut s.controllers[0];
+	controller.le.rebuild.push_back((0x202d, vec![0]));
+	controller.le.rebuild.push_back((0x2010, Vec::new()));
+	controller.le.rebuild.push_back((0x2029, Vec::new()));
+	for peer in 0..7u8 {
+		controller.le.rebuild.push_back((0x2011, vec![peer; 7]));
+		controller.le.rebuild.push_back((0x2027, vec![peer; 39]));
+	}
+	controller.le.rebuild.push_back((0x202d, vec![1]));
+	controller.le.arming = true;
+	let wanted = controller.le.rebuild.len();
+	controller.feed_rebuild();
+	assert!(controller.pending.len() + REBUILD_HEADROOM <= MAX_QUEUED, "the first feed leaves room: {} queued", controller.pending.len());
+	assert!(controller.command(0x2019, &[0; 28]), "a link's encryption is queued while the rebuild is fed");
+	let mut rounds = 0;
+	while (controller.le.arming || !controller.le.rebuild.is_empty()) && rounds < 16 {
+		controller.pending.clear();
+		controller.feed_rebuild();
+		assert!(controller.pending.len() <= MAX_QUEUED);
+		rounds += 1;
+	}
+	assert!(!controller.actions.iter().any(|action| matches!(action, Action::Refused(_))), "nothing the rebuild sent was refused: {:?}", controller.actions);
+	let commands = controller.actions.iter().filter(|action| matches!(action, Action::Command(op) if *op != 0x2019)).count();
+	assert_eq!(commands, wanted, "every list command was queued");
+	assert!(matches!(controller.actions.last(), Some(Action::Create(_))) && controller.le.accepting, "the attempt is queued behind the lists: {:?}", controller.actions.last());
+	println!("1 actual rebuild case passed");
 }
 fn main() {
 	if !std::env::args().any(|arg| arg == "--forget-only") {
 		connection_cases();
 		rotation_cases();
+		rebuild_cases();
 	}
 	forget_cases();
 	if !std::env::args().any(|arg| arg == "--forget-only") {

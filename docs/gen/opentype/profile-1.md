@@ -128,7 +128,7 @@ replaced by them.
 
 | flag | name | effect |
 | --- | --- | --- |
-| `0x0001` | `rightToLeft` | cursive attachment takes its direction from the run rather than the font |
+| `0x0001` | `rightToLeft` | cursive attachment leaves the last glyph of a connected sequence on the baseline rather than the first |
 | `0x0002` | `ignoreBaseGlyphs` | base glyphs are skipped when matching |
 | `0x0004` | `ignoreLigatures` | ligature glyphs are skipped when matching |
 | `0x0008` | `ignoreMarks` | mark glyphs are skipped when matching |

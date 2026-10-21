@@ -252,6 +252,33 @@ fn idle_dims_the_active_backlight_and_active_undoes_it_unless_the_level_was_move
 }
 
 #[test]
+fn a_dim_carried_out_after_its_set_went_unanswered_is_still_the_policys_own() {
+	// THE SET TIMED OUT AT THE POLICY, AND DisplayService CARRIED IT OUT ANYWAY, publishing the change under a serial the
+	// policy never learned. Taken for someone's hand it would cancel the dim, pause automatic brightness and be stored
+	// as their choice - and the person's return would have nothing to undo.
+	let scale = Scale::range(0, 100).unwrap();
+	let mut policy = Policy::new(Settings::default());
+	assert_eq!(policy.idle(Some(ActiveBacklight { key: "usb:a", scale: &scale, level: Some(80) })), Some(Action::Set { key: "usb:a".into(), level: 24 }));
+	policy.unanswered("usb:a", 24);
+	policy.changed("usb:a", Some(24), 41, 0, 200);
+	assert!(policy.dimmed(), "the late dim leaves the dim in force");
+	assert_eq!(policy.next_due(), None, "and is not stored");
+	assert_eq!(policy.active(), Some(Action::Set { key: "usb:a".into(), level: 80 }), "the return undoes it");
+	// REMEMBERED ONCE, AND FOR THAT LEVEL ONLY: a second change, or one to another level, is somebody's.
+	policy.unanswered("usb:a", 24);
+	policy.changed("usb:a", Some(30), 42, 0, 200);
+	assert_eq!(policy.next_due(), Some(200), "another level is someone's hand");
+	policy.changed("usb:a", Some(24), 43, 0, 200);
+	policy.changed("usb:a", Some(24), 44, 0, 200);
+	assert_eq!(policy.settled(200), vec![Action::Store { key: "usb:a".into(), level: 24 }], "the second change to that level is someone's too");
+	// AND A BACKLIGHT THAT LEFT TAKES ITS LATE SETS WITH IT.
+	policy.unanswered("usb:a", 50);
+	policy.left("usb:a");
+	policy.changed("usb:a", Some(50), 45, 300, 200);
+	assert_eq!(policy.next_due(), Some(500), "a late set of a backlight that left is no longer the policy's");
+}
+
+#[test]
 fn turning_the_idle_timeout_off_undoes_a_dim_in_force() {
 	let scale = Scale::range(0, 100).unwrap();
 	let mut policy = Policy::new(Settings::default());

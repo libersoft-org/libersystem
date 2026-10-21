@@ -5619,9 +5619,9 @@ No gate reaches any of the Medium defects.
     - The gate scripts check what the DONE notes say they check: confirmed statically.
 - **Not done.** This was a static review only: nothing was built or run. QEMU's virtio-crypto reset behaviour could not be checked against source, because none is available here.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0099 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0099 (2026-10-21T12:09:39Z):
 
-Fourteen findings were verified and accepted; one (9) is rejected as a redesign, with the bound finding 7 now gives it.
+Fourteen findings were verified and accepted; one (9) is rejected as a change of the shared-line interrupt design, its residual recorded as open for the owner.
 
 **Finding 1 - with virtio-mem memory online, the balloon's floor counts plugged frames but takes boot-pool frames only (Medium): ACCEPTED.**
 - `src/kernel/mem/frame/mod.rs`: `boot_totals()` answers the boot pools' own frames and free frames, which plugged
@@ -5687,8 +5687,11 @@ Fourteen findings were verified and accepted; one (9) is rejected as a redesign,
   I/O cannot hand its slot's request to another consumer.
 
 **Finding 6 - a root-port change seen by a wait inside a transfer is remembered, but the loop then blocks without acting on it (Medium): ACCEPTED.**
-- `usb_host.rs`: the loop takes a remembered port change at its top (`take_port_change` then `reconcile`) before it
-  waits, so OHCI's root-hub interrupt is not left masked until an unrelated wake.
+- `usb_host.rs`: the loop takes remembered port changes at its top (`take_port_change` then `reconcile`) before it
+  waits, so OHCI's root-hub interrupt is not left masked until an unrelated wake - AND KEEPS TAKING THEM UNTIL NONE IS
+  LEFT, at most eight a pass: the reconcile that takes one can raise the next (attaching a device resets its port, and
+  the enumeration's own waits see that and hold the interrupt off again). The single take was what this response first
+  said; its verification found the gap, and `usb-legacy` passes with the loop.
 
 **Finding 7 - a holder of a shared wired line that goes away without its function's pin turned off unmasks a level line its controller may still be asserting (Medium): ACCEPTED.**
 - `src/kernel/object/interrupt.rs`: an interrupt object records the PCI function a platform line was acquired for
@@ -5705,10 +5708,14 @@ Fourteen findings were verified and accepted; one (9) is rejected as a redesign,
   nothing. 31 `nvme` host tests; each new one watched failing under a mutation of `recovered`.
 
 **Finding 9 - one holder that does not acknowledge holds the shared line masked for every other holder and for the hot-plug port, with no bound (Low): REJECTED.**
-- Masking per function instead of per line is a different interrupt design for every shared-line holder, not a fix of
-  this milestone's code. The case that had no bound at all - a holder that went away still holding its pin asserted - is
-  bounded by finding 7. A live holder that never acknowledges is a driver defect; the cost to its line's neighbours is
-  stated in the milestone's Corrections of 2026-10-19.
+- Rejected as a change to make in this review, not because the concern is wrong. Bounding a LIVE holder that never
+  acknowledges needs per-function masking of a shared level line - that holder's INTx disabled and the line unmasked for
+  the others - which changes the kernel's shared-line dispatch for every holder; it is not a correction of the code
+  reviewed. The shared level lines are this milestone's own legacy-USB design, and the residual is real: a live holder
+  - a driver stalled, for instance, in a blocking send to a consumer that stopped reading - keeps its line masked for
+  its neighbours. Finding 7 bounds only a holder that has gone away, not this case. An oracle exists (QEMU emulates INTx
+  Disable and Interrupt Status, and the kernel has `set_intx_disabled`). The milestone records the residual as open,
+  for the owner to decide.
 
 **Finding 10 - EHCI ships while the companion drivers it hands full- and low-speed devices to are development-only (Low): ACCEPTED (stated, not changed).**
 - `src/user/drivers/core/src/ehci.rs`: in a shipping image the hand-over says what it is - the device is left on a
@@ -5727,14 +5734,17 @@ Fourteen findings were verified and accepted; one (9) is rejected as a redesign,
 
 **Finding 13 - a stopped virtio-crypto driver exits without destroying its sessions at the device (Low): ACCEPTED.**
 - `src/user/drivers/core/src/virtio_crypto.rs`: `Clients::destroy_all` destroys every client's sessions at the device,
-  and the driver calls it before it stops or exits.
+  and the driver calls it on every way it stops or exits - the exit taken when a client's departure cannot be told to
+  the manager either was added after this response's verification found it missing.
 
 **Finding 14 - the ticked CDC-ECM/NCM item still says its oracle has not run (Low): ACCEPTED.**
 - `docs/todo/P02M0099.md`: the item records the run (`USB_GADGET=ncm`, PASS 2026-10-15).
 
 **Finding 15 - the milestone document points at audit files for its evidence (Low): ACCEPTED.**
 - `docs/todo/P02M0099.md`: every sentence that pointed at an audit file now names the retained evidence or says what was
-  done.
+  done - the three left in the 2026-10-09/11 continuation records ("preserved in the implementation record", "the
+  appended implementation audit", "the latest appended implementation record") included, removed after this response's
+  verification found them.
 
 **Also, found by the final runs and fixed:** `src/kernel/mem/hotplug.rs` and `src/kernel/object/balloon.rs` sat beside
 the `tests.rs` of their own directories, which `source-hygiene` refuses (it failed on them; both came with this
@@ -5772,8 +5782,49 @@ milestone's restored items landed, and each pinned a list those items had grown.
   three targets' test kernels (377 keys, `gate.usb-release` among them).
 - Finding 9 is rejected.
 
+**Found by the regression run (2026-10-21):** The ports' `camera-usb` gates booted a staging without their development
+probe under a shipping caller; a port gate now builds its architecture's development staging and restores the shipping
+one (`src/tools/guest-gate.sh`), and both PASS (aarch64 1476 s, riscv64 1465 s). `docs/DYNAMIC_*.tsv` were stale after
+the tool and library changes of 2026-10-17 to 2026-10-19 (`free`'s balloon rows among them); regenerated,
+`dynamic-report` PASS (409 s). `usb-release` PASS (575 s). Reported, not changed: since the loader optimisation of
+2026-10-12 the loader loads the kernel before it refuses an absent DMA-mode record, so
+`arch-profile-aarch64-no-dt-absent-1` and `-riscv64-` fail - still fail-closed, the kernel is never entered; restoring
+the refusal before the load, or a gate that accepts the order, is the owner's decision. And `virtio-iommu-protocol` no
+longer compiled: `check-iommu-completions.py` builds the production IOMMU functions it names into a host crate, and this
+milestone's 32-bit DMA ceiling of 2026-10-18 split `map_for_device` and `DmaBuffer::create_for` around new
+`map_for_device_within` and `create_within` it did not name; it now takes both (with a frame stub for
+`allocate_contiguous_below`), and the gate PASSES with every planted defect still refused. And `guest-verdict` failed:
+the five guest gates this milestone added - `host-share`, `balloon`, `memory-hotplug`, `usb-legacy` and `usb-release` -
+had no row in `docs/verification/P02M0177-guest-cases.md`; each now has its launcher, final predicate and backstop, and
+`guest-verdict` PASSES. And `kernel.hardware.kernel_transport_reads_a_ready_reply_without_waiting_for_unrelated_work`
+failed on about half of the day's x86_64 runs: an earlier test's driver teardown, printing on the boot core, fell inside
+the transport's three-tick patience. The test lets that finish first and gives the transport ten ticks against a
+fallback of sixty; alone three times PASS, a transport that drains every runnable thread before it reads fails it, and
+the x86_64 suite passes whole.
+
 **Milestone status (verified after these changes):** COMPLETE for phase 2. Every item is done and every finding of this
 review is fixed but finding 9, which is rejected above with its reason. Recorded as decided, not open: a shipping image
 drives USB high-speed devices only (finding 10, the owner's to change), and the legacy controllers carry the HID and
 Bulk-Only classes (finding 11). The stale mount found by `usb-release` is fixed (finding 4), and finding 1's floor is
 driven by a test. Not tested on real hardware - not part of phase 2, by the owner's decision of 2026-10-13.
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

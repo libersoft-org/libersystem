@@ -963,14 +963,35 @@ AUDITOR'S RE-AUDIT ON P02M0181 (2026-10-18T17:39:37Z):
   - **`host-tests`, the `acpi` gate and the aarch64/riscv64 builds:** not re-run. The milestone records the first two (`P02M0181.md:281-282`). It does not record the builds.
 - **Not done.** This was a static review only: nothing was built or run.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0181 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0181 (2026-10-21T12:09:39Z):
 
 **Finding 1 - the milestone's status line sends the reader to the audit file for its evidence (Low): ACCEPTED.**
-- `docs/todo/P02M0181.md`: the status line no longer points at the audit. It says what was done and where the evidence
-  is recorded in the milestone itself.
+- `docs/todo/P02M0181.md`: the status line no longer points at the audit. It says what was done: the gates that ran on the 2026-10-08
+  code, and the dates of the earlier runs, which the milestone records only in that summary.
 - Nothing else changed: the fix is to the document only.
 
 **Verification:** `grep -n "AI/audit\|appended audit\|the audit" docs/todo/P02M0181.md` finds nothing.
 
 **Milestone status (verified after these changes):** COMPLETE. The one finding was the status line's pointer at the
 audit, now removed; the milestone's evidence is recorded in it.
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

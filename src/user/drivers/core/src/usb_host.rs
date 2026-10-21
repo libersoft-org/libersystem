@@ -1241,7 +1241,15 @@ pub fn run<C: Controller>(bootstrap: u64, bind: &common::Bind, device: u64, irq:
 		// cleared what raised it - and OHCI holds its root hub's interrupt off until the change is taken - so left for
 		// the next wake it waited for unrelated traffic: a stick plugged after a keyboard was not seen until a key was
 		// pressed, and one pulled mid-read stayed published until somebody asked it for a block.
-		if host.hc.take_port_change() {
+		//
+		// AND AGAIN, UNTIL NONE IS LEFT: the reconcile that takes one can raise the next - attaching a device resets its
+		// port, and the enumeration's own waits see that change and hold the interrupt off again - so taking one change
+		// and blocking left the root hub deaf once more. Bounded, since a port that changes on every look must not keep
+		// the loop from its consumers.
+		for _ in 0..8 {
+			if !host.hc.take_port_change() {
+				break;
+			}
 			host.reconcile();
 		}
 		publications.follow(&mut host, bootstrap, bind, &mut serving);

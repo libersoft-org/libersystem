@@ -568,12 +568,19 @@ struct Dim {
 /// How many of its own serials the policy remembers: a set's change is read within a few frames of its answer.
 const OWN_SERIALS: usize = 32;
 
+/// How many of its own sets that went unanswered the policy remembers: each is one set DisplayService may still carry
+/// out, and a set is made at most once per backlight per idle, wake or reading.
+const LATE_SETS: usize = 4;
+
 /// THE POLICY'S STATE: its settings, the serials of the sets it made, the levels waiting to settle, the dim in force, and
 /// automatic brightness's pause and last level.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Policy {
 	pub settings: Settings,
 	own: Vec<u64>,
+	// THE POLICY'S SETS THAT TIMED OUT, by backlight and the level each lands on: DisplayService may carry one out after
+	// all, and it publishes that change under a serial the policy never learned.
+	late: Vec<(String, u32)>,
 	pending: Vec<Pending>,
 	dim: Option<Dim>,
 	paused: bool,
@@ -594,12 +601,26 @@ impl Policy {
 		self.own.push(serial);
 	}
 
+	/// A SET THE POLICY MADE WENT UNANSWERED, and DisplayService may still carry it out - publishing the change, late,
+	/// under a serial the policy never learned. The level it lands on is remembered, so that change is the policy's own
+	/// too: a dim carried out late is still a dim, not someone's hand that cancels it and is stored as their choice.
+	pub fn unanswered(&mut self, key: &str, level: u32) {
+		if self.late.len() == LATE_SETS {
+			self.late.remove(0);
+		}
+		self.late.push((String::from(key), level));
+	}
+
 	/// A CHANGE OF A LEVEL, read from DisplayService's subscription. The policy's own is forgotten. Anyone else's - a
 	/// key, a hotkey, the device, a set through the policy's control - waits `settle_ticks` to be stored, cancels a dim
 	/// of that backlight, and pauses automatic brightness until the next idle.
 	pub fn changed(&mut self, key: &str, level: Option<u32>, serial: u64, now: u64, settle_ticks: u64) {
 		if let Some(at) = self.own.iter().position(|&own| own == serial) {
 			self.own.remove(at);
+			return;
+		}
+		if let Some(at) = self.late.iter().position(|(late, landing)| late == key && Some(*landing) == level) {
+			self.late.remove(at);
 			return;
 		}
 		if self.dim.as_ref().is_some_and(|dim| dim.key == key) {
@@ -616,6 +637,7 @@ impl Policy {
 	/// A backlight left: nothing of it waits or is dimmed.
 	pub fn left(&mut self, key: &str) {
 		self.pending.retain(|pending| pending.key != key);
+		self.late.retain(|(late, _)| late != key);
 		if self.dim.as_ref().is_some_and(|dim| dim.key == key) {
 			self.dim = None;
 		}

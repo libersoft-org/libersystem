@@ -2507,7 +2507,7 @@ Three of the catalogue item's own gates are still unbuilt, and the milestone doe
   - No milestone IDs appear in the changed code.
 - **Not done.** This was a static review only: nothing was built or run.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0136 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0136 (2026-10-21T12:09:39Z):
 
 All four findings were verified against the code and accepted. The engine changes follow OpenType's own rules as HarfBuzz
 implements them; every expectation below is computed from a face's design, not recorded from a run.
@@ -2570,6 +2570,10 @@ implements them; every expectation below is computed from a face's design, not r
 - Tests: `font-shape` - a right-to-left word joined letter to letter with and without the flag, and a left-to-right one
   carrying each shift to the next; each checks that every join's anchors meet where the glyphs are drawn.
 - `docs/todo/P02M0136.md`: the "OPEN" note on cursive attachment is closed by the Corrections of 2026-10-19.
+- The published profile said `rightToLeft` makes cursive attachment take "its direction from the run rather than the
+  font"; it now says what the flag does and the code does - it leaves the last glyph of a connected sequence on the
+  baseline rather than the first (`opentype-profile`'s table, `docs/gen/opentype/profile-1.md` regenerated). Found by
+  this response's verification; `opentype-profile` PASS.
 
 **Finding 4 - three of the catalogue item's own gates are still unbuilt, and the milestone keeps the item ticked without saying so (Low): ACCEPTED - the three gates are built.**
 - `src/kernel/test_suites/applications.rs`: a new kernel test,
@@ -2578,7 +2582,9 @@ implements them; every expectation below is computed from a face's design, not r
   - The `Factory` route: a connection minted the way the supervisor's bootstrap mints a `factory` role (CONNECT on the
     SERVE root end it keeps, narrowed to send, receive, wait and transfer) is handed to `lsfont`, which lists the
     installed faces through it. No manifest row takes that role today, so the test stands in for the supervisor, as it
-    already does when it starts the catalogue. The granted route is the corpus test's: `textconf` is now handed a
+    already does when it starts the catalogue - the auditor's minimal fix, a test-side consumer. Neither the
+    supervisor's Factory executor nor PermissionManager runs in it, so the plan's "manifest-declared consumer through
+    its Factory role" is met by that stand-in, not by a manifest row. The granted route is the corpus test's: `textconf` is now handed a
     connection minted fresh from the root and narrowed to the grant's rights, as PermissionManager hands one to an
     application, instead of the root itself with every right.
   - The RESOLVE-INTO race with the hint dropped: the test answers the catalogue's watch with a stream nothing is ever
@@ -2616,3 +2622,24 @@ implements them; every expectation below is computed from a face's design, not r
 
 **Milestone status (verified after these changes):** COMPLETE. Every item is implemented, all four findings are fixed,
 and the three catalogue gates that were missing are built; the status line no longer excepts anything.
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

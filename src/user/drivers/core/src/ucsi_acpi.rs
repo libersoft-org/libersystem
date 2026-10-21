@@ -162,8 +162,10 @@ impl Ucsi {
 		let layout = self.layout;
 		let connectors = self.connectors();
 		let exchange = ucsi::execute(self, &layout, command, &[], connectors, acknowledges.is_some())?;
-		let seen = [exchange.change.filter(|&number| Some(number) != acknowledges), exchange.after];
-		for number in seen.into_iter().flatten() {
+		// EVERY CONNECTOR THE COMMAND'S CCIs NAMED - a BUSY or interim one's too, which a later CCI's overwrote - and the
+		// acknowledgement's.
+		let seen = exchange.named.iter().copied().filter(|&number| Some(number) != acknowledges).chain(exchange.after);
+		for number in seen {
 			if !self.changes.contains(&number) {
 				self.changes.push(number);
 			}

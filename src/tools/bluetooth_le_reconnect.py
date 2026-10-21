@@ -48,8 +48,8 @@ def production(root, source_tree):
     actual += '\n'.join(item(le, anchor) for anchor in (
         'pub(crate) fn start_le_pairing(', 'pub(crate) fn pair_le(', 'fn set_aside(')) + '\n}\n'
     actual += "impl OperatorView<'_> {\n" + item(main, 'fn forget(') + '\n}\n'
-    actual += 'impl Controller {\n' + item(main, 'fn fail_attempt(') + '\n}\n'
-    for name in ('KIND_BREDR', 'TICKS_PER_SECOND', 'REARM_TICKS', 'STATUS_UNKNOWN_CONNECTION'):
+    actual += 'impl Controller {\n' + item(main, 'fn fail_attempt(') + '\n' + item(main, 'fn feed_rebuild(') + '\n}\n'
+    for name in ('KIND_BREDR', 'TICKS_PER_SECOND', 'REARM_TICKS', 'STATUS_UNKNOWN_CONNECTION', 'MAX_QUEUED', 'REBUILD_HEADROOM'):
         constants = [line for line in main.splitlines() if line.startswith(f'const {name}:')]
         if len(constants) != 1:
             raise ValueError(f'ambiguous production {name} constant')
@@ -99,6 +99,8 @@ def run(root, keep=None, *, source_tree=None, expect_failure=False, forget_only=
              'raw scan must not bypass legacy-over-SC bond policy'),
             ('resolve-after-failure', replace_once(replace_once(actual, RESOLVE, ''), LINK_BOUND, RESOLVE + '\n' + LINK_BOUND), False,
              'failed raw-RPA completion must end the canonical attempt'),
+            ('rebuild-in-one-burst', replace_once(actual, 'while self.pending.len() + REBUILD_HEADROOM < MAX_QUEUED {', 'loop {'), False,
+             'the first feed leaves room'),
         ]
     rustc = os.environ.get('RUSTC', 'rustc')
     with tempfile.TemporaryDirectory(prefix='bluetooth-le-reconnect-') as folder:
@@ -121,7 +123,7 @@ def run(root, keep=None, *, source_tree=None, expect_failure=False, forget_only=
                 (target / (label + '.log')).write_text(f'run exit: {tested.returncode}\n{tested.stdout}{tested.stderr}')
             if (tested.returncode == 0) != should_pass or (expected_error and expected_error not in tested.stderr):
                 raise ValueError(f'LE reconnect {label} gave the wrong verdict:\n{tested.stdout}{tested.stderr}')
-            print(f'bluetooth-le-reconnect: {label}: ' + ('PASS31 cases' if should_pass else 'expected causal failure proved'), flush=True)
+            print(f'bluetooth-le-reconnect: {label}: ' + ('PASS33 cases' if should_pass else 'expected causal failure proved'), flush=True)
     print(f'bluetooth-le-reconnect: exact source SHA256 identities {pins}; mocked bond/controller/SMP-start boundaries; not radio/encryption completion', flush=True)
 
 

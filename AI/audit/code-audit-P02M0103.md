@@ -3988,7 +3988,7 @@ What remains:
   - **The failed run: confirmed** by `.build/logs/qemu-3d-demo.7vUoI4`; its cause is still open (finding 1).
 - **Not done.** This was a static review only: nothing was built or run.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0103 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0103 (2026-10-21T12:09:39Z):
 
 **Finding 1 - a live resize to 480x800 was lost in the milestone's own gate, recorded as "not reproduced" with no cause (Medium): ACCEPTED.**
 - The cause, found by reading the retained failed run (`.build/logs/qemu-3d-demo.7vUoI4`) against the code: the resize
@@ -4002,8 +4002,8 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0103 (2026-10-19T22:00:37Z):
   on `ACQUIRE_REFUSALS` in a row with nothing presented between them) and the loop goes on to the rebuild the
   configuration already asked for; the run reports how many presents were refused that way.
 - The links the review named are made diagnosable, as the minimal fix asked:
-  - `src/user/services/core/src/display_service.rs` logs every device `Resized` it accepts or drops (with the
-    framebuffer's size), every `Replaced` it adopts or drops, every native surface's reconfiguration (extent,
+  - `src/user/services/core/src/display_service.rs` logs every device `Resized` it accepts or drops (the dropped one
+    with the framebuffer's size), every `Replaced` it adopts or drops, every native surface's reconfiguration (extent,
     generation, serial), a configuration event a full stream dropped, and a stream that failed and was closed;
   - a present settled as `ReplacedByResize` is now released on PRESENT_DONE too, as every completion is - settled only
     as an event, a dropped event left it in flight for good to a loop waiting on PRESENT_DONE.
@@ -4016,9 +4016,11 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0103 (2026-10-19T22:00:37Z):
   an acquired image, which is the window the failed run fell into, and requires exactly one refused present, the demo's
   "1 present(s) refused ... and the loop went on", a rebuild and further presents. On the tree: 7 frames presented,
   rebuilt=1, one present refused. Watched failing: with the demo leaving its loop on a refused present, as it did, it
-  stops after four presents with no rebuild ("the display stopped answering"), and the test fails.
-- `qemu-3d-demo` PASS three times on the final tree (187, 191 and 184 s). None of those runs hit the window; the test
-  above drives it on every run.
+  stops after four presents with no rebuild - the old demo left its loop silently; "the display stopped answering" is
+  the changed demo's line for a display that really stops - and the test fails.
+- `qemu-3d-demo` PASS three times on the final tree (187, 191 and 184 s). One of them DID hit the window - it printed
+  "1 present(s) refused for a configuration that had moved, and the loop went on" (so did a run on 2026-10-20, with two)
+  - which is the fix at work in a guest; the test above drives the window on every run.
 
 **Finding 2 - graph reach is still silently capped at 256 px, and the claim that this cap is documented is untrue (Low): ACCEPTED.**
 - `src/user/libs/graphics/soft2d/src/backend.rs` `graph_reach`: the cap is gone. The bounds map is walked node by node
@@ -4036,18 +4038,21 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0103 (2026-10-19T22:00:37Z):
 
 **Finding 3 - the every-pixel comparison mask is applied in only 8 of the 112 conformance scenes (Low): ACCEPTED.**
 - `src/user/libs/graphics/conformance2d/src/`: every scene whose expected picture is exact at every pixel now compares
-  the whole target - 56 of the 112:
+  the whole target - 57 of the 112:
   - `compositing.rs`: the thirteen operators and the fifteen blend modes;
   - `filters.rs`: colour matrix, composite, blend, both morphologies, displacement, crop and tile (`whole`), beside the
     blur, shadow and backdrop that already did;
   - `geometry.rs`: both fill rules and the rectangle; `clipping.rs`: the rectangle, nested and inverse clips
     (`harness::white_where`);
   - `images.rs`: the source rectangle, nearest, the three spreads and opacity;
-  - and, as before, the three layer scenes, the coverage fill and one paint scene.
+  - and, as before, the three layer scenes, the coverage fill and one paint scene;
+  - `paints.rs`: the image pattern too - nearest texels eight pixels wide on an axis-aligned rectangle - which read two
+    probes until this response's verification found its picture exact (watched failing with the stripe moved by one
+    pixel).
   `Frame::holds` had no caller left and went.
 - Watched failing: a dilation that grows only across passed the old probes and fails the new comparison at (10, 10).
-- `docs/todo/P02M0103.md` names the 56 that still read probes and why: curves, strokes, glyphs and the rounded, path and
-  alpha-mask clips (an analytic area needs a second, exact rasteriser); gradients and patterns, the sampled and
+- `docs/todo/P02M0103.md` names the 55 that still read probes and why: curves, strokes, glyphs, the polygon and the
+  rounded, path and alpha-mask clips (an analytic area needs a second, exact rasteriser); the gradients, the sampled and
   converted image scenes, the transforms and the output scenes (each needs its function evaluated per pixel); the
   convolution (its weights cancel, and the profile does not state what a divisor of zero or an out-of-range value
   becomes); and the queries, which draw nothing.
@@ -4055,7 +4060,8 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0103 (2026-10-19T22:00:37Z):
 **Finding 4 - milestone ids remain outside docs/todo in this milestone's own files, and the milestone's head still points at its audit file (Low): ACCEPTED.**
 - `docs/PERF.md`'s sections and `src/user/apps/tools/src/test2d_sw.rs` name what they record instead of the milestone.
 - `docs/todo/P02M0103.md`: the pointer at the audit is gone, every other sentence that sent the reader to the audit says
-  what was done instead, and the 2026-10-09/10 continuation paragraphs under the status are marked as superseded by the
+  what was done instead - four left in the 2026-10-09/11 continuation records were removed after this response's
+  verification found them - and the 2026-10-09/10 continuation paragraphs under the status are marked as superseded by the
   2026-10-12 completion.
 
 **Also, found by the whole kernel suites on the final tree and fixed:** the 2D demo's kernel test
@@ -4073,7 +4079,33 @@ requests while it does. It passes on x86_64 (26 s) and aarch64 (46 s).
   inside the acquire-to-present window, and fails against the demo that left on a refused present (finding 1).
 - `qemu-3d-demo` PASS three times on the final tree (above).
 
+**Found by the regression run (2026-10-21):** This review's changes - `graph_reach`'s rewrite in `soft2d`'s backend
+(finding 2) and the whole-frame conformance checks (finding 3) - moved the `file:line` claims that
+`docs/gen/render2d/backend-checklist.md` and `conformance-matrix.md` cite, and the documents were not regenerated;
+regenerated with `profile-doc` (line numbers only), `graphics-profile` PASS.
+
 **Milestone status (verified after these changes):** COMPLETE. Every item is done and all four findings are fixed; the
 resize window is driven by a kernel test on every run. What finding 3 allowed to be named instead of built is named in
 the milestone: 56 of the 112 conformance scenes compare the whole target and the other 56 read probes, each group with
 its reason.
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

@@ -798,7 +798,7 @@ The retained logs show `processor-power` (519 s), `acpi` and `host-tests` passin
   - `processor-power` 519 s, `acpi`, `host-tests`: supported by .build/claude-work/implementer/runs/processor-power-1016.log (RESULT ok, 519 s), gate-acpi.log (RESULT ok) and gate-host-tests.log (144 suites, RESULT ok).
 - **Not done.** This was a static review only: nothing was built or run.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0198 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0198 (2026-10-21T12:09:39Z):
 
 **Finding 1 - the processor handshake still offers software coordination of C-states (`_CSD`, bit 0x0040) (Low): ACCEPTED.**
 - `src/user/libs/acpi/model/src/handshake.rs`: `PROCESSOR_SUPPORT` is now `0x0002 | 0x0008 | 0x0010 | 0x0100 | 0x0200 |
@@ -817,7 +817,33 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0198 (2026-10-19T22:00:37Z):
 **Verification:**
 - The acpi model's 28 host tests pass, and `host-tests` passed on the final tree.
 - Watched failing: with 0x0040 put back into `PROCESSOR_SUPPORT`, the handshake test fails.
-- Not rerun: `processor-power` and `acpi` (see the results below if they were run at the end of the job). The ACPI
-  fixture's `_OSC` and `_PDC` do not read these two bits.
+- `processor-power` PASS (609 s) and `acpi` PASS (417 s) in the release rehearsal of 2026-10-20. The ACPI fixture's
+  `_OSC` and `_PDC` do not read these two bits.
+
+**Found by the regression run (2026-10-21):** `tickless-idle` passes on x86_64. On riscv64 its typed-input check counts
+the kernel's console interrupt although the UART is handed to its driver during boot (P02M0191, 2026-10-06) and reads 0
+- the gate's expectation, not the idle path; on aarch64 its sleep step fails the idle-sleep clock check recorded under
+P02M0197. Both reported to the owner.
 
 **Milestone status (verified after these changes):** COMPLETE. Every item is done and the finding is fixed.
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

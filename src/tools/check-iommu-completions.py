@@ -26,7 +26,7 @@ def main():
         'attach_endpoint', 'attach_for', 'attachment_quarantined', 'domain_of', 'retained_domain_of', 'faults_for', 'grants_for',
         'quarantined_grants_for', 'requester_of', 'detach_for_inner', 'poll_faults',
         'poll_faults_attributed', 'poll_faults_attributed_with', 'drain_faults',
-        'attribution_trustworthy', 'with', 'map_for_device', 'map_device_buffer',
+        'attribution_trustworthy', 'with', 'map_for_device', 'map_for_device_within', 'map_device_buffer',
         'domain_for_generation', 'unmap_for_device'))
     attach_failure = source[source.index('#[derive(Debug)]\npub struct AttachFailure {'):source.index('// Bring one device\'s endpoint under translation:')]
     prelude = r'''
@@ -45,6 +45,7 @@ mod mem {
         pub static RETIRED: AtomicUsize = AtomicUsize::new(0);
         pub fn pages_for(size: usize) -> usize { size.max(1).div_ceil(PAGE_SIZE as usize) }
         pub fn allocate_contiguous(_: usize) -> Option<u64> { Some(0x800000) }
+        pub fn allocate_contiguous_below(_: usize, _: u64) -> Option<u64> { panic!("the fixture's buffers name 64 bits, so no ceiling is asked for") }
         pub fn allocate() -> Option<u64> { panic!("host fixture never creates hardware queues") }
         pub unsafe fn deallocate(_: u64) { panic!("the fixture's successful allocation is never rolled back") }
         pub unsafe fn retire(frames: &[u64]) { RETIRED.fetch_add(frames.len(), Ordering::SeqCst); }
@@ -430,7 +431,7 @@ fn a_surviving_buffer_keeps_unconfirmed_frames_and_quota_quarantined() {
     buffer_parts = buffer_source[buffer_source.index('pub struct DmaBuffer {'):buffer_source.index('\nimpl DmaBuffer {')]
     buffer_parts += '\nimpl DmaBuffer {\n' + '\n'.join(
         re.search(r'^\tpub fn ' + name + r'\b.*?^\t}', buffer_source, re.M | re.S).group()
-        for name in ('create_for', 'mark_orphaned')) + '\n}\n'
+        for name in ('create_for', 'create_within', 'mark_orphaned')) + '\n}\n'
     buffer_parts += buffer_source[buffer_source.index('impl Drop for DmaBuffer {'):buffer_source.index('\n#[cfg(test)]\nmod tests;')]
     buffer_fixture = '''
 mod buffers {

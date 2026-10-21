@@ -790,7 +790,7 @@ Three Low items remain, and none of them changes behaviour on QEMU:
   - "`sleep` passed" and "`host-tests` passed": cannot be checked statically. The disarm has no gate oracle, as the plan says.
 - **Not done.** This was a static review only: nothing was built or run.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0196 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0196 (2026-10-21T12:09:39Z):
 
 **Finding 1 - the firmware-held/ECDT port admission has no test, although a runnable in-guest oracle exists (Low): ACCEPTED.**
 - `src/kernel/firmware/tests.rs`:
@@ -824,5 +824,33 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0196 (2026-10-19T22:00:37Z):
 - The selection of this pass's kernel tests PASS on x86_64 (35): the ECDT test, the firmware suite, and the claim test
   after `kernel.boot.init_package_starts_system_manager`.
 
+**Found by the regression run (2026-10-21):** The ports' `firmware-tree` gates booted a staging without the development
+`acpi_fixture` driver under a shipping caller; fixed with P02M0099's camera gates (a port gate builds its development
+staging), both PASS (aarch64 1469 s, riscv64 1455 s). Reported, not changed: `concurrent-selection` takes every
+`kernel.object` id from the source, including P02M0196b's port-only `a_machine_with_no_port_space_mints_nothing`, and
+has failed on x86_64 since 2026-09-29 ("no test with id"); taking the ids from what the x86_64 test kernel compiles is
+the fix, the owner's to schedule.
+
 **Milestone status (verified after these changes):** COMPLETE for phase 2. Every item is done and every finding is
 fixed. Not tested on real hardware - not part of phase 2, by the owner's decision of 2026-10-13.
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

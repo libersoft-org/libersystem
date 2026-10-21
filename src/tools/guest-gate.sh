@@ -31,11 +31,11 @@ trap guest_gate_cleanup EXIT
 # A GATE THAT NEEDS THE DEVELOPMENT IMAGE builds it, and puts the shared staging back the way it found it. image.sh
 # rebuilds `.build/image` and the system volume in the profile it runs under, so every later step reading them - a
 # kernel suite above all - would find development fixtures in a shipping volume: on 2026-10-13 the x86_64 suite failed
-# "system volume contains an undeclared entry drivers/acpi_fixture.lsexe" right after such a gate. On x86_64, where the
-# gate builds its own medium, a run that began in the shipping profile rebuilds it on the way out.
+# "system volume contains an undeclared entry drivers/acpi_fixture.lsexe" right after such a gate. A run that began in
+# the shipping profile rebuilds the gate's architecture's staging on the way out.
 guest_gate_shipping_to_restore=""
 guest_gate_development() {
-	if [[ "${LIBER_DEVELOPMENT:-}" != 1 && "$GUEST_ARCH" == x86_64 ]]; then
+	if [[ "${LIBER_DEVELOPMENT:-}" != 1 ]]; then
 		guest_gate_shipping_to_restore=1
 	fi
 	export LIBER_DEVELOPMENT=1
@@ -43,8 +43,8 @@ guest_gate_development() {
 guest_gate_restore_shipping() {
 	[[ -n "$guest_gate_shipping_to_restore" ]] || return 0
 	guest_gate_shipping_to_restore=""
-	echo "${GUEST_GATE_NAME:-guest-gate}: rebuilding the shipping x86_64 staging this gate's development image replaced" >&2
-	env -u LIBER_DEVELOPMENT "$root/../build.sh" --arch x86_64 >/dev/null 2>&1 || echo "${GUEST_GATE_NAME:-guest-gate}: the shipping staging did not rebuild - run ./build.sh --arch x86_64" >&2
+	echo "${GUEST_GATE_NAME:-guest-gate}: rebuilding the shipping $GUEST_ARCH staging this gate's development image replaced" >&2
+	env -u LIBER_DEVELOPMENT "$root/../build.sh" --arch "$GUEST_ARCH" >/dev/null 2>&1 || echo "${GUEST_GATE_NAME:-guest-gate}: the shipping staging did not rebuild - run ./build.sh --arch $GUEST_ARCH" >&2
 }
 
 # `--arch ARCH`, defaulting to x86_64.
@@ -79,6 +79,17 @@ guest_gate_triple() {
 # where the volume packager copies it from. The staged image directory holds only the dynamic half.
 guest_gate_require_programs() {
 	local image="$root/../.build/image/$(guest_gate_triple)" built="$root/../.build/cargo/user/$(guest_gate_triple)/debug" name
+	# A PORT BOOTS THE SHARED STAGING, which a run in the shipping profile built without the development probes: the
+	# ports' camera and firmware-tree gates answered "no artifact" under `verify.sh --release`. So the development
+	# staging is built here, as an x86_64 gate builds its own medium.
+	if [[ "$GUEST_ARCH" != x86_64 && "${LIBER_DEVELOPMENT:-}" != 1 ]]; then
+		guest_gate_development
+		echo "${GUEST_GATE_NAME:-guest-gate}: building the development $GUEST_ARCH staging this gate's probes are in" >&2
+		"$root/../build.sh" --arch "$GUEST_ARCH" >"$guest_gate_work/build.log" 2>&1 || {
+			tail -n 40 "$guest_gate_work/build.log" >&2
+			guest_gate_fail "the development $GUEST_ARCH staging did not build"
+		}
+	fi
 	for name in "$@"; do
 		[[ -f "$image/libexec/$name" || -f "$image/bin/$name" || -f "$built/$name" ]] || guest_gate_fail "$name is not built - build the development image:  LIBER_DEVELOPMENT=1 ./build.sh --arch $GUEST_ARCH"
 	done

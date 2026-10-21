@@ -2788,14 +2788,19 @@ fn kernel_transport_reads_a_ready_reply_without_waiting_for_unrelated_work() {
 		ENDED.store(true, Ordering::SeqCst);
 	}
 
+	// WHAT AN EARLIER TEST LEFT TO FINISH is let finish first: a driver's teardown, whose lines can take tens of ticks to
+	// print, fell inside the transport's patience on some runs, and the reply was not read in time for a reason this test
+	// is not about. And the patience is ten ticks against a fallback of sixty - still a transport that waited for the
+	// unrelated work would give up long before it ended.
+	sched::run_until_idle();
 	let (client, server) = Channel::create();
 	STOP.store(false, Ordering::SeqCst);
 	SENT.store(false, Ordering::SeqCst);
 	ENDED.store(false, Ordering::SeqCst);
 	let worker = sched::spawn(responder, alloc::sync::Arc::into_raw(server) as u64);
-	let fallback = arch::apic::ticks() + 20;
+	let fallback = arch::apic::ticks() + 60;
 	BUSY_UNTIL.store(fallback, Ordering::SeqCst);
-	let mut transport = KernelTransport::new(&client, 3);
+	let mut transport = KernelTransport::new(&client, 10);
 	let mut handles = Handles::new();
 	let reply = transport.call(REQUEST, &[], &mut handles, 0);
 	let ended_before_stop = ENDED.load(Ordering::SeqCst);

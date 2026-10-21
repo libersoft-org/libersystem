@@ -173,11 +173,15 @@ pub struct Exchange {
 	/// soon as the one before it is acknowledged, and may name it nowhere else: this was dropped whenever the command's
 	/// own completion had named a connector, and that connector's change was then never read.
 	pub after: Option<u8>,
+	/// EVERY CONNECTOR THE COMMAND'S CCIs NAMED, interim and BUSY ones included, in the order named and each once. A PPM
+	/// may name a pending change in whichever CCI comes next, and a later CCI naming another connector overwrote it in
+	/// `change` - that change was then never read.
+	pub named: Vec<u8>,
 }
 
 // Wait for a notification whose CCI satisfies `done`, noting every connector change seen on the way; a BUSY PPM is
 // waited on inside the same bound.
-fn await_cci(ppm: &mut dyn Ppm, deadline: u64, change: &mut Option<u8>, done: impl Fn(Cci) -> bool) -> Result<Cci, Failure> {
+fn await_cci(ppm: &mut dyn Ppm, deadline: u64, change: &mut Option<u8>, named: &mut Vec<u8>, done: impl Fn(Cci) -> bool) -> Result<Cci, Failure> {
 	loop {
 		if !ppm.wait_notify(deadline)? {
 			return Err(Failure::Silent);
@@ -185,6 +189,9 @@ fn await_cci(ppm: &mut dyn Ppm, deadline: u64, change: &mut Option<u8>, done: im
 		let cci = ppm.cci();
 		if let Some(number) = cci.connector() {
 			*change = Some(number);
+			if !named.contains(&number) {
+				named.push(number);
+			}
 		}
 		if done(cci) {
 			return Ok(cci);
@@ -197,15 +204,16 @@ fn await_cci(ppm: &mut dyn Ppm, deadline: u64, change: &mut Option<u8>, done: im
 /// `GET_CONNECTOR_STATUS` reading that change asks for.
 pub fn execute(ppm: &mut dyn Ppm, layout: &Layout, command: command::Command, message_out: &[u8], connectors: u8, change_ack: bool) -> Result<Exchange, Failure> {
 	let mut change = None;
+	let mut named = Vec::new();
 	ppm.send(command.control, message_out)?;
 	let deadline = ppm.now_ms() + COMMAND_MS;
-	let cci = await_cci(ppm, deadline, &mut change, |cci| cci.has(Cci::COMMAND_COMPLETE) && !cci.has(Cci::BUSY))?;
+	let cci = await_cci(ppm, deadline, &mut change, &mut named, |cci| cci.has(Cci::COMMAND_COMPLETE) && !cci.has(Cci::BUSY))?;
 	if cci.has(Cci::ACK_COMPLETE) || cci.has(Cci::RESET_COMPLETE) {
 		// A completion that also says it acknowledged or reset is no answer to a command.
 		return Err(Failure::Malformed);
 	}
-	if let Some(number) = cci.connector()
-		&& number > connectors
+	// A CONNECTOR PAST THE PPM'S COUNT, in any of the command's CCIs, is refused.
+	if let Some(&number) = named.iter().find(|&&number| number > connectors)
 		&& connectors != 0
 	{
 		return Err(Failure::Connector(number));
@@ -230,7 +238,7 @@ pub fn execute(ppm: &mut dyn Ppm, layout: &Layout, command: command::Command, me
 	ppm.send(command::ack(true, change_ack).control, &[])?;
 	let deadline = ppm.now_ms() + COMMAND_MS;
 	let mut after = None;
-	await_cci(ppm, deadline, &mut after, |cci| cci.has(Cci::ACK_COMPLETE))?;
+	await_cci(ppm, deadline, &mut after, &mut Vec::new(), |cci| cci.has(Cci::ACK_COMPLETE))?;
 	if let Some(number) = after
 		&& number > connectors
 		&& connectors != 0
@@ -240,7 +248,7 @@ pub fn execute(ppm: &mut dyn Ppm, layout: &Layout, command: command::Command, me
 	if change.is_none() {
 		change = after;
 	}
-	Ok(Exchange { completion, change, after })
+	Ok(Exchange { completion, change, after, named })
 }
 
 /// PPM_RESET, its completion POLLED through the `_DSM`'s function 2 - a reset leaves notifications off, so nothing else

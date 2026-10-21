@@ -419,6 +419,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				Some(Some(common::ProviderReady::Connected(_))) | Some(Some(common::ProviderReady::Device(_))) => {}
 				Some(Some(common::ProviderReady::Consumer(index))) => {
 					if !serve(&mut engine, &mut clients, &serving, index, &mut buf, &mut reply) && !part(&mut engine, &mut clients, &mut serving, bootstrap, &bind, index) {
+						// THE MANAGER IS GONE TOO, and the device must not keep the other connections' sessions.
+						clients.destroy_all(&mut engine);
 						exit();
 					}
 				}

@@ -1387,15 +1387,46 @@ One Low documentation defect remains: the milestone points at its audit file for
   - Audit pointers in the milestone: found at :776 and :795 (finding 1). The run directory :795 names, `.build/logs/end-of-job/qemu-only-20261010-shared-host/kernel-media-review/p0197-current-runs/`, still exists.
 - **Not done.** This was a static review only: nothing was built or run.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0197 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0197 (2026-10-21T12:09:39Z):
 
 **Finding 1 - the milestone document points at its audit file for the evidence of two runs (Low): ACCEPTED.**
-- `docs/todo/P02M0197.md`: the five sentences that sent the reader to the audit file (the status, and the 2026-10-15 and
-  2026-10-17 run records) now state the runs themselves - what ran, the result and the time - without the pointer.
+- `docs/todo/P02M0197.md`: the five sentences that sent the reader to the audit file - the status preamble and the
+  2026-10-08, 2026-10-10 (two) and 2026-10-11 records - lost their pointer clauses; the sentences around them already
+  said what ran. Two more of the same kind ("final case outcomes will be appended", and where the final record's
+  commands are) were found by this response's verification and removed too.
 - Document only; no code changed.
 
 **Verification:** `grep -n "AI/audit\|appended audit\|the audit" docs/todo/P02M0197.md` finds nothing.
 
+**Found by the regression run (2026-10-21):** `sleep` PASS (1658 s), `hibernate` PASS (2795 s), `hibernate-ports` PASS
+(6842 s). OPEN AND REPORTED: `system-suspend-riscv64`, and `tickless-idle`'s aarch64 sleep, fail the idle-sleep clock
+check every time - the serial shell's background counter keeps sampling between the freeze and the park, its 100 ms
+waits returning at once, and those samples arrive after the resume, so the oracle compares two samples taken before the
+sleep (0 ms). It passed on 2026-10-10; it fails the same with both console-input changes reverted, and no kernel clock
+or sleep code changed since.
+
 **Milestone status (verified after these changes):** COMPLETE for phase 2. The one finding was the document's pointers
 at the audit, now removed. aarch64 PSCI SYSTEM_SUSPEND, PCI PME and network wake have no emulated oracle and are out of
-phase 2 with real hardware, by the owner's decision of 2026-10-13.
+phase 2 with real hardware, by the owner's decision of 2026-10-13. Open, found by the regression run and reported to the
+owner: the ports' idle-sleep clock check (above).
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.

@@ -1970,7 +1970,7 @@ Separately, four harness lines still carry the milestone id.
   - Gate runs: the independent run /data/yellow/libersystem/.build/logs/bluetooth-independent/20261016-000657 was imaged at 02:09 on 2026-10-16, after the last Bluetooth source edit (le.rs, 01:51). It holds 70 scenario records through bond persistence and forget, which is consistent with the stated pass. The other guest gates log to temporary directories, so their passes could not be checked.
 - **Not done.** This was a static review only: nothing was built or run. The stall and call-deadline changes in BluetoothService (`CALL_TICKS`, `end_stalled`, `btclassic stall`) belong to other milestones' corrections, and were read here only for regressions.
 
-IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0194 (2026-10-19T22:00:37Z):
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0194 (2026-10-21T12:09:39Z):
 
 **Finding 1 - the standing attempt's accept-list rebuild is one burst into a 16-command queue, so five or six absent bonded LE peripherals get no standing attempt at all (Medium): ACCEPTED.**
 - `src/user/services/core/src/bluetooth_service/le.rs`: the rebuild is now a queue of its own (`LeState::rebuild`, a
@@ -1981,8 +1981,11 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0194 (2026-10-19T22:00:37Z):
   `REBUILD_HEADROOM` (4) free for what a link needs meanwhile, its encryption above all. The attempt itself is queued
   once the lists are all in. A command the queue refuses ends the rebuild rather than leaving half a list. So any number
   of bonded peripherals up to the controller's list size gets its standing attempt.
-- `src/tools/bluetooth_le_reconnect.py` and `src/tools/bluetooth-le-reconnect.rs` (the exact-source proof): updated for
-  the queued rebuild; its cases include more bonded peers than the burst could hold.
+- The exact-source proof (`src/tools/bluetooth_le_reconnect.py`, `bluetooth-le-reconnect.rs`) first only followed the
+  `VecDeque` - it never ran `feed_rebuild`, and this response said otherwise; its verification found that. It now runs
+  production's `feed_rebuild` against a command queue bounded as the controller's: seven absent bonded peers - eighteen
+  commands - are fed as the queue has room, `REBUILD_HEADROOM` places stay free for a link's encryption, nothing is
+  refused, and the attempt is queued behind the lists. A variant that feeds the rebuild in one burst fails it.
 
 **Finding 2 - the standing attempt is not taken up again after its own failed completion, nor after an operator connection the controller refuses at Command Status (Low): ACCEPTED.**
 - A standing attempt that completes in failure on its own - a peripheral that missed its first connection events (0x3E),
@@ -1999,16 +2002,46 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0194 (2026-10-19T22:00:37Z):
   them to be consumed by.
 - The exact-source proof gains a case that rotates the private address while the standing attempt is out, and the
   "rearmed" order is now `[then, Relist]`. `bluetooth-le-audio-identity.rs` follows the `VecDeque` rebuild.
+- ONE PATH STILL LEAKED `rotate`, found by this response's verification: a connection through the list refused at the
+  link bound or as a peer already linked returned before the mark was taken. It is taken there too (the attempt is not
+  taken up again at the bound, where it would connect into the same refusal); a proof case, watched failing on the
+  service as it was.
 
 **Finding 4 - the milestone id is still written in four lines of the milestone's own oracle harness (Low): ACCEPTED.**
 - `src/harness/bluetooth-oracles.md`, `src/harness/bluetooth_classic_peers.py` (two places) and
   `src/harness/prepare-bluetooth-oracles.py` say what they are instead of naming the milestone.
 
 **Verification:**
-- The exact-source proofs pass - the reconnect proof with the rotation case and more bonded peers than the burst could
-  hold, the LE Audio identity proof - and `bluetooth-le` PASS (605 s), `bluetooth-le-audio` PASS (656 s) and
+- The exact-source proofs pass - the reconnect proof (production and nine variants) with the rotation and rebuild cases,
+  the LE Audio identity proof - and `bluetooth-le` PASS (605 s), `bluetooth-le-audio` PASS (656 s) and
   `bluetooth-service` PASS (1117 s) on the final tree.
+
+**Found by the regression run (2026-10-21):** `bluetooth-independent`'s GATT step read PermissionManager's own refusal
+line ("PermissionManager: btgatt: the BluetoothGatt grant could not be minted", added 2026-10-17) as btgatt's output and
+failed although the grant was refused as required; it now reads only the program's own lines
+(`src/harness/bluetooth_guest_le.py`). `bluetooth-independent` PASS (1290 s).
 
 **Milestone status (verified after these changes):** COMPLETE for phase 2. Every part is done and every finding is
 fixed. The ports cross-build the stack and do not run it, by design; not tested on real hardware - not part of phase 2,
 by the owner's decision of 2026-10-13.
+
+**Full regression on the final tree:** A release rehearsal, `./verify.sh --release --in-place --jobs 2` over the tree
+(2026-10-20/21), ran 183 of its 373 steps in 22 hours and was stopped there by the owner's decision; every step it
+failed was run again alone, and the 190 it never reached were then run - so every release step has a result. An
+independent check of every finding of these responses against the code then found gaps, which are fixed and recorded
+above, and the fixed tree was verified one step at a time: the builds of all three targets; the drivers' 638 host tests,
+`service-logic`'s 965, `ucsi`'s 16 and `conformance2d`; the Bluetooth reconnect proof; `source-hygiene`,
+`graphics-profile`, `opentype-profile`, `guest-verdict`, `milestone-index` and `dynamic-report` (regenerated);
+`brightness-acpi`, `usb-legacy`, `typec-ucsi`, `bluetooth-le` and `driver-mutations`; and the x86_64 kernel suite, 585
+passed. The other suites on the tree before those fixes, which touched no kernel code but one x86_64 test: aarch64 546
+passed; riscv64 passed but `spool_service_sends_submitted_jobs_exactly_once`, which fails there alone (a printer's
+answer past its 200-tick bound; P02M0186, outside this review). The 148 host suites PASS (`host-tests`). Failed in the
+rehearsal only for the run's order, concurrency or load and passed alone: `perf-anchor`, `sleep`, `verify-evidence`,
+`signed-boot`'s pairing, `staged-consistency`, `run-verdict`, `capability-trace` and five arch profiles; and
+`provider-media-order`, `development-gate` and the x86_64 suite, which failed because the gates that boot through
+`dev.sh` leave the shared x86_64 staging in the development profile and nothing restores it - a harness gap reported to
+the owner. Not caused by this review - its one kernel change, and the 2026-10-19 one beside it, reverted change nothing
+- and reported to the owner: `qemu-pcie-hotplug` and `concurrent-selection` (since 2026-09-29), `signed-boot`'s
+re-signing cases (the signer has required `--dma-mode` since 2026-09-10), `arch-profile-*-no-dt-absent-1` (since
+2026-10-12), the IOMMU hostile and transition phases on both ports, the ports' idle-sleep clock check, `tickless-idle`
+on riscv64, `typec-tcpci-riscv64` (timing) and `development-lifecycle`'s protocol fuzz.
