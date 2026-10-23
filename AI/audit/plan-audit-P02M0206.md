@@ -535,3 +535,102 @@ Validation: read-only inspection of:
 - the scripts of the catalogued guest gates.
 
 Disk usage was measured with `df`. No plan or source file was modified, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0206 (2026-10-23T01:42:59Z):
+
+I checked every finding of the re-audit against the tree before acting on it. All five are accepted. For three of them I had to choose between the remedies the re-audit offered, and I say below why I chose as I did.
+
+I revised [the plan](/data/yellow/libersystem/docs/todo/P02M0206.md) in place, and its row in `docs/todo/TODO.md` now matches it. No source file was changed, and nothing was built or booted.
+
+1. **ACCEPTED: L2 in a sealed snapshot would build everything from nothing.**
+
+   The re-audit is right. `release-snapshot.sh` creates a new worktree (`:50`) with an empty `.build` (`:61`), `verify.sh` moves every step into it (`:383-386`), and the cargo output directories are relative to the tree.
+
+   **Remedy chosen: L2 runs in place.**
+   - Not taken: a snapshot that reuses the main tree's build output. Cargo identifies a path package by its location, so a worktree at another path compiles everything again, whatever target directory it is pointed at.
+   - Not taken: a cold snapshot for every L2. It does not fit the disk, which had 28 GB free.
+
+   Plan changes:
+   - **A1, L2:** `./verify.sh --release --in-place`, on the tree's own build output. The tree is left alone while it runs, and its dossier is marked a rehearsal, as it is today (`verify.sh:353`).
+   - **A1, L3:** `./verify.sh --release` on the revision the owner names. It is sealed, builds from nothing, and continues nothing from another run. Before it starts, it checks the free space against the size A3 measured. The first sealed run starts only after the owner has freed room for it.
+   - **A3:** also measures the time and the size of the sealed build.
+   - **THE TARGET:** L3 is L2's four hours plus the sealed build.
+   - **WHAT IS MEASURED:** a new bullet, "THE TIERS AND THE EVIDENCE".
+   - **Elsewhere:**
+     - the "LEVELS" entry describes the split between L2 and L3;
+     - E1 says L3 reuses nothing;
+     - VERIFICATION runs its final L2 in place, with the tree left alone.
+   - **OPEN:** the figures are restated, and there is a new question about room on the disk for a sealed release.
+
+2. **ACCEPTED: L1 as `--merge` covered only one commit.**
+
+   Confirmed in four places:
+   - `tier.rs:360-365` binds a merge to one commit;
+   - `commit.sh:27` reformats files before committing;
+   - `tier.rs:465-467` refuses outcomes for keys the tier does not own;
+   - `--for-range` exists (`verify.sh:62`) and runs the inner tier (`verify.sh:829-831`), so L1 needs no new tier.
+
+   Plan changes:
+   - **A1, L1:** `./verify.sh --for-range BASE..HEAD` on a clean tree, then `--merge` of that run's own handoff, at the same HEAD.
+     - BASE is the revision at which the last L1 or L2 passed. The runner records it in `.build/state`; until one has passed, it is given by hand.
+     - The preset adds `suite.kernel` on x86_64 and the ports' kernel-test keys to the range's plan before the plan is partitioned, so each tier owns what it runs.
+     - The tier's tests get a new oracle.
+   - **A1, L0:** I dropped the change my previous response planned for the inner tier, which moved keys the budget skipped into the handoff's deferred set. L1 now plans the whole range again, so nothing L0 skipped needs carrying in a handoff. L0's INCOMPLETE exit (status 6) is its expected outcome. This makes A1 smaller.
+   - **WHAT IS MEASURED:** "THE TIERS AND THE EVIDENCE" records that a merge covers one commit, and that `commit.sh` formats before it commits.
+
+3. **ACCEPTED: the bootable volume's DMA mode flips the way the profile does, and cold runs still build.**
+
+   Confirmed:
+   - `guest-gate.sh:129`, through `image.sh:143`, signs the volume `harness`;
+   - `lab.py:3145` signs it `enforcing-required`;
+   - both write one shared file. Its mode is recorded at `main.rs:382` and checked at `mkimage.sh:704`;
+   - `lab.py:3129` and `:3145` build every time.
+
+   One detail I checked further: `build-shared.sh:706` takes a lock per target, but only for the shared-library stage. The cargo builds, the packaging and the volume are not serialized, so the overlap the re-audit describes is real.
+
+   **Remedy chosen: the mode becomes a second dimension of the staging state.**
+   - Not taken: one volume file per mode. Every reader of the volume would have to change (`qemu-run.sh:1695`, `:2376`, `:2895`, `:3291`, `signed-boot`, the guest-verdict tests). That is the same objection the plan already makes to separate staging directories.
+   - The mode is already recorded, and `mkimage` already refuses a mismatch.
+
+   Plan changes:
+   - **B3:** retitled "THE STAGING SAYS ITS PROFILE, AND THE BOOTABLE VOLUME ITS DMA MODE". Where `qemu-run.sh` pairs the volume with a guest, it refuses a volume recorded for another mode, as `mkimage` does.
+   - **B4:** the runner brings the staging and the volume to what the next step needs. At the end it restores the shipping profile and the `enforcing-required` volume.
+   - **B5:** cold runs are grouped apart from the `harness`-mode gates, so B5's key holds.
+   - **C1:** declares the mode.
+   - **C2:** groups by profile, then by mode, with a new fixture.
+   - **C7:**
+     - a cold run builds nothing when the staging and the volume are already current;
+     - under the runner, the build it does need is a declared step of its own;
+     - its oracle now also checks that no build starts.
+   - **WHAT IS MEASURED:** the mode flip is added to "THE PROFILE IS SWITCHED BACK AND FORTH".
+   - **"WHAT WAS PROPOSED AND IS CHANGED OR DROPPED":** the barrier and separate-staging entries name the mode. A new entry, "ONE BOOTABLE VOLUME FILE PER DMA MODE", records why that remedy was not taken.
+
+4. **ACCEPTED: B4's retry left a failed envelope, and B3 contradicted B4.**
+
+   Confirmed: `check.sh:689` publishes with `--if-absent`, and `evidence.rs:141-142` and `:154-155` allow one envelope per key.
+
+   Plan changes:
+   - **B3, the refusal:** it has an exit status of its own, publishes no envelope and records no history. The step's outcome is that of its next run. New oracle: a step refused in a release rehearsal leaves no envelope.
+   - **B3, who refuses:** only `test.sh` and the steps that boot the shipping staging refuse a profile mismatch. `guest-gate.sh`, `dev.sh`, `lab.sh` and the cold runs switch into the development profile themselves, as today. Under the runner they do not switch back (B4). By hand, `guest-gate.sh` still puts the staging back.
+   - **B4:** the outcome of the second run is the step's. New oracle: a suite refused once ends with one envelope, from its second run.
+   - **After C1 lands:** the runner reads each step's declaration before starting it, so refusals become the exception. B4 already said this.
+
+5. **ACCEPTED: C1's list of calls was incomplete.**
+
+   Confirmed: nine gates boot a guest without any listed call, eight of them through `test.sh` and `secure-boot` through `guest-verdict.py`.
+
+   Plan changes:
+   - **C1, the list:** adds `test.sh`, `test-kernel.sh` and `guest-verdict.py`.
+   - **C1, the expected answer:** today's catalogue, that is `GATES_THAT_BOOT_A_GUEST` plus the five.
+   - **C1, the oracle:** the check must also pass every gate in today's catalogue, the nine included.
+
+Re-check after the changes:
+- **The levels:** each one names a command that exists today and the tree it runs on: L0 `--budget 600`, L1 `--for-range` then `--merge`, L2 `--release --in-place`, L3 `--release`. What each one changes is stated. THE TARGET, A1, A3, OPEN and VERIFICATION use the same figures.
+- **The staging state:** it has two dimensions, the profile and the volume's DMA mode. B3, B4, B5, C1, C2 and C7 treat both the same way: stamped, switched on demand, grouped, and refused at once when wrong, with no evidence left by a refusal.
+- **The release evidence:** the rule of one envelope per key per run is respected. L3 continues nothing (E1), and the "CONTINUE A RELEASE RUN" entry agrees with that.
+- **The order:** THE ORDER still covers all 27 items. B3 and B4 now include the mode, and their place in the order is unchanged.
+- **OPEN:** it asks the owner about the budgets, room on the disk for a sealed release, and D4.
+- **References:** the plan points at no audit.
+
+The plan is ready to implement once the owner has answered OPEN and says to start. Nothing has been implemented.
