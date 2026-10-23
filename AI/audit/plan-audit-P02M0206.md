@@ -437,3 +437,101 @@ Re-check after the changes:
 - **Clean of audit references.** No item points at an audit.
 
 The plan is ready to implement once the owner has answered OPEN (the budgets, and the D4 measurement) and says to start. Nothing has been implemented.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0206 (2026-10-22T21:04:17Z):
+
+**Rating: 6/10.** The revision resolves most of the first review:
+- the exclusive-gate time has items aimed at it (C7, C8 and A3);
+- L0 hands what its budget skipped on to L1;
+- guests stop when their console driver does (B7);
+- C3 is built from reproduced conflicts;
+- prices survive a model change without inventing seeds;
+- D1 and D2 agree on `suite.kernel`;
+- the spool test moved to OPEN.
+
+The planner's two partial rejections are justified:
+- the old VERIFICATION sentence was ambiguous, and it has been replaced;
+- the kernel does print a handoff line ([console_uart/mod.rs:601](/data/yellow/libersystem/src/kernel/arch/common/console_uart/mod.rs:601)), and riscv64's armed identity is the kernel's delivery id, not the source number ([riscv64/serial.rs:333](/data/yellow/libersystem/src/kernel/arch/riscv64/serial.rs:333)).
+
+Five problems remain. Four are new in the revision, or were missed by both earlier passes:
+
+1. **High - L2 now runs in a sealed snapshot, which builds everything from nothing in an empty `.build`. Neither the four hours nor the disk allow for that.**
+
+   The revision made L2 `./verify.sh --release` on a clean tree, "so that the tree can be edited while it runs" ([A1](/data/yellow/libersystem/docs/todo/P02M0206.md:155)). That run happens in a new git worktree ([release-snapshot.sh:50](/data/yellow/libersystem/src/tools/release-snapshot.sh:50)), whose `.build` starts empty ([release-snapshot.sh:61](/data/yellow/libersystem/src/tools/release-snapshot.sh:61)). `verify.sh` moves every step there ([verify.sh:383-386](/data/yellow/libersystem/verify.sh:383)), and nothing seeds it.
+
+   The cargo output directories are relative to the tree ([src/.cargo/config.toml:2](/data/yellow/libersystem/src/.cargo/config.toml:2), [src/kernel/.cargo/config.toml:3](/data/yellow/libersystem/src/kernel/.cargo/config.toml:3), [src/user/.cargo/config.toml:3](/data/yellow/libersystem/src/user/.cargo/config.toml:3)). So every L2 compiles from nothing:
+   - the planner;
+   - all three targets and their test kernels;
+   - every host tool;
+   - whatever else lives in `.build` (firmware, the foreign artifacts, the oracles).
+
+   Two consequences:
+   - **Time.** The baseline was an in-place run on a warm `.build`, where builds took 0.1 hours ([line 16](/data/yellow/libersystem/docs/todo/P02M0206.md:16)). A3 and the four-hour figure would price builds from that history, so they would not describe a cold L2.
+   - **Disk.** The main tree's cargo output is 236 GB, and the disk has 28 GB free. Nobody has measured how much a cold build of three targets needs, and nothing checks the free space before the run starts. If the shared host's disk fills, everyone working on it is stopped.
+
+   **Correct A1, A3 and VERIFICATION.** Choose L2's tree and state what it costs. The options are:
+   - in place, on a warm `.build`, with the tree left alone during the run;
+   - a snapshot whose build output is reused from the main tree, saying how;
+   - a cold snapshot, with its build time priced in A3 and a free-space check before it starts.
+
+   L3 can stay sealed, with the same accounting.
+
+2. **Medium - L1 as `--merge` covers only the change since the last commit, and only when the commit is exactly the tested tree.**
+
+   `--merge` completes one inner handoff at HEAD. It refuses unless HEAD's tree is exactly the tree the inner run tested ([tier.rs:360-363](/data/yellow/libersystem/src/tools/verify-model/src/tier.rs:360)), and its plan is HEAD against its parent ([tier.rs:365](/data/yellow/libersystem/src/tools/verify-model/src/tier.rs:365)). This fails in two ways:
+   - **Several commits.** If a milestone is committed in several commits, every earlier handoff's deferred keys are never run: the ports, the guest gates, and whatever L0's budget skipped.
+   - **Formatting at commit time.** `commit.sh` formats the changed files before it commits ([commit.sh:27](/data/yellow/libersystem/commit.sh:27)). Any file the formatter touches makes the commit differ from the tested tree, and `--merge` refuses.
+
+   L1's widening has a gap of its own. The merge tier refuses an outcome for a key it does not own ([tier.rs:465-467](/data/yellow/libersystem/src/tools/verify-model/src/tier.rs:465)), and neither the whole x86_64 suite nor the ports' split suites are in its work set.
+
+   **Correct A1's L1.**
+   - Plan the milestone's commit range on a clean tree, with `./verify.sh --for-range BASE..HEAD`, which already exists ([verify.sh:62](/data/yellow/libersystem/verify.sh:62)).
+   - Complete it with `--merge` of that run's own handoff, at the same HEAD.
+   - Add the widening keys to the plan the tiers own.
+
+3. **Medium - The staging model has one dimension, and the gates flip a second one: the bootable volume's DMA mode.**
+
+   One shared file, `.build/boot/system-volume-bootable-x86_64.img`, is rewritten for two different modes. Its mode is recorded beside it ([mkpackages main.rs:382](/data/yellow/libersystem/src/tools/mkpackages/src/main.rs:382)) and checked when a medium is made ([mkimage.sh:704](/data/yellow/libersystem/src/harness/mkimage.sh:704)):
+   - every x86_64 development-image gate builds its medium with `--dma-mode harness` ([guest-gate.sh:129](/data/yellow/libersystem/src/tools/guest-gate.sh:129)), which rebuilds the volume signed for that mode ([image.sh:143](/data/yellow/libersystem/image.sh:143));
+   - every x86_64 cold run rebuilds the same volume signed `enforcing-required` ([lab.py:3145](/data/yellow/libersystem/src/harness/lab.py:3145)).
+
+   This breaks three items:
+   - **C2 and B5.** C2 groups steps by profile. Both kinds of step are development steps, so within one group the volume flips back and forth. Each flip changes the content B5's key is made from, so B5's single ISO is rebuilt after every cold run.
+   - **The enforcing gates.** A gate that needs the enforcing-required volume (`perf-anchor`, the gates that recompute the default image's key) can find a harness one.
+   - **C7.** C7 makes a cold run's names private, but each cold run still starts by building the target's staging in the development profile ([lab.py:3122](/data/yellow/libersystem/src/harness/lab.py:3122), [:3129](/data/yellow/libersystem/src/harness/lab.py:3129)) and, on x86_64, the shared bootable volume. Two cold runs of one target, which is C7's own oracle, write those files at the same time.
+
+   **Correct B3, B4, C1, C2 and C7.**
+   - Make the bootable volume's DMA mode part of the declared staging state, switched on demand and grouped as the profile is. Alternatively, give each mode its own volume file, which removes the flips altogether.
+   - Split a cold run's build from the run itself: the build becomes a separate step, skipped when the stamps already match, so that cold runs in parallel only read.
+
+4. **Medium - B4's interim switch (a refusal, then one retry) cannot pass in a release run, and B3 contradicts B4 on hand runs.**
+
+   - **The retry.** In a release run, `check.sh` publishes an envelope for every gate, failed ones included, with `--if-absent` ([check.sh:689](/data/yellow/libersystem/check.sh:689)). A key takes one envelope per run ([evidence.rs:141-142](/data/yellow/libersystem/src/tools/verify-model/src/evidence.rs:141), [:154-155](/data/yellow/libersystem/src/tools/verify-model/src/evidence.rs:154)). So the refused first attempt's failed envelope stays, the retry's pass is never written, and the dossier lists the key as failed. L2 and L3 are release runs, and that is where the switching happens.
+   - **The contradiction.** B3 says `guest-gate.sh` refuses a profile mismatch. B4 says that, run by hand, `guest-gate.sh` "puts the staging back as it does today", which implies it also switches into the development profile itself, as it does today.
+
+   **Correct B3 and B4.**
+   - A B3 refusal publishes no envelope and records no history. Alternatively, the runner reads the stamp before it starts a step, rather than retrying after a refusal.
+   - B3 should say that `guest-gate.sh` refuses only under the runner, and still switches by itself when run by hand.
+
+5. **Low - C1's list of calls that mean "boots a guest" is incomplete, so a check run "in both directions" would refuse correct declarations.**
+
+   Nine gates the catalogue lists as booting a guest call none of the scripts C1 lists:
+   - eight boot one only through `test.sh`: `spool-service`, `i2c-bus`, `media-import-service`, `qemu-numa`, `implementation-mutations`, `concurrent-selection`, `provider-media-order` and `smp-core-cap`;
+   - `secure-boot` boots one only through `guest-verdict.py`.
+
+   **Correct C1.**
+   - Add `test.sh`, `test-kernel.sh` and `guest-verdict.py` to the list.
+   - Take today's catalogue (`GATES_THAT_BOOT_A_GUEST` plus the five gates) as the check's expected answer, so the list is tested against all of it, not only against the five.
+
+Validation: read-only inspection of:
+- the revised plan and the whole history of this file;
+- `release-snapshot.sh` and `verify.sh`'s release and tier paths;
+- `tier.rs`;
+- the cargo configurations;
+- `commit.sh`;
+- `check.sh`'s envelope publishing and `evidence.rs`;
+- `guest-gate.sh`, `image.sh`, `lab.py`'s cold run, `mkpackages` and `mkimage.sh`;
+- the scripts of the catalogued guest gates.
+
+Disk usage was measured with `df`. No plan or source file was modified, and nothing was built or booted.
