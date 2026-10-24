@@ -882,3 +882,152 @@ Not raised, because they are stale wording and not defects:
 - the milestone documents and audits that cite the deleted `end-of-job` logs now point at nothing, which is the owner's choice and outside this plan.
 
 Validation: read-only inspection of the plan, the whole history of this file, `check-capability-trace.sh`, `result-logs.sh`, `run-files.py` and `test-kernel.sh`'s log naming. `.build/logs` and the disk were measured with `find` and `df`. No plan or source file was modified, nothing was deleted, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0206 (2026-10-24T03:09:19Z):
+
+I checked both findings against the tree before acting on them, and both are ACCEPTED. The plan was revised in place. No source file was changed, nothing was deleted, and nothing was built or booted.
+
+1. **ACCEPTED: G1 kept less than the tools read, and could remove logs of runs still in flight.**
+
+   Confirmed in the tree:
+   - `capability-trace` scans every x86_64 guest log for the newest one carrying `captrace: begin` (`check-capability-trace.sh:52-70`).
+   - Gates and `verify.sh` read exactly the logs their own run wrote, through `RESULT-LOGS` (`result-logs.sh`).
+   - `run-files.py` removes only the files whose owner has ended (`run-files.py:11-20`).
+   - A test log names its run's pid (`test-kernel.sh:35`).
+   - A passing run's logs carry `test suite complete: N passed` (`test-kernel.sh:816`), so the sweep can read a run's outcome from its own logs.
+
+   I also checked the one-time cleanup of 2026-10-23. The x86_64 log kept from it, the whole suite of 2026-10-21 (585 passed), carries the trace. `capability-trace` still works today, but only because that run happened to be a whole suite. The rule now guarantees it.
+
+   Plan changes, all in G1:
+   - **When the sweep runs.** It runs at the start of a top-level run (`verify.sh`, or `test.sh` or `check.sh` started by hand), and only when no other run is live:
+     - every top-level run holds a shared lock on `.build/state/logs.lock` for its lifetime;
+     - a run started by another run takes no lock and sweeps nothing;
+     - the sweep starts only when its run gets the lock exclusively.
+
+     So D1's parts and C2's overlapping steps all run inside one top-level run, after its sweep, and nothing the sweep removes can still be written or read. It also removes only logs of runs that have ended, as `run-files.py` decides.
+   - **What it keeps.** For each test target:
+     - the newest run's logs;
+     - the newest log a reader selects by content; today that is `capability-trace`'s newest x86_64 guest log with a trace;
+     - a failed run's logs, recognised by a missing `test suite complete` line, until a later run of that target passes.
+
+     For each gate it keeps the newest kept set.
+   - **Compression is dropped.** The finding allowed compression only for logs no tool reads by name. Dropping it is the simpler remedy and loses nothing: the retention already keeps the logs small (509 MB now), and every kept log stays under its own name for its reader.
+   - **The oracle gains three cases:**
+     - an older trace-carrying log kept beside a newer one without a trace;
+     - a live run's logs left alone, and a sweep that does not start while another run holds the lock;
+     - `capability-trace` still finding its trace after a later `./test.sh --tags numa`.
+
+2. **ACCEPTED: the milestone had no end once the targets were gone.**
+
+   Plan changes:
+   - **THE TARGET:** A3's largest remaining cost now decides which of this plan's open items comes next. A cost that no item covers is recorded in the plan, for a milestone of its own. The milestone ends when every item has landed and VERIFICATION's measurement is recorded.
+   - **A3:** says the same, adding that such a cost "does not extend this one".
+
+Not raised as findings, but fixed:
+- **A1, L3:** the stale "50 GB free on 2026-10-23" now reads "111 GB free on 2026-10-24".
+- **Dangling citations:** the documents that cite the deleted `end-of-job` logs stay as they are. That is the owner's choice, as the re-audit says.
+
+Re-check after the changes:
+- **G1 against the code:** consistent with every reader of `.build/logs` found in the tree: `capability-trace`, `result-logs.sh` with its gates and `verify.sh`, and the pins.
+- **G1 against the other items:** consistent with D1's parts and C2's overlap, which now run inside a sweep-free top-level run.
+- **Completion:** the milestone's end is defined. THE TARGET, A3 and VERIFICATION agree on it.
+- **Items and oracles:** every item has an oracle, and THE ORDER covers all 28 items.
+- **OPEN:** asks the owner nothing.
+- **References:** the plan points at no audit.
+
+The plan is ready to implement once the owner says to start.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0206 (2026-10-24T03:13:51Z):
+
+**Rating: 8/10.** Both findings of the last re-audit are resolved:
+- G1's sweep now runs only at the start of a top-level run, under an exclusive lock, and removes only logs of runs that have ended;
+- G1 keeps `capability-trace`'s trace-carrying log;
+- compression is gone;
+- THE TARGET and A3 now give the milestone an end.
+
+I checked the one-time cleanup against the tree: the x86_64 log it kept carries the trace, so `capability-trace` works today.
+
+The planner's re-check states that G1 is "consistent with every reader of `.build/logs` found in the tree". It is not. Two parts of the tree that the plan does not mention touch `.build/logs`, and the revised G1 collides with both.
+
+1. **Medium - "Everything else goes" removes the build's image-graph cache, and the build does not hold the lock.**
+
+   Three files in the root of `.build/logs` are not logs:
+   - `cargo-<target>.jsonl`;
+   - `cargo-<target>.stderr`;
+   - `services-seed-<target>.stderr`.
+
+   `build-shared.sh` writes all three ([build-shared.sh:1979-1980](/data/yellow/libersystem/src/tools/build-shared.sh:1979), [:2015](/data/yellow/libersystem/src/tools/build-shared.sh:2015)). It counts a "Cargo image graph cache hit" only when all of them exist ([:2045](/data/yellow/libersystem/src/tools/build-shared.sh:2045)), and it then reads the `.jsonl` with `jq` to find the archives it links ([:2107](/data/yellow/libersystem/src/tools/build-shared.sh:2107), [:2526](/data/yellow/libersystem/src/tools/build-shared.sh:2526)).
+
+   [G1](/data/yellow/libersystem/docs/todo/P02M0206.md:392) keeps test logs, gate sets, content-selected logs, failed runs and pins, and then says "Everything else goes" ([line 405](/data/yellow/libersystem/docs/todo/P02M0206.md:405)). That causes two problems:
+   - **A repeated build.** Every sweep forces a cache miss on every target's next build. That is the waste THE TARGET names.
+   - **A failed build.** The lock holders are `verify.sh`, `test.sh` and `check.sh`. `build.sh` started by hand holds no lock, so a sweep can run beside it and remove the `.jsonl` between the build writing it and the build reading it with `jq`.
+
+   **Correct G1.**
+   - Say what the sweep may touch: `.build/logs/test`, the gates' folders, and folders that no gate or tool owns. Do not cover the whole tree with "everything else goes".
+   - Count `build.sh` and `image.sh` started by hand as top-level runs that hold the lock.
+   - Move the image-graph cache files out of `.build/logs` and into `.build/state`, where the cache's other key files already live (`build-shared.sh:1978`).
+
+2. **Low - G1 adds a second pruner beside the one the tree already has, and the plan says the tree has none.**
+
+   `./lab.sh dev-clean` prunes "host-side leftovers against documented limits" ([lab.py:2528-2541](/data/yellow/libersystem/src/harness/lab.py:2528)). It keeps the 20 newest test runs ([lab.py:2525](/data/yellow/libersystem/src/harness/lab.py:2525)), baseline samples and cache objects, and the scratch of processes that have ended. Two statements in the plan are therefore wrong:
+   - "THE LOGS" says nothing removes the logs except `clean.sh --part logs` and one gate's own folder ([line 68](/data/yellow/libersystem/docs/todo/P02M0206.md:68));
+   - G1 specifies a new sweep with different rules.
+
+   Two pruners would then disagree. `dev-clean` keeps 20 runs where G1 keeps one per target. `dev-clean` also takes the newest 20 by time, which can drop `capability-trace`'s trace-carrying log after twenty selective runs, the same hazard G1 just closed.
+
+   **Correct THE LOGS and G1.**
+   - Record `dev-clean` in THE LOGS.
+   - Make G1 the extension of `dev-clean` rather than a second mechanism: the same rules, called at the start of a top-level run, with its test-log rule replaced by G1's.
+
+Validation: read-only inspection of the plan, the whole history of this file, `build-shared.sh`'s image-graph cache, `lab.py`'s `dev-clean`, and the top-level files in `.build/logs`. No plan or source file was modified, nothing was deleted, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0206 (2026-10-24T03:17:39Z):
+
+I checked both findings against the tree before acting on them, and both are ACCEPTED. For finding 1 I chose one of its remedies over the other two, and I say why below. The plan was revised in place. No source file was changed, nothing was deleted, and nothing was built or booted.
+
+1. **ACCEPTED: "everything else goes" would remove the build's image-graph cache.**
+
+   Confirmed:
+   - In `.build/logs`, `build-shared.sh` writes only the three files the re-audit names (`build-shared.sh:1979-1980`, `:2015`). Its per-artifact transcripts go to `.build/image/<target>/logs` (`:236`).
+   - It needs all three for a cache hit (`:2045`) and reads the `.jsonl` with `jq` (`:2107`, `:2526`).
+   - Every other file of that cache is already in `.build/state`: the config, the seeds and the graph keys (`:1978-2019`).
+
+   **Remedy chosen: move the three files.** G1 now has a bullet, "THE IMAGE-GRAPH CACHE LEAVES `.build/logs`": `build-shared.sh` keeps them in `.build/state`, beside the rest of the cache. Two consequences:
+   - `.build/logs` then holds logs only, so G1's rules cover all of it, "everything else goes" included, with no exception list.
+   - `build.sh` and `image.sh` write nothing under `.build/logs`, so they need no lock.
+
+   The re-audit's other two remedies are not taken, because the move makes them unnecessary:
+   - limiting the sweep's scope to named folders;
+   - adding `build.sh` and `image.sh` as lock holders.
+
+   **WHAT IS MEASURED ("THE LOGS")** now records the cache files and where the rest of the cache lives.
+
+   **The oracle** gains a case: a build run straight after a sweep still hits its image-graph cache.
+
+2. **ACCEPTED: G1 duplicated `./lab.sh dev-clean`, and the plan said the tree had no pruner.**
+
+   Confirmed:
+   - `cmd_dev_clean` prunes test logs to the newest twenty runs by time (`lab.py:2525-2541`), along with baseline samples, stale cache objects, the scratch of processes that have ended, and a stopped instance's sockets.
+   - Its rule: only what can be produced again, or what belongs to a run that is over, may go (`lab.py:2523-2533`).
+
+   Plan changes:
+   - **G1, first bullet: "G1 IS `./lab.sh dev-clean`, EXTENDED, not a second pruner".**
+     - `dev-clean`'s rule stays.
+     - Its test-log rule is replaced by G1's: the newest run per target, the trace-carrying x86_64 log, failed runs until a pass, live runs left alone. That also removes the `capability-trace` hazard the newest-twenty rule had.
+     - It runs on its own at the start of a top-level run, not only by hand.
+   - **WHAT IS MEASURED ("THE LOGS"):** now says that `dev-clean` and `clean.sh --part logs` both exist, and that they run only when someone runs them.
+
+Re-check after the changes:
+- **One pruner.** G1 is one pruner, the existing one extended.
+- **What `.build/logs` holds.** Once the image-graph cache moves, it holds logs only. Every reader found in the tree is kept by name: `capability-trace`, `result-logs.sh`'s gates and `verify.sh`, the pins, and `build-shared.sh`'s cache, which is now in `.build/state`.
+- **Concurrency.** The sweep runs alone under the lock, after which D1's parts and C2's overlapping steps run inside one top-level run.
+- **The rest of the plan:**
+  - THE ORDER still covers all 28 items, with G1 first;
+  - every item has an oracle;
+  - OPEN asks the owner nothing;
+  - the plan points at no audit.
+
+The plan is ready to implement once the owner says to start.
