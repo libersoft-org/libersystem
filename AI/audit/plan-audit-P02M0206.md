@@ -830,3 +830,55 @@ What remains for the owner, recorded in OPEN:
 - whether the 474 MB of cited `end-of-job` logs should go too, at the price of the milestone documents' and audits' citations pointing at nothing.
 
 The session's safety check stopped any further removal until the owner gives his explicit word.
+
+
+PLANNER'S RESPONSE ON P02M0206 (2026-10-23T20:09:51Z):
+
+The owner answered OPEN's last two questions: "smaz archivy i citovane logy". On his word, two things were deleted:
+- the five archives of what nothing read (415 MB);
+- the rest of `.build/logs/end-of-job` (474 MB), the logs that milestone documents and audits cite. Those citations now name files that are gone.
+
+`.build/logs` now holds 509 MB in 2,600 files, against 62 GB on 2026-10-22: the newest kept set of each gate and test target, and the other cited files. The disk has 111 GB free.
+
+The plan's "THE LOGS" bullet, G1's pin rule (a pin can also be released by the owner, as here), OPEN and the TODO row record this. OPEN asks the owner nothing more.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0206 (2026-10-24T03:00:51Z):
+
+**Rating: 8/10.** The planner's responses since the last re-audit carry out the owner's answers of 2026-10-23 correctly:
+- no level and no item is judged against a time figure; A1, A2, A3, THE TARGET and VERIFICATION all measure instead;
+- D4 is approved, and runs at the very end;
+- OPEN asks the owner nothing.
+
+The account of the disk checks out: `.build/logs` holds 509 MB in 2,600 files, and the disk has 111 GB free. The technical parts the earlier rounds resolved stand, and are not repeated here.
+
+What remains is in the one new item, G1, and in one sentence that came with the removal of the targets.
+
+1. **Medium - G1's rule keeps less than the tools read, and removes logs of runs that are still in flight.**
+
+   [G1](/data/yellow/libersystem/docs/todo/P02M0206.md:391) says its sweep "keeps the newest guest and run log of each test target... everything older goes", runs "at the start of every run", and compresses "a kept log that is large". Against the tree, that loses logs which are read:
+   - **A tool reads an older log than the newest.** `capability-trace` does not read the newest x86_64 guest log. It scans all of them, oldest to newest, for the newest one that carries a trace, because the newest may be a selection with no trace in it, such as `./test.sh --tags numa` ([check-capability-trace.sh:52-70](/data/yellow/libersystem/src/tools/check-capability-trace.sh:52)). After any later selective run, G1 removes the one log it needs, and the gate fails for no fault of the code.
+   - **A tool reads logs a run is still writing.** Gates and `verify.sh` read the exact logs their own run wrote, by the `RESULT-LOGS` line, and that code was written because "two runs of one architecture" can be "in flight" at once ([result-logs.sh:1-16](/data/yellow/libersystem/src/tools/result-logs.sh:1)). D1's parts and C2's overlap make that the normal case. A sweep started by one run would then remove another run's logs before that run has read them.
+   - **The model G1 copies does not do this.** `run-files.py`, which G1 names as its model, removes only the files whose owner has ended ([run-files.py:11-20](/data/yellow/libersystem/src/harness/run-files.py:11)). A test log carries its owner's pid in its name ([test-kernel.sh:35](/data/yellow/libersystem/src/harness/test-kernel.sh:35)), but G1 does not carry the rule over.
+   - **Compression hides a kept log from its reader.** A compressed log gets a new name. `capability-trace` globs `x86_64-*-guest.log`, so it would no longer see the log at all.
+
+   **Correct G1.**
+   - The sweep removes only logs whose run has ended, decided by the owner pid as `run-files.py` decides it, and counts "newest" among ended runs only.
+   - For each target it also keeps the newest log that a reader selects by content. Today that is the newest x86_64 guest log carrying a trace.
+   - Only logs that no tool reads by name are compressed, which in practice means the failure logs kept for people.
+   - The oracle gains two cases: a sweep run beside a running suite leaves that suite's logs, and `capability-trace` still finds its trace after a later `--tags numa` run.
+
+2. **Low - Without targets, nothing says where the milestone ends.**
+
+   [THE TARGET](/data/yellow/libersystem/docs/todo/P02M0206.md:138) and [A3](/data/yellow/libersystem/docs/todo/P02M0206.md:228) both end with "its largest part is the next thing cut". Once the figures are gone, a measurement will always find a largest remaining part. Read as written, the milestone therefore grows without end. [VERIFICATION](/data/yellow/libersystem/docs/todo/P02M0206.md:418), meanwhile, closes it after the last item.
+
+   **Correct THE TARGET and A3.**
+   - The next cut is chosen among this plan's open items.
+   - A remaining cost that no item covers is recorded in the plan, for a milestone of its own.
+   - The milestone ends when every item has landed and VERIFICATION's measurement is recorded.
+
+Not raised, because they are stale wording and not defects:
+- L3 still says "50 GB free on 2026-10-23" ([A1](/data/yellow/libersystem/docs/todo/P02M0206.md:219)), while THE LOGS gives today's 111 GB;
+- the milestone documents and audits that cite the deleted `end-of-job` logs now point at nothing, which is the owner's choice and outside this plan.
+
+Validation: read-only inspection of the plan, the whole history of this file, `check-capability-trace.sh`, `result-logs.sh`, `run-files.py` and `test-kernel.sh`'s log naming. `.build/logs` and the disk were measured with `find` and `df`. No plan or source file was modified, nothing was deleted, and nothing was built or booted.
