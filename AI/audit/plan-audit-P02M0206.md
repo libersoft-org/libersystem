@@ -1031,3 +1031,33 @@ Re-check after the changes:
   - the plan points at no audit.
 
 The plan is ready to implement once the owner says to start.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0206 (2026-10-24T03:35:48Z):
+
+**Rating: 9/10.** Both findings of the last re-audit are resolved, and the remedies chosen are sound:
+- **The image-graph cache moves into `.build/state`.** It sits beside the rest of the cache, and `build-shared.sh` is its only reader in the tree, so the move is self-contained. I checked this against the tree.
+- **G1 extends `./lab.sh dev-clean`** instead of adding a second pruner.
+
+The two remedies the planner did not take were rightly dropped *for `.build/logs`*: scoping the sweep, and making `build.sh` and `image.sh` lock holders. One consequence of the second change is new, and it is the only issue left.
+
+1. **Medium - Run on its own, `dev-clean` also prunes the build's object cache, which a build running beside it is writing; and the build holds no lock against it.**
+
+   G1 now says that `dev-clean`, extended, "runs on its own at the start of a top-level run" ([G1](/data/yellow/libersystem/docs/todo/P02M0206.md:398)). It also says `build.sh` and `image.sh` "write nothing there, so they need no lock" ([line 405](/data/yellow/libersystem/docs/todo/P02M0206.md:405)).
+
+   But `dev-clean` prunes more than `.build/logs`. It also removes:
+   - every object generation in `.build/cache/<target>/` other than the one its `executable-<name>.object` reference names ([lab.py:2562-2579](/data/yellow/libersystem/src/harness/lab.py:2562));
+   - `.build/tmp` scratch older than a day;
+   - a stopped instance's sockets.
+
+   A build writes a new generation, `object-<name>-<key>`, before it records the reference to it ([build-shared.sh:2927-2935](/data/yellow/libersystem/src/tools/build-shared.sh:2927)). A sweep that runs between those two steps sees an unreferenced generation and removes the object the build is about to link. The build guards that step only with its per-target lock ([build-shared.sh:706](/data/yellow/libersystem/src/tools/build-shared.sh:706)), which `dev-clean` does not take. And under the latest change, a `build.sh` or `image.sh` started by hand holds no logs lock that would hold the sweep back.
+
+   `dev-clean` was written to be run by hand, when nothing is building. The plan makes it run on its own without carrying that condition over.
+
+   **Correct G1.** Either of these would do:
+   - The automatic sweep runs only `dev-clean`'s rules for `.build/logs`, and its cache, scratch and socket rules stay a command run by hand, as today.
+   - Before it prunes `.build/cache/<target>`, the automatic run takes that target's build lock (`build-<target>.lock`), and it skips the target when the lock is held.
+
+   Either way, the oracle gains a case: a sweep beside a running build leaves that build's new object generation alone.
+
+Validation: read-only inspection of the plan, the whole history of this file, `lab.py`'s `cmd_dev_clean`, `build-shared.sh`'s object cache and build lock, and a search of the tree for other readers of the image-graph cache files. No plan or source file was modified, nothing was deleted, and nothing was built or booted.
