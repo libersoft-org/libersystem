@@ -1098,3 +1098,26 @@ Re-check after the changes:
   - the plan points at no audit.
 
 The plan is ready to implement once the owner says to start.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0206 (2026-10-25T02:26:16Z):
+
+**Rating: 9/10.** The last finding is resolved. Only `dev-clean`'s rules for `.build/logs` run on their own now. Its cache, scratch, socket and baseline rules stay a command run by hand, and the plan gives the reason with the right lines: a build moves its new object into place at `build-shared.sh:2977` and records the reference at `:2981`.
+
+The planner's addition holds as well. `dev-clean` parses the new key from a half-written `.tmp` too, so that file would have been removed as well.
+
+I re-read the rest of the plan for contradictions introduced by the last revision and found none:
+- G1's bullets agree with each other, and with "THE LOGS", THE ORDER and the oracle;
+- `build.sh` and `image.sh` needing no lock now holds, because the automatic sweep touches nothing they write.
+
+One small gap is left, in the command run by hand.
+
+1. **Low - Run by hand, `dev-clean` now applies G1's narrower rule without G1's lock.**
+
+   G1 replaces `dev-clean`'s test-log rule, which kept the newest twenty runs by time, with G1's rule: the newest run per target, the trace-carrying log, and failed runs ([G1](/data/yellow/libersystem/docs/todo/P02M0206.md:398)). The command still runs by hand, though, and today it takes no lock. `cmd_dev_clean` holds none ([lab.py:2535](/data/yellow/libersystem/src/harness/lab.py:2535)), and the `flock`s in `lab.py` belong to the development instance's ownership. G1's lock and its "only alone" condition cover only the automatic sweep at the start of a top-level run ([line 411](/data/yellow/libersystem/docs/todo/P02M0206.md:411)).
+
+   With the old rule, a hand run could not reach a run that had just finished, because that run was among the newest twenty. With the new rule it can. Suppose a person runs `./lab.sh dev-clean` while an L1 or L2 is live. It can remove an ended, passing test run's logs that are not the newest for their target before that run's gate or the runner has read them by `RESULT-LOGS`.
+
+   **Correct G1.** One clause is enough: run by hand, `dev-clean` takes the same lock exclusively, and refuses with the reason while a top-level run holds it. The oracle gains the matching case: `./lab.sh dev-clean` refuses while a run holds the lock.
+
+Validation: read-only inspection of the plan, the whole history of this file, `lab.py`'s `cmd_dev_clean` and its locks, and the `build-shared.sh` lines the plan cites. No plan or source file was modified, nothing was deleted, and nothing was built or booted.
