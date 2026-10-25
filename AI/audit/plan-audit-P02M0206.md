@@ -1121,3 +1121,34 @@ One small gap is left, in the command run by hand.
    **Correct G1.** One clause is enough: run by hand, `dev-clean` takes the same lock exclusively, and refuses with the reason while a top-level run holds it. The oracle gains the matching case: `./lab.sh dev-clean` refuses while a run holds the lock.
 
 Validation: read-only inspection of the plan, the whole history of this file, `lab.py`'s `cmd_dev_clean` and its locks, and the `build-shared.sh` lines the plan cites. No plan or source file was modified, nothing was deleted, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0206 (2026-10-25T05:56:52Z):
+
+I checked the one finding against the tree before acting on it. It is ACCEPTED. The plan was revised in place. No source file was changed, nothing was deleted, and nothing was built or booted.
+
+1. **ACCEPTED: run by hand, `dev-clean` would apply G1's narrower rule without G1's lock.**
+
+   Confirmed:
+   - `cmd_dev_clean` takes no lock (`lab.py:2535`). The `flock` calls in `lab.py` (`:980`, `:1039`) guard only the development instance's ownership.
+   - With G1's rule (the newest run per target, the trace-carrying log, failed runs), a hand run beside a live top-level run could remove an ended, passing run's logs that are not the newest for their target, before that run's gate or runner has read them through `RESULT-LOGS`. The old rule kept the newest twenty runs, so a run that had just finished was always among them.
+
+   The fix is one clause and one oracle case; it is not overengineering.
+
+   Plan changes, all in G1:
+   - **The bullet "THE SWEEP RUNS AT THE START OF A TOP-LEVEL RUN, AND ONLY ALONE"** now ends with: run by hand, `./lab.sh dev-clean` takes the same lock exclusively too, and refuses with the reason while a top-level run holds it. The bullet also gives the reason, with `lab.py:2535`.
+   - **The oracle** gains a case: `./lab.sh dev-clean` refuses while a run holds the lock. The oracle paragraph was re-wrapped; none of its other cases changed.
+
+Re-check after the changes:
+- **Every path that removes logs is now bound by the lock.** The automatic sweep runs alone at the start of a top-level run. The command run by hand refuses while a run is live. Nothing else removes `.build/logs` on its own except `clean.sh --part logs`, which a person runs to discard everything.
+- **The rest of G1 is unchanged and consistent:**
+  - the image-graph cache moves into `.build/state`;
+  - the cache, scratch and socket rules stay manual;
+  - G1 keeps what each reader needs, and pins what documents cite.
+- **The rest of the plan:**
+  - THE ORDER still covers all 28 items, with G1 first;
+  - every item has an oracle;
+  - OPEN asks the owner nothing;
+  - the plan points at no audit.
+
+The plan is ready to implement once the owner says to start.
