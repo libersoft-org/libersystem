@@ -1061,3 +1061,40 @@ The two remedies the planner did not take were rightly dropped *for `.build/logs
    Either way, the oracle gains a case: a sweep beside a running build leaves that build's new object generation alone.
 
 Validation: read-only inspection of the plan, the whole history of this file, `lab.py`'s `cmd_dev_clean`, `build-shared.sh`'s object cache and build lock, and a search of the tree for other readers of the image-graph cache files. No plan or source file was modified, nothing was deleted, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0206 (2026-10-24T16:25:13Z):
+
+I checked the one finding against the tree before acting on it. It is ACCEPTED, with the first of its two remedies. The plan was revised in place. No source file was changed, nothing was deleted, and nothing was built or booted.
+
+1. **ACCEPTED: run on its own, `dev-clean` would also prune the object cache a build running beside it is writing.**
+
+   Confirmed:
+   - `dev-clean` removes every `object-<name>-*` in `.build/cache/<target>/` whose key is not the one `executable-<name>.object` names (`lab.py:2562-2579`).
+   - A build moves a new generation into place (`build-shared.sh:2977`) and records the reference to it only afterwards (`:2981`). It holds its own target lock while doing so (`:706`), and `dev-clean` does not take that lock.
+
+   It is worse than the re-audit said. The key `dev-clean` parses from a half-written `object-<name>-<key>.o.tmp.<pid>` is the new key. So the temporary file can be removed too, before the build's `mv` reaches it.
+
+   **Remedy chosen: only `dev-clean`'s `.build/logs` rules run on their own.** It is simpler than taking each target's build lock, and the cache backlog has no bearing on how long verification takes.
+
+   Plan changes:
+   - **G1, first bullet.** Only `dev-clean`'s `.build/logs` rules run on their own at the start of a top-level run. Its other rules stay a command run by hand, as today:
+     - superseded object generations in `.build/cache`;
+     - day-old `.build/tmp` scratch;
+     - a stopped instance's sockets;
+     - baseline samples.
+
+     The bullet also gives the reason, with the lines above.
+   - **G1, second bullet.** It still says that `build.sh` and `image.sh` need no lock. That now holds, because the automatic sweep touches nothing they write.
+   - **G1's oracle** gains a case: the automatic sweep touches nothing outside `.build/logs`, and an unreferenced object generation in a fixture `.build/cache` is left where it is.
+
+Re-check after the changes:
+- **The automatic sweep's reach.** It touches only `.build/logs`. That directory holds logs only once the image-graph cache moves into `.build/state`, and nothing that writes it runs beside the sweep: the lock keeps out other top-level runs, and builds write nothing there.
+- **The manual command.** `./lab.sh dev-clean` by hand still does everything it does today, under the same rule, with its test-log rule replaced by G1's.
+- **The rest of the plan:**
+  - THE ORDER still covers all 28 items, with G1 first;
+  - every item has an oracle;
+  - OPEN asks the owner nothing;
+  - the plan points at no audit.
+
+The plan is ready to implement once the owner says to start.
