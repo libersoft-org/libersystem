@@ -1152,3 +1152,32 @@ Re-check after the changes:
   - the plan points at no audit.
 
 The plan is ready to implement once the owner says to start.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0206 (2026-10-25T18:28:33Z):
+
+**Rating: 10/10.** The last finding is resolved. Run by hand, `./lab.sh dev-clean` now takes the logs lock exclusively and refuses while a top-level run holds it, and the oracle has the matching case. Every path that removes logs on its own is therefore bound by the lock:
+- the automatic sweep at the start of a top-level run;
+- the hand command;
+- `check-ipv6-peer.sh`, which clears its own folder from inside its own gate.
+
+The exception is `clean.sh --part logs`, which a person runs to discard everything.
+
+I also checked one statement that the plan's design of G1 rests on and no earlier round had verified in the code: "A release copies the logs its envelopes name into its own run directory, so `.build/logs` is not evidence". It holds:
+- `--log` copies a file into the run (`evidence.sh:59-60`);
+- the suite's envelope names its run and guest logs only that way (`test-kernel.sh:448`). Its inputs recorded by path are the staged test kernel in `.build/state` and the medium in `.build/boot`;
+- gates and steps publish their logs by `--log` too (`check.sh:689`, `verify.sh:1096`).
+
+So no envelope records a file under `.build/logs` by path, and G1's sweep cannot break a dossier, nor E1's reuse of an earlier L2's envelopes.
+
+The lock's conversion from exclusive to shared after a sweep is not atomic under `flock`. This does no harm: a run that slips in between can only remove logs of runs that have ended, and the sweeping run has produced none yet.
+
+The rest of the plan reads consistently:
+- no time figure is used as a target; the remaining mentions of a budget are `verify.sh`'s existing `--budget` flag and the record of the dropped proposal;
+- the 28 items each have an oracle, and THE ORDER covers them all;
+- OPEN asks the owner nothing;
+- the plan points at no audit.
+
+No unresolved issue, incorrect correction or new material defect remains. The plan is ready for implementation.
+
+Validation: read-only inspection of the plan, the whole history of this file, `evidence.sh`'s publishing, the suite's envelope in `test-kernel.sh`, and the envelope calls in `check.sh` and `verify.sh`. No plan or source file was modified, nothing was deleted, and nothing was built or booted.
