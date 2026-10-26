@@ -739,7 +739,8 @@ fi
 TEST_FAILED_LIST="${TEST_FAILED_LIST:-}"
 failed_test() {
 	# The test a failure ended this boot in: the last test the suite opened before `[failed]`, or before the end.
-	cat "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | awk '/^[[:alnum:]_.]+\.\.\./ { id = $0; sub(/\.\.\..*$/, "", id); last = id } /\[failed\]/ && last != "" { print last; found = 1; exit } END { if (!found && last != "") print last }' | tr -d '\r'
+	# Read whole, with no early exit: under pipefail a reader that stops early fails the pipeline it reads.
+	cat "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | awk 'found { next } /^[[:alnum:]_.]+\.\.\./ { id = $0; sub(/\.\.\..*$/, "", id); last = id } /\[failed\]/ && last != "" { print last; found = 1 } END { if (!found && last != "") print last }' | tr -d '\r'
 }
 resume_after() {
 	local failed="$1" top=0

@@ -3279,7 +3279,7 @@ fn an_account_separates_what_runs_alone_the_lanes_and_the_exclusive_chains() {
 // were scheduled as host gates.
 #[test]
 fn every_gate_declares_what_it_uses_and_its_scripts_agree() {
-	let failures = crate::resources::declaration_failures(&repo_root(), &crate::resources::GATE_RESOURCES, &crate::resources::NAMES_WHAT_IT_DOES_NOT_RUN, &crate::catalog::gate_schedules_a_guest);
+	let failures = crate::resources::declaration_failures(&repo_root(), &crate::resources::GATE_RESOURCES, &crate::resources::NOT_HELD_TO_ITS_SCRIPTS, &crate::catalog::gate_schedules_a_guest);
 	assert!(failures.is_empty(), "{failures:#?}");
 }
 

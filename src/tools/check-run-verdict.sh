@@ -695,6 +695,46 @@ else
 	note "a finished build leaves no step mark (${#own_builds[@]} build(s) of this gate's)"
 fi
 
+# A FAILING GATE PRINTS ITS OWN INJECTION TRACE, AND ONLY ITS OWN. `check.sh` printed and removed every
+# `liber-injection-trace.*.log` on any failure, so two failing injection gates side by side each printed the other's.
+# Two stand-in gates in a private tree's GATES table write their trace where the injection gate writes its own and
+# fail after both traces exist; each run of check.sh must print its gate's lines and not the other's.
+tree="$(private_root)"
+cp "$ROOT/src/tools/result-logs.sh" "$tree/src/tools/result-logs.sh"
+traces="$tree/traces"
+mkdir -p "$traces"
+for gate in one two; do
+	cat >"$tree/src/tools/check-trace-$gate.sh" <<GATE
+#!/usr/bin/env bash
+trace="\${LIBER_INJECTION_TRACE:-\${TMPDIR:-/tmp}/liber-injection-trace.\$\$.log}"
+echo "trace of gate $gate" >"\$trace"
+touch "$traces/$gate"
+for _ in \$(seq 1 100); do [[ -e "$traces/one" && -e "$traces/two" ]] && break; sleep 0.1; done
+exit 1
+GATE
+	chmod +x "$tree/src/tools/check-trace-$gate.sh"
+done
+python3 - "$tree/check.sh" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+start = text.index("declare -A GATES=(")
+end = text.index("\n)", start) + 2
+open(path, "w").write(text[:start] + 'declare -A GATES=(\n\t["trace-one"]="tools/check-trace-one.sh"\n\t["trace-two"]="tools/check-trace-two.sh"\n)' + text[end:])
+PY
+(cd "$tree" && TMPDIR="$traces" ./check.sh --gate trace-one >"$scratch/trace-one.out" 2>&1) &
+first=$!
+(cd "$tree" && TMPDIR="$traces" ./check.sh --gate trace-two >"$scratch/trace-two.out" 2>&1) &
+second=$!
+wait "$first" || true
+wait "$second" || true
+if grep -q "trace of gate one" "$scratch/trace-one.out" && grep -q "trace of gate two" "$scratch/trace-two.out" && ! grep -q "trace of gate two" "$scratch/trace-one.out" && ! grep -q "trace of gate one" "$scratch/trace-two.out"; then
+	note "two failing injection gates side by side each print their own trace and not the other's"
+else
+	complain "an injection gate printed another's trace, or not its own: $(grep -h 'trace of gate' "$scratch"/trace-*.out | tr '\n' ' ')"
+fi
+[[ -z "$(ls "$traces"/liber-injection-trace.* 2>/dev/null)" ]] || complain "a trace was left behind: $(ls "$traces"/liber-injection-trace.*)"
+
 if ((failed)); then
 	note "a run ended without saying so, or said the wrong thing"
 	exit 1

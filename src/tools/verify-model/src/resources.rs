@@ -242,7 +242,7 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("driver-event-dispatch", "host"),
 	("driver-mutations", "host"),
 	("driver-protocol-note", "host stage:x86_64:r profile:shipping"),
-	("duplicate-edge", "host stage:x86_64:r profile:shipping traces"),
+	("duplicate-edge", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
 	("dynamic-report", "host stage:x86_64:r profile:shipping"),
 	("dynamic-report-regressions", "host stage:x86_64:r profile:shipping"),
 	("firmware-fixtures", "host"),
@@ -274,7 +274,7 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("i2c-bus", "guest stage:x86_64:r profile:shipping media"),
 	("i2c-hid", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("icd-selection", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
-	("identity-note", "host stage:x86_64:r profile:shipping traces"),
+	("identity-note", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
 	("implementation-mutations", "guest stage:x86_64:r profile:shipping media"),
 	("iommu-aarch64-direct-gicv2", "guest stage:aarch64:r profile:shipping media"),
 	("iommu-aarch64-direct-gicv2-hostile", "guest stage:aarch64:r profile:shipping media"),
@@ -299,8 +299,8 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("ipv6-peer", "guest stage:x86_64:w profile:shipping media volume:x86_64:enforcing-required:w"),
 	("kernel-allocations", "host"),
 	("lifecycle", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
-	("malformed-dynamic", "host stage:x86_64:r profile:shipping traces"),
-	("malformed-symbol-relocation", "host stage:x86_64:r profile:shipping traces"),
+	("malformed-dynamic", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
+	("malformed-symbol-relocation", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
 	("media-import-service", "guest stage:x86_64:r profile:shipping media"),
 	("memory-hotplug", "guest stage:x86_64:r profile:development media"),
 	("milestone-index", "host"),
@@ -350,8 +350,8 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("source-history-hygiene", "host stage:x86_64:r profile:shipping"),
 	("source-hygiene", "host stage:x86_64:r profile:shipping"),
 	("spool-service", "guest stage:x86_64:r profile:shipping media"),
-	("staged-consistency", "host stage:x86_64:r profile:shipping"),
-	("static-image", "host stage:x86_64:r profile:shipping traces"),
+	("staged-consistency", "host stage:x86_64:w profile:shipping"),
+	("static-image", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
 	("supervisor-waits", "host"),
 	("system-suspend-riscv64", "guest stage:riscv64:r profile:development media"),
 	("targeted-cache", "host stage:x86_64:w profile:shipping"),
@@ -365,7 +365,7 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("typec-tcpci-riscv64", "guest stage:riscv64:r profile:development media"),
 	("typec-ucsi", "guest stage:x86_64:r profile:development media"),
 	("ucsi-ppm", "host"),
-	("undeclared-edge", "host stage:x86_64:r profile:shipping traces"),
+	("undeclared-edge", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
 	("unicode-segmentation", "host"),
 	("usb-legacy", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("usb-release", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
@@ -417,9 +417,10 @@ pub fn step_declaration(step: &crate::commands::Step) -> Option<Declaration> {
 	}
 }
 
-// THE GATES WHOSE SCRIPTS NAME A RUNNER OR A BUILD THEY DO NOT RUN, and why: each is held to its declaration
-// on the other half only. `(gate, "guest" | "staging" | "both", reason)`.
-pub const NAMES_WHAT_IT_DOES_NOT_RUN: [(&str, &str, &str); 7] = [
+// THE GATES WHOSE SCRIPTS DO NOT SHOW WHAT THEY DO, and why: ones that name a runner or a build they do not run, and
+// ones that write a staging without a build - they mutate the staged tree in place and put it back, which no build
+// call shows. Each is held to its declaration on the other half only. `(gate, "guest" | "staging" | "both", reason)`.
+pub const NOT_HELD_TO_ITS_SCRIPTS: [(&str, &str, &str); 14] = [
 	("boot-harness", "both", "host tests of lab.py and the scenario runner, against fakes and copies in temporary trees"),
 	("guest-verdict", "both", "host tests of the guest runners, with stand-in QEMU, runners and builds in temporary trees"),
 	("run-verdict", "guest", "copies of the entry scripts in private trees, with stub runners; its one real build is declared"),
@@ -427,6 +428,15 @@ pub const NAMES_WHAT_IT_DOES_NOT_RUN: [(&str, &str, &str); 7] = [
 	("dma-mode-carrier", "both", "reads the runners' sources for the run-mode carrier, and runs none of them"),
 	("gate-result-logs", "both", "reads the gate scripts' sources for how they find their logs, and runs none of them"),
 	("verify-scheduler", "staging", "drives the runner over prepared plans in a private tree, with a `build.sh` stand-in it writes there"),
+	// FOUND BESIDE ANOTHER STEP (2026-10-26): `build-order`, run beside `staged-consistency`, failed its bootable volume
+	// build and passed alone - the gate mutates the real staged tree and restores it. They write, and are declared so.
+	("staged-consistency", "staging", "mutates the real x86_64 staged tree, case by case, and restores it"),
+	("static-image", "staging", "mutates each target's staged image in place and restores it"),
+	("undeclared-edge", "staging", "mutates each target's staged image in place and restores it"),
+	("duplicate-edge", "staging", "mutates each target's staged image in place and restores it"),
+	("malformed-dynamic", "staging", "mutates each target's staged image in place and restores it"),
+	("malformed-symbol-relocation", "staging", "mutates each target's staged image in place and restores it"),
+	("identity-note", "staging", "mutates each target's staged image in place and restores it"),
 ];
 
 // WHAT A GATE'S SCRIPTS WERE SEEN TO CALL: a runner, which boots a guest, and a build, which writes a staging.

@@ -1818,7 +1818,7 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 	// guest and whether it writes a staging - and its booting to the slot the catalog gives it. The scheduler overlaps
 	// two steps only where their declarations do not conflict, so a declaration nobody checked would be a guess it
 	// trusts (`resources`).
-	failures.extend(verify_model::resources::declaration_failures(&model.repo_root, &verify_model::resources::GATE_RESOURCES, &verify_model::resources::NAMES_WHAT_IT_DOES_NOT_RUN, &verify_model::catalog::gate_schedules_a_guest));
+	failures.extend(verify_model::resources::declaration_failures(&model.repo_root, &verify_model::resources::GATE_RESOURCES, &verify_model::resources::NOT_HELD_TO_ITS_SCRIPTS, &verify_model::catalog::gate_schedules_a_guest));
 
 	// `lib.sh`'s VOLUME_SOURCES against the derived answer. A literal list on a hot path is fine; a
 	// literal list nobody checks is how `src/term` and `src/volume` went missing from it, and a

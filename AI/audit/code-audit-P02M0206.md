@@ -607,3 +607,216 @@ C5 - the width grows by measurement (implemented)
 Verification after the C group: `cargo test` in verify-model - 167 passed; `verify-model check` - consistent;
 check-verify-scheduler.sh - all cases pass; harness-test.py CompletionLineTest, GuestConsoleTest,
 ColdRunPrivacyTest - pass; check-guest-verdict.py inventory test - pass.
+
+Host gates after the C group (2026-10-26): `./check.sh --gate
+guest-verdict,verify-scheduler,run-verdict,boot-harness,source-hygiene,verify-model,verify-model-tests`.
+  - First pass failed in boot-harness on two of my own test defects:
+    - CompletionLineTest sent the late line at `settle / 2` of the driver's window, so the no-window run sent it at
+      once - fixed with a separate delay, the gate's half window, for both runs;
+    - FixtureSetTest's manifest carried a placeholder recipe that the new recipe check now refuses - it now
+      carries the real recipe's digest, plus a test that another recipe is stale.
+  - verify-model flagged the scheduler fixture's own `build.sh` stand-in as a staging write; verify-scheduler is
+    now in `NAMES_WHAT_IT_DOES_NOT_RUN` (staging) with that reason.
+  - After the fixes every one of the seven gates passed.
+
+D3 - a failure does not hide the rest (implemented, host-verified; real runs pending)
+  - Kernel (`src/kernel/tests.rs` `test_runner`): `TEST_AFTER` (compile-time, like a selection) starts the run
+    after the named test, in the suite's own order, in each mode (whole, selection, tags). It prints `resuming
+    after <id>`, and an unknown id is a hard failure, as a selection's is. The x86_64 test kernel compiles
+    (`TEST=1 TEST_TAGS="" cargo build --tests`); the ports' compile is part of the end-of-job port builds.
+  - `src/harness/test-kernel.sh`: after a failed test (`[failed]`), a stall naming the stuck test, a timeout, or a
+    guest reset, `resume_after` boots again with `TEST_AFTER=<that test>` and the same tags or selection. The
+    resumed boot's logs are `<stem>-restartN-{run,guest}.log`. Every failure is said as it is found, the first
+    boot prints `N test(s) of this suite failed: ...`, and the verdict stays failed.
+    - It is not resumed after a selection, resume or filter error, nor after a suite that printed `test suite
+      complete` (a failure after the suite, e.g. the USB-audio pcap check).
+    - The whole suite's envelope discharges the `[ok]` tests of every boot and names all their logs.
+    - The stall watcher's and the timeout's test-id patterns had no `.` in them, so neither ever named a namespaced
+      id (`kernel.x.y`); both now match it (the resume needs the name).
+  - lab.py logs rules: a run with `-restart` logs is a failed run.
+  - Tests:
+    - `KernelSuiteResumes` (check-guest-verdict.py): the real test-kernel.sh over a stand-in compiler that records
+      the resume point and a stand-in runner that plays a six-test suite. One planted failure: every test runs
+      exactly once, the failure is reported, one more compile, the restart logs are named after the run. Two
+      failures: both reported, three compiles. A passing suite boots once. Watched failing against HEAD's
+      test-kernel.sh: t1-t3 ran, t4-t6 never did.
+    - `LogsRulesTest.test_a_resumed_run_is_a_failed_run`.
+
+D1 - a port's suite split across guests (implemented, host-verified; the oracle is an end-of-job aarch64 run)
+  - `commands::split_suites`, applied in `emit_steps` to every plan the runner gets.
+    - A kernel-suite step of aarch64 or riscv64 whose keys are that target's kernel tests is dealt into parts: the
+      six heaviest each alone, the rest dealt dearest-first onto the lightest part, by `measured_test_durations`.
+    - Each part is `TEST_SELECTION=<its ids> ./test.sh --arch A` with its own tests' keys, in a guest of its own.
+      Steps that required the suite require every part.
+    - The number of parts is chosen with each part charged the target's measured fixed cost of a run (its compile
+      and its boot, `CostModel` fixed term), over the width (4); the count whose estimate - the work over the
+      slots, or the dearest part - is least.
+    - A step that discharges `suite.kernel` (the release's whole run) is never split, and nor is x86_64's suite,
+      which runs whole in minutes and which the inner tier owns.
+  - `measured_test_durations`: per target, the newest whole run's logs in `.build/logs/test` - `[ok] (N s)`, on the
+    test's line or after its output, and 0.5 s for a bare `[ok]`.
+  - Tests: every selected test in exactly one part, the six heaviest alone, each part an exact selection,
+    prerequisites carried to every part, `suite.kernel` and x86_64 never split; durations read from the newest
+    whole run in preference to a newer selection.
+  - Decision (stated here, not in the plan): the split covers the two emulated targets only; the plan's L1 text
+    gives x86_64's whole suite to the inner tier and the ports' tests to the merge tier "split across guests".
+
+D2 - the whole suite still runs in every L2 and L3 (holds; no new code)
+  - The release plan keeps one whole-suite step per target, carrying `suite.kernel`, and `split_suites` never splits
+    a step that discharges it (tested above). Only a whole run's envelope discharges `suite.kernel` (test-kernel.sh,
+    unchanged; a `TEST_AFTER` resume does not either).
+
+E1 - a run continues what an identical one left (implemented, host-verified)
+  - identity.rs:
+    - `PER_RUN_ENVIRONMENT`: the run's own bookkeeping variables - the run dir, the logs holder, the refusal file,
+      the injection trace, the gate key, the history path.
+    - `continuation_differences`: the tree, each tool's digest (QEMU, toolchain, image tools), the firmware, the
+      configurations, and the environment but the run's own variables.
+  - evidence.rs:
+    - `Envelope.continued_from`.
+    - `Run::continue_from(earlier)`: refuses, naming what moved, when the identities differ. Otherwise every passed
+      envelope of the earlier run this run has none for is taken over - its logs copied with their digests
+      checked, republished as this run's, marked with the run that produced it - and `continued-from` is written.
+    - `Run::withdraw`.
+    - The collector refuses a taken-over envelope whose producing run, beside this one, is gone or no longer this
+      identity (`continued-changed`). The dossier says `Continued: N envelope(s) taken over from run(s) ...` and
+      has a `from run` column.
+  - `verify-model continue-run --run NEW [--from OLD] [--steps PLAN]`: the newest earlier run marked `level` L2
+    beside it that is identical (older ones tried in turn). With the plan, it prints `COVERED <index> <run>` for
+    every step all of whose keys were taken over, and withdraws taken-over envelopes of steps only partly covered,
+    so the step that will run publishes them again.
+  - verify.sh:
+    - `release_prepare` marks an in-place release over the whole required set `level` L2.
+    - After the plan, an L2 calls `continue-run`; covered steps are decided as `CONTINUED: ... passed in run X`
+      and never started.
+    - A sealed release (L3) and a narrowed rehearsal continue nothing.
+  - Tests:
+    - check-verify-evidence.sh section 5, run on its own (the whole gate needs a shipping ISO and a nested
+      rehearsal):
+      - an L2 that passed one key and failed another is continued by an identical run: the passed envelope is
+        taken over with its log, the plan step covered, the failed key not taken over;
+      - the dossier names the producing run for the taken-over row and `this run` for the other;
+      - a run with another QEMU binary first on PATH is refused by name ("the tool qemu-system-x86_64 moved since
+        it ran") and takes nothing;
+      - a dossier whose source run's QEMU digest was then changed is refused `continued-changed`.
+    - check-verify-scheduler case 11: an in-place release over the whole set is marked L2, a covered step is not
+      started again, the rest runs.
+    - The real continuation of a real L2 has not been run: only one L2 is in this job's plan, at the end.
+
+E2 - the smaller defects (implemented, host-verified)
+  - A release in which a step was skipped (the two-guest gate at `--jobs 1`) now collects its dossier, then exits 6
+    with "the release run is INCOMPLETE" (`release_finish` takes the incomplete reason).
+    - Fixture: check-verify-scheduler case 10, a private in-place release whose cargo answers `run-start` and
+      `dossier`. Watched failing against HEAD's verify.sh: no dossier, no message.
+  - `--release` with `--catalog`, `--age`, `--trust` or `--model-hash` builds no snapshot (B6's `release_answers`),
+    checked on the tree: each answered with no snapshot, run-start or "every optimisation" line.
+
+F1 - one bounded wait (implemented; compiled for x86_64, runs pending)
+  - `src/kernel/tests.rs`: `wait_for(rounds, pump, poll) -> Option<T>` and `wait_until(rounds, pump, holds) -> bool`.
+  - The brightness test's `receive` and `peer_closed`, and the gamepad test's `settled`, `until_closed`,
+    `acknowledged` and `drive_through`, are written over them (their own loops are gone).
+
+F2 - the flake ledger (written)
+  - `docs/verification/FLAKES.md`: the rules (a test listed twice is fixed first; a failure that repeats alone is
+    no flake; the width grows only by the ledger; the one bounded wait), the count of L2 runs since the last
+    flake attributed to load (0), and the entries of 2026-10-20/21 as the plan's measurements state them. A
+    target that measurement did not record is written "not recorded" rather than guessed. The spool test is noted
+    as not a flake.
+
+F3 - typec-tcpci-riscv64 (by the plan's second option): it runs alone (`ALONE_GATES`); its bounds are unchanged.
+
+A1 - four presets (implemented, host-verified)
+  - `./verify.sh --level L0|L1|L2|L3` (and `--base REV`):
+    - L0: the inner tier over the working tree's change.
+    - L1: on a clean tree, `--for-range BASE..HEAD --l1-suites` and then `--merge` of its handoff at the same HEAD.
+      BASE is `--base`, or `.build/state/verify-last-passed`, which a passed L1 writes and so does a passed L2 over
+      a clean tree; with neither it refuses and names `--base`.
+    - L2: `--release --in-place`.
+    - L3: `--release`, refused before anything is built when `$BUILD_DIR` has less room than
+      `.build/state/release-build-size`, which a sealed release writes (the snapshot's `.build` size) for the next.
+  - tier.rs `with_suites` (`tier-inner --level L1`): `suite.kernel` x86_64 added and the x86_64 tests the range
+    selected one by one dropped (the whole suite runs them), and every port kernel test added; then partitioned as
+    any plan.
+  - Tests:
+    - tier test `an_l1_over_two_commits_plans_both_and_its_merge_runs_the_deferred_suites_at_the_same_head`: each
+      commit's keys planned; suite.kernel x86_64 inner; no x86_64 test one by one; every port test deferred; the
+      merge at the same HEAD runs every deferred key and its outcomes are accepted.
+    - check-verify-scheduler case 12: L1 with no base refused naming --base; L3 with less room refused before
+      run-start; an unknown level refused.
+
+A2 - the estimate before and the measured time after (implemented)
+  - Before dispatch: `verify-model account --steps PLAN --jobs J --brief` prints `estimate: N step(s), X s of priced
+    steps (K priced under an older model, U never measured); no schedule over J slot(s) finishes in under F s`.
+  - After the run: `measured: W s wall clock over J guest slot(s); the steps took S s between them`.
+
+A3 - where the time goes (account rewritten for the C2 scheduler)
+  - `history::PlannedStep`, `Account::of(steps, history, cost, hash)`: what runs alone, the host lane, the guest
+    slots (price x slots), the dearest exclusive chain (writers or holders of one resource, one after another), the
+    longest step. Floor = alone + the longest of the host lane, the guest work over the width, the chain and the
+    longest step. Unmeasured guest steps are priced at the seed; unmeasured host steps are named.
+  - Measured on the release plan at four slots with the prices in the history (most from 2026-10-20/21, 325 of
+    362 under an older model):
+    - 374 steps, 84,844 s (23.6 h) of priced steps, 12 never measured;
+    - alone 3,504 s; host lane 6,170 s; guest work 18,792 s over 4 slots; dearest exclusive chain 7,406 s
+      (`stage:x86_64`, its builds and writer gates); longest step 4,305 s (the aarch64 suite, before D1 splits it);
+    - floor 22,296 s (6.2 h).
+    These prices predate B1, B7 and B2 - boot-volume-controllers on the ports still 3,901 s - so the next L2's
+    measurement replaces them.
+
+Verification after D, E, F, A: verify-model `cargo test` 170 passed; `verify-model check` consistent;
+check-verify-scheduler.sh all cases; check-guest-verdict.py KernelSuiteResumes; harness-test.py LogsRulesTest,
+CompletionLineTest, FixtureSetTest, ColdRunPrivacyTest; check-verify-evidence.sh section 5 alone.
+
+The second x86_64 batch (2026-10-26, from 11:04Z; results as they come)
+  - D3, the kernel's half on the real tree: `TEST_SELECTION=<three ids, in the suite's order> TEST_AFTER=<the first>
+    ./test.sh --arch x86_64` - the guest printed `resuming after kernel.arch.common.bootmem.a_direct_boot_archive_
+    states_its_own_length: the 1 test(s) up to it ran in an earlier boot`, `running 2 selected tests (584 total)`, the
+    two after it `[ok]`, and `test suite complete: 2 passed` (PASS, 22 s).
+  - F1 and the suite after the kernel's changes: `./test.sh --arch x86_64` PASS, 585 passed (433 s in the guest,
+    446 s in all).
+  - C3, run-verdict beside a concurrent build: the concurrent `build.sh --part libs` (on a current staging) took 2 s,
+    so it was not live when run-verdict looked - not a reproduction. Reproduced instead with a live foreign mark:
+    `.build/state/build-step.<pid of a live sleep>`. The run-verdict gate of commit 73a0d898 (before C3) failed on it
+    ("a finished build left its step mark behind: .../build-step.864826"). The current gate passed ("no step mark
+    (3 build(s) of this gate's)", RESULT ok).
+  - C3, two failing injection gates side by side: the new run-verdict case passed in the gate run, and with the
+    check.sh of 73a0d898 copied into its private tree each run printed both traces.
+  - C3, staged-consistency beside the host lane: run beside `build-order`, it passed (272 s) and `build-order`
+    FAILED ("./build.sh --kernel-on-volume --part volume failed"); `build-order` passed alone (111 s).
+    `check-staged-consistency.sh` says it: "Every case below MUTATES THE REAL STAGED TREE and puts it back", and
+    so do the six injection gates (`check-static-injection.sh`: each target's staged image, backup and restore).
+    They are WRITERS:
+    - staged-consistency `stage:x86_64:w`;
+    - static-image, undeclared-edge, duplicate-edge, malformed-dynamic, malformed-symbol-relocation and
+      identity-note `stage:x86_64:w stage:aarch64:w stage:riscv64:w`.
+    The static check cannot see a write without a build call, so these seven are in the exemption table, renamed
+    `NOT_HELD_TO_ITS_SCRIPTS` since it now holds both kinds, with the reason.
+  - B2, C2, C3 together - four development-image gates through the scheduler at four slots (`LIBER_VERIFY_STEPS`
+    with the release plan's steps for i2c-hid, usb-legacy, bluetooth-le and usb-release, keys kept):
+    - estimate: 2,920 s of priced steps, a floor of 929 s;
+    - the runner brought `stage:x86_64` to development (138 s) and the volume to development/harness (72 s), once;
+    - all four started together and passed - bluetooth-le 140 s, i2c-hid 164 s, usb-release 176 s, usb-legacy
+      274 s - four x86_64 guests at once, none colliding on a socket or a port;
+    - the end restore put the staging back. Run 704 s, against 452 + 409 s for two of them one after another in the
+      first batch.
+  - C7 - two cold scenarios of one target started together on a current staging:
+    - the cold run before them, by hand on a shipping staging, named what was stale (libs in shipping; the bootable
+      volume not from these sources) and built it, then passed `launch a program`;
+    - then `launch-program` and `shell-basics` together: each printed "the x86_64 staging is current in the
+      development profile; nothing is built", booted in its own directory (`.build/tmp/cold-x86_64.844649`,
+      `.844650`) and passed.
+  - B4(c): `./test.sh --arch x86_64` by hand straight after the cold runs: `REFUSED: the x86_64 staging's 'libs' was
+    built in the development profile ... build it: env -u LIBER_DEVELOPMENT ./build.sh --arch x86_64`, exit 75 in
+    1 s.
+  - B6, concurrent-selection, its first run: after rebuilding the x86_64 staging (my verify-model edits had made it
+    stale - the gate refused in 1 s on it), PASS in 112 s: two suites overlapping, each on its own medium and logs.
+
+The host gates after the second batch (2026-10-26)
+  - `./check.sh --gate verify-model,verify-model-tests,verify-scheduler,guest-verdict,boot-harness,run-verdict,
+    source-hygiene,milestone-index,gate-result-logs`: the first six passed; source-hygiene FAILED on
+    `src/harness/test-kernel.sh:742` - `failed_test` piped both logs into an awk that stopped at the first failed id
+    (`exit`), which under pipefail reads as a failed pipeline when the writer is still writing.
+  - Fixed: the awk reads to the end and skips the lines after the first failed id (`found { next }`); what it prints
+    is unchanged. `check-guest-verdict.py KernelSuiteResumes` 3 tests OK (91 s); then
+    `./check.sh --gate source-hygiene,milestone-index,gate-result-logs` RESULT ok (110 s).
+  - `./format.sh --changed`: nothing to change.
