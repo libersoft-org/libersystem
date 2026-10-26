@@ -835,50 +835,36 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	// targets - the service on another core - a pass could end before it had read the driver at all: the events are
 	// read until `want` have come, or the bound of passes is spent and the assertion that follows says what came.
 	fn settled(stream: &Channel, want: usize, pump: &mut dyn FnMut()) -> alloc::vec::Vec<GamepadEvent> {
-		let mut out = events(stream);
-		for _ in 0..200 {
-			if out.len() >= want {
-				break;
-			}
-			pump();
+		let mut out = alloc::vec::Vec::new();
+		crate::tests::wait_until(200, pump, || {
 			out.extend(events(stream));
-		}
+			out.len() >= want
+		});
 		out
 	}
 	// The same for a stream the service is about to close: every event it held, once it has closed or the bound is spent.
 	fn until_closed(stream: &Channel, pump: &mut dyn FnMut()) -> alloc::vec::Vec<GamepadEvent> {
-		let mut out = events(stream);
-		for _ in 0..200 {
-			if stream.is_peer_closed() {
-				break;
-			}
-			pump();
+		let mut out = alloc::vec::Vec::new();
+		crate::tests::wait_until(200, pump, || {
 			out.extend(events(stream));
-		}
+			stream.is_peer_closed()
+		});
 		out.extend(events(stream));
 		out
 	}
 	// A focus change's acknowledgement, waited for the same way.
 	fn acknowledged(channel: &Channel, pump: &mut dyn FnMut()) -> alloc::vec::Vec<u8> {
-		for _ in 0..200 {
-			if let Ok(message) = channel.recv() {
-				return message.bytes;
-			}
-			pump();
-		}
-		panic!("the focus change was never acknowledged");
+		crate::tests::wait_for(200, pump, || channel.recv().ok().map(|message| message.bytes)).unwrap_or_else(|| panic!("the focus change was never acknowledged"))
 	}
 	// A frame sent the way a driver sends one: a channel the service has not read yet is waited on, not overrun - what
 	// falls behind in these steps is meant to be the reader, never the driver.
 	fn drive_through(driver: &Channel, frame: alloc::vec::Vec<u8>, pump: &mut dyn FnMut()) {
-		for _ in 0..200 {
-			match driver.send(Message::new(frame.clone(), alloc::vec::Vec::new())) {
-				Ok(()) => return,
-				Err(ChannelError::Full) => pump(),
-				Err(error) => panic!("a driver frame: {error:?}"),
-			}
-		}
-		panic!("the service never read its driver's channel");
+		let sent = crate::tests::wait_until(200, pump, || match driver.send(Message::new(frame.clone(), alloc::vec::Vec::new())) {
+			Ok(()) => true,
+			Err(ChannelError::Full) => false,
+			Err(error) => panic!("a driver frame: {error:?}"),
+		});
+		assert!(sent, "the service never read its driver's channel");
 	}
 	// A request that hands a capability over and answers with one - or refuses with the correlation alone.
 	fn call(client: &Channel, op: u16, corr: u32, proof: Option<alloc::sync::Arc<Channel>>, pump: &mut dyn FnMut()) -> Option<alloc::sync::Arc<Channel>> {

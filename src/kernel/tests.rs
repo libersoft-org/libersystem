@@ -87,6 +87,26 @@ pub(crate) fn clock_skew() -> u64 {
 // Push the guest's notion of time forward. Waiters due after the jump are woken by the scheduler's
 // deadline check, which runs on every pass of `run_until_idle` - so a pump after this is what
 // actually delivers the wake.
+// ONE BOUNDED WAIT FOR THE SUITES. What a test waits for is asked again after each `pump`, at most `rounds` times, and
+// the answer is the first it gives - `None` once the bound is spent, so the assertion after it says what came. A test
+// that pumped once and expected its answer failed on an emulated target whenever the service it asked was on another
+// core and had not run yet; the tests that met it each grew a loop of their own - the brightness test's `peer_closed`,
+// the gamepad test's helpers - and this is the one they share.
+pub(crate) fn wait_for<T>(rounds: usize, pump: &mut dyn FnMut(), mut poll: impl FnMut() -> Option<T>) -> Option<T> {
+	for _ in 0..rounds {
+		if let Some(value) = poll() {
+			return Some(value);
+		}
+		pump();
+	}
+	poll()
+}
+
+// Whether `holds` came to hold within the bound.
+pub(crate) fn wait_until(rounds: usize, pump: &mut dyn FnMut(), mut holds: impl FnMut() -> bool) -> bool {
+	wait_for(rounds, pump, || holds().then_some(())).is_some()
+}
+
 pub(crate) fn advance_clock(ticks: u64) {
 	CLOCK_SKEW.fetch_add(ticks, core::sync::atomic::Ordering::Relaxed);
 }

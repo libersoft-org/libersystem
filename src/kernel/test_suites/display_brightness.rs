@@ -23,26 +23,14 @@ fn wait(ticks: u64) {
 }
 
 fn receive(channel: &Channel, why: &str) -> Message {
-	for _ in 0..100 {
-		if let Ok(message) = channel.recv() {
-			return message;
-		}
-		pump();
-	}
-	panic!("no reply: {why}")
+	crate::tests::wait_for(100, &mut pump, || channel.recv().ok()).unwrap_or_else(|| panic!("no reply: {why}"))
 }
 
 // WHETHER THE SERVICE CLOSED `channel`'s peer, within the bound a reply is waited for: a message the service answers by
 // closing what it carried is not always handled within the one pump that delivered it - a late completion printing
 // that its backlight answered again took a second.
 fn peer_closed(channel: &Channel) -> bool {
-	for _ in 0..100 {
-		if channel.is_peer_closed() {
-			return true;
-		}
-		pump();
-	}
-	channel.is_peer_closed()
+	crate::tests::wait_until(100, &mut pump, || channel.is_peer_closed())
 }
 
 fn reply(channel: &Channel, corr: u32, body: impl FnOnce(&mut wire::VecWriter)) {

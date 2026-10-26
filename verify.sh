@@ -858,11 +858,6 @@ elif [[ "$mode" == release ]]; then
 	release_plan_args=()
 	[[ -z "$release_required_file" ]] || release_plan_args=(--required "$LIBER_RELEASE_REQUIRED")
 	cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- release-plan "${release_plan_args[@]}" >"$steps_file" || planner_failed "the release plan could not be produced"
-	# A RUN CONTINUES WHAT AN IDENTICAL ONE LEFT: an L2 takes over the passed envelopes of the newest earlier L2 whose
-	# tree, tools, firmware and configuration are this one's, and runs only what failed or never ran.
-	if [[ -f "$release_run_dir/level" ]]; then
-		cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- continue-run --run "$release_run_dir" --steps "$steps_file" >"$steps_file.covered" || planner_failed "the earlier run could not be continued"
-	fi
 else
 	mkdir -p "$BUILD_DIR/state/verify-tiers"
 	tier_run="$(mktemp -d "$BUILD_DIR/state/verify-tiers/run.XXXXXX")"
@@ -1512,6 +1507,12 @@ dispatch() {
 	done
 	pending=(${kept[@]+"${kept[@]}"})
 }
+
+# A RUN CONTINUES WHAT AN IDENTICAL ONE LEFT: an L2 takes over the passed envelopes of the newest earlier L2 whose tree,
+# tools, firmware and configuration are this one's (`continue-run`), and runs only what failed or never ran.
+if [[ -n "$release_run_dir" && -f "$release_run_dir/level" ]]; then
+	cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- continue-run --run "$release_run_dir" --steps "$steps_file" >"$steps_file.covered" || planner_failed "the earlier run could not be continued"
+fi
 
 # THE STEPS, in the plan's order - the order they are considered in - read whole before any runs. They were read on
 # fd 3, one at a time between steps, because the first step that read stdin swallowed the rest of the plan; read

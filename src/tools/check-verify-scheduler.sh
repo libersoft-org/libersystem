@@ -572,6 +572,39 @@ check "a release with a step skipped for the slots is INCOMPLETE" 6 "$rc"
 check "and its dossier is collected all the same" 1 "$(grep -c ' dossier ' "$release/calls" || true)"
 check "and said" 1 "$(grep -c 'the release run is INCOMPLETE' "$out" || true)"
 
+# 11. AN L2 CONTINUES WHAT AN IDENTICAL ONE LEFT: a step all of whose keys the earlier run passed is not started again,
+#     and the rest runs. The model's `continue-run` (stood in for here) decides what an identical earlier run covers.
+cat >"$release/bin/cargo" <<'RECORDER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CARGO_CALLS"
+case " $* " in
+*" run-start "*)
+	mkdir -p "$RELEASE_RUN/logs"
+	echo "$RELEASE_RUN"
+	;;
+*" continue-run "*) printf 'COVERED\t0\tthe-earlier-run\n' ;;
+*" dossier "*) printf '# Release dossier - run fixture (rehearsal (in place))\n' >"$RELEASE_RUN/dossier.md" ;;
+esac
+exit 0
+RECORDER
+plan="$release/plan-continued"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	printf 'STEP\t0\t1\tthe step the earlier run passed\ttouch %q\t\n' "$release/ran-0"
+	printf 'STEPID\t0\tid-0\nSTEPCOST\t0\t1\nSTEPGUESTS\t0\t0\nKEY\t0\tgate.covered / host / host / default\n'
+	printf 'STEP\t1\t1\tthe step it did not\ttouch %q\t\n' "$release/ran-1"
+	printf 'STEPID\t1\tid-1\nSTEPCOST\t1\t1\nSTEPGUESTS\t1\t0\nKEY\t1\tgate.uncovered / host / host / default\n'
+} >"$plan"
+rm -rf "$release/run"
+: >"$release/calls"
+out="$release/continued.log"
+rc=0
+(cd "$release" && PATH="$release/bin:$PATH" CARGO_CALLS="$release/calls" RELEASE_RUN="$release/run" LIBER_VERIFY_STEPS="$plan" ./verify.sh --release --in-place) >"$out" 2>&1 || rc=$?
+check "an in-place release over the whole set is an L2, and is marked so" L2 "$(cat "$release/run/level" 2>/dev/null)"
+check "the step the earlier identical run passed is not started again" "absent present" "$([[ -e "$release/ran-0" ]] && echo present || echo absent) $([[ -e "$release/ran-1" ]] && echo present || echo absent)"
+check "and the run says where its envelope came from" 1 "$(grep -c 'CONTINUED: the step the earlier run passed - passed in run the-earlier-run' "$out" || true)"
+check "and finishes" 0 "$rc"
+
 if ((failed != 0)); then
 	echo "verify-scheduler: the shell scheduler did not behave as the milestone requires" >&2
 	exit 1
