@@ -1625,6 +1625,8 @@ class LogsLockTest(unittest.TestCase):
 		os.makedirs(os.path.join(self.repo, 'src', 'harness'))
 		for name in ('lib.sh', 'dev.sh'):
 			shutil.copy2(os.path.join(repo, name), os.path.join(self.repo, name))
+		os.makedirs(os.path.join(self.repo, 'src', 'tools'))
+		shutil.copy2(os.path.join(repo, 'src', 'tools', 'staging-state.sh'), os.path.join(self.repo, 'src', 'tools', 'staging-state.sh'))
 		self.lab = os.path.join(self.repo, 'src', 'harness', 'lab.py')
 		shutil.copy2(os.path.join(HERE, 'lab.py'), self.lab)
 		with open(os.path.join(self.repo, 'check.sh'), 'w') as handle:

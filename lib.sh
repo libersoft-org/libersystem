@@ -11,6 +11,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$REPO_ROOT/src"
 BUILD_DIR="$REPO_ROOT/.build"
+# shellcheck source=src/tools/staging-state.sh
+source "$SRC_DIR/tools/staging-state.sh"
 
 ARCHS_ALL=(x86_64 aarch64 riscv64)
 
@@ -241,11 +243,13 @@ run_owned_shell() {
 # `verify.sh`, and by `test.sh` and `check.sh`, once their arguments are read: the first of them in a
 # process tree sweeps, if no other run is alive, and then holds `.build/state/logs.lock` shared until
 # it ends; every run it starts inherits `LIBER_LOGS_RUN` and takes no lock and sweeps nothing. A
-# marker whose run has ended is no marker, so a process a run left behind is not held back by it.
+# marker whose run has ended is no marker, so a process a run left behind is not held back by it. A
+# tree without the harness - a fixture that copies the entry scripts - has no logs to keep.
 logs_run_begin() {
 	if [[ -n "${LIBER_LOGS_RUN:-}" ]] && kill -0 "$LIBER_LOGS_RUN" 2>/dev/null; then
 		return 0
 	fi
+	[[ -f "$SRC_DIR/harness/lab.py" ]] || return 0
 	export LIBER_LOGS_RUN="$$"
 	python3 "$SRC_DIR/harness/lab.py" dev-clean --run "$$" || note "the logs sweep did not finish, and this run goes on without holding the logs lock"
 }

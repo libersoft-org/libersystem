@@ -316,6 +316,8 @@ private_root() {
 	# branches below, which publish no evidence and write no result log.
 	: >"$root/src/tools/evidence.sh"
 	: >"$root/src/tools/result-logs.sh"
+	# And the staging-state helpers lib.sh sources, as they are: a refusal is part of the control flow.
+	cp "$ROOT/src/tools/staging-state.sh" "$root/src/tools/staging-state.sh"
 	printf '%s' "$root"
 }
 

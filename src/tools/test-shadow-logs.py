@@ -90,6 +90,8 @@ class ShadowLogPaths(unittest.TestCase):
             (root / "bin").mkdir()
             shutil.copy2(ROOT / "lib.sh", root / "lib.sh")
             shutil.copy2(ROOT / "src/tools/result-logs.sh", root / "src/tools/result-logs.sh")
+            # The staging-state helpers lib.sh sources.
+            shutil.copy2(ROOT / "src/tools/staging-state.sh", root / "src/tools/staging-state.sh")
             # The evidence helper verify.sh sources: a no-op here, since no run is collecting.
             shutil.copy2(ROOT / "src/tools/evidence.sh", root / "src/tools/evidence.sh")
             scripts = {
