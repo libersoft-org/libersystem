@@ -398,6 +398,12 @@ pub fn read_byte() -> Option<u8> {
 
 // ------------------------------------------------------------------ the handoff, by the UART's base
 
+// The APLIC source the console's receive line is, 0 until the boot tail armed it - how a claim's binding knows
+// the line it arms is the console's.
+pub fn console_source() -> u32 {
+	CONSOLE.model().source.load(Ordering::Acquire)
+}
+
 fn instance(base: u64) -> Option<&'static Uart<Ns16550>> {
 	(base == CONSOLE.base()).then_some(&CONSOLE)
 }

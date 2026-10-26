@@ -151,3 +151,272 @@ B7 - the guest stops when its console driver does (implemented, host-verified; r
     - `./check.sh --gate guest-verdict`: 104 tests OK.
   - NOT YET RUN: "`usb-release` and `bluetooth-le` give the same verdict before and after on one tree" (real x86_64
     gate runs). Batched with the other real runs.
+
+B3 - the staging says its profile, and the bootable volume its DMA mode (implemented, host-verified; real-tree run pending)
+  - New `src/tools/staging-state.sh` (mode 755, like the other sourced helpers). It is sourced by `lib.sh`,
+    `qemu-run.sh`, `mkimage.sh`, `test-kernel.sh` and `check-development-gate.sh`, and defines:
+    - `STATE_REFUSED=75`, the status of its own;
+    - `run_profile`: `development` with `LIBER_DEVELOPMENT=1`, else `shipping`;
+    - `staging_build_command`;
+    - `record_staging_profile`;
+    - `staging_profile_refusal`;
+    - `volume_mode_refusal`.
+  - THE RECORD: `build.sh` writes `.build/state/built-<arch>-<part>.profile` beside its per-part source stamps, for
+    `libs`, `user` (which also records `libs`, since `step_user` builds them), `packages` and the volume part
+    (`volume` or `volume-test`, the same name its stamp has). `image.sh` stamps through the build.sh it runs.
+  - THE REFUSALS (exit 75; each names the part or volume, the profile or mode needed, and the command that builds
+    it):
+    - `test.sh` `require_built`: after the source-digest check, every one of `libs user packages volume-test` must
+      be in `run_profile`. A missing record refuses too.
+    - `qemu-run.sh`, before the per-arch dispatch: a boot that reads the staging must find its parts in
+      `run_profile`.
+      - ports: `libs user packages volume-test`, or `libs user packages volume` with `SYSTEM_DISK`;
+      - x86_64 without `BOOT_IMAGE`: the same parts, with `volume-test` under `TEST=1` and `volume` otherwise;
+      - an x86_64 `BOOT_IMAGE` carries its own volume and is not checked.
+      Checked first: every development-profile caller passes `LIBER_DEVELOPMENT=1` in its boot environment (lab.py
+      dev-up and cold runs, check-system-suspend.py, check-tickless-idle.py, check-hibernate-ports.py,
+      check-bluetooth-independent.py, guest_gate_development).
+    - `qemu-run.sh` DMA mode, where a bootable volume is paired with a guest:
+      - ports (`qemu_port_volume_pairing`, `SYSTEM_DISK`): the record must be `harness`, because the port medium is
+        always signed `--dma-mode harness` (`stage_signed_boot_manifest`). Its three callers now pass the status on
+        (`|| exit $?` instead of `|| exit 1`).
+      - x86_64: when a new `RUN_DISK` would be seeded from `system-volume-bootable-x86_64.img`, its record must equal
+        the medium's signed mode.
+    - `mkimage.sh`: the old `die` (exit 1) for a volume signed for another mode is replaced by `volume_mode_refusal`
+      and exit 75. A missing `.dma-mode` record now refuses the same way. A missing image or uuid still dies (exit
+      1).
+    - `check-development-gate.sh`: after `--manifest-only` and before anything is built, the volume package's
+      `packages` record must be in `run_profile`. A package whose record and content disagree still fails check 4.
+      This gate does not boot. It is included because the plan names its failure on "not the shipping
+      configuration" among the profile-switch failures.
+  - NO ENVELOPE, NO HISTORY:
+    - `test-kernel.sh`: a runner status of 75 with a `qemu-run: REFUSED:` line is passed on as 75, and
+      `publish_suite_evidence` (the EXIT trap) publishes nothing (`SUITE_REFUSED=1`).
+    - `check.sh` `run_gate`: status 75 publishes no envelope, notes "REFUSED to run", and returns 75. `check.sh`'s
+      exit then carries it.
+    - `verify.sh`: `run_one_step` keeps the step's real status; it used to flatten every failure to 1.
+      `record_one_step` on 75 notes "REFUSED: <label>", counts the step failed for the run's verdict and for
+      blocking, and publishes no fallback envelope, files no tier outcome and records no history. Until B4 the
+      refused step is not run again.
+  - Fixture copy lists that copy the changed scripts now also copy `staging-state.sh`:
+    - check-verify-scheduler.sh (the learning fixture);
+    - test-shadow-logs.py;
+    - check-run-verdict.sh (`private_root`);
+    - check-guest-verdict.py (KernelBuildOnly, PerfImageIsolation; both failed until then);
+    - harness-test.py (LogsLockTest).
+    `logs_run_begin` returns at once in a tree without `src/harness/lab.py`, because those fixtures copy the entry
+    scripts without the harness.
+  - Tests:
+    - `check-run-verdict.sh`, new case "a staging in the other profile": a private root with a current digest stamp
+      and the four parts recorded `development`. `env -u LIBER_DEVELOPMENT test.sh --arch x86_64 --build-only` ->
+      `RESULT failed exit=75` in 1 s, with "REFUSED: the x86_64 staging's 'libs' was built in the development
+      profile, and this step needs the shipping one". Watched failing on HEAD's test.sh: exit 127, past the
+      pre-flight into the missing harness (on a real tree that is the compile and the boot).
+    - `check-verify-scheduler.sh`, new case 7: a prepared plan with a refusing step (`exit 75`) and a failing step,
+      both with KEY lines and both in a fixture `LIBER_RELEASE_REQUIRED`, run under a fixture `LIBER_VERIFY_RUN`
+      through a private copy with a recording `cargo`. The refused step is reported REFUSED and gets no envelope
+      call and no `record` call; the failed step gets both; the run does not pass. Watched failing on HEAD's
+      verify.sh: the refused step is not reported as refused, and it published an envelope and recorded history.
+    - qemu-run.sh on the real tree (no QEMU started): `TEST=1 LIBER_RUN_MODE=test bash harness/qemu-run.sh x86_64
+      <kernel>` and the same for aarch64, without `LIBER_DEVELOPMENT`, both exit 75 in 0 s. x86_64: "'packages'
+      carries no profile record"; aarch64: "'libs' carries no profile record". No build has written the remaining
+      records yet. `libs` and `user` on x86_64 were written by the run-verdict gate's own real `./build.sh --part
+      libs,user`.
+  - Gates run: `./check.sh --gate run-verdict,verify-scheduler,guest-verdict,boot-harness` -> RESULT ok (143 s);
+    `./check.sh --gate source-hygiene` -> clean. The first hygiene run failed on the new file's mode 644, fixed
+    to 755.
+  - NOT YET RUN on the real tree: a real development staging followed by `./test.sh` refusing in seconds; a
+    release rehearsal with a refused step. Batched with B4's real runs, which need the same states.
+
+B6 - the gates that cannot pass are made able to (implemented; per-gate status below)
+  1. concurrent-selection - `src/tools/check-concurrent-selection.sh`
+     - Change: the `kernel.object` ids are no longer grepped from the source. The gate first compiles the whole
+       x86_64 test kernel (`harness/test-kernel.sh x86_64 --build-only`), then reads its ids with a new model-free
+       command, `verify-model kernel-tests --arch A`. That command calls the planner's own
+       `kerneltests::discover` (nm over the test binary), takes 4 s, and refuses when no test binary exists.
+     - Old reason, demonstrated: on the real tree the source declares 121 `kernel.object.*` ids and the x86_64 test
+       kernel carries 120. The one missing is `kernel.object.port_range.a_machine_with_no_port_space_mints_nothing`,
+       which only the ports compile; one of the two selections always contained it.
+     - NOT YET RUN: the gate itself, which needs two x86_64 guests at once and may meet C3's port-5555 collision.
+       Batched.
+  2. signed-boot - `src/tools/check-signed-boot.sh`
+     - Change: `medium_mode="$(src/harness/image-dma-mode.sh "$ISO")"`, and `resign_with` passes `--dma-mode
+       "$medium_mode"` before the case's own arguments.
+     - Old reason, demonstrated without a boot: the manifest rows re-signed exactly as `resign_with` did, from the
+       ESP of `.build/boot/libersystem.iso` (built 2026-10-21, mode `enforcing-required`). Without `--dma-mode`,
+       exit 1 with "--dma-mode is required"; with the medium's mode, it signs and verifies.
+     - NOT YET RUN: the gate's boots, which need a current `./image.sh --format iso`. Batched.
+  3. verify-evidence - `src/tools/check-verify-evidence.sh`
+     - Change: `unset LIBER_RELEASE_REQUIRED` before its first nested run, with the reason. Its own envelope is
+       published by the outer check.sh, which does not read the variable.
+     - Old reason, reproduced: `LIBER_RELEASE_REQUIRED=<release-required.toml> verify-model run-start` refuses with
+       "undeclared environment override(s) ... LIBER_RELEASE_REQUIRED".
+     - Watched failing: HEAD's gate run with that variable set stops at step 1 ("run-start refused").
+     - Passed: the new gate run the same way passes all four steps, including the nested in-place release rehearsal
+       (run 20261026T032024Z-..., three envelopes, sealed).
+  4. perf-anchor - `src/tools/verify-model/src/catalog.rs`
+     - `IMAGE_PRODUCERS` becomes `(id, command, artifact, volume)`. Each image producer also produces the bootable
+       volume it leaves in the staging (`artifact:system-volume-bootable-x86_64.<mode>`).
+     - `GATE_IMAGE_INPUTS` gains `("perf-anchor", &["artifact:system-volume-bootable-x86_64.enforcing-required"])`.
+     - A gate's prerequisites are the producers whose ISO or volume it names.
+     - Test: `the_release_plan_discharges_every_required_key_once_with_producers_before_consumers` now also requires
+       perf-anchor's release step to require, and come after, `producer:x86_64:image.libersystem-iso`. Passes;
+       watched failing with the new `GATE_IMAGE_INPUTS` row removed (panic at the requires assertion).
+     - NOT YET RUN: perf-anchor's own boots. Batched.
+  5. tickless-idle on riscv64
+     - Established first:
+       - The wake counters key a device interrupt by "the identity the architecture dispatches it under" (IDT
+         vector, INTID, interrupt-file identity; `idle/mod.rs:74-75`).
+       - On riscv64 the kernel's console handler is armed on `WIRED_EID`, and the boot line says so (`main.rs:1459`).
+       - A claim that takes the UART lets the APLIC source go (`release_line`), and `bind_wired_inner` arms it to
+         `LINE_EID_BASE + slot`, an identity of the claim's own window. No line named that identity. The handoff
+         line (`console_uart/mod.rs:601`) prints the APLIC source number, and it prints before the binding exists,
+         so it cannot carry the identity.
+       - x86_64 binds a legacy GSI at `IRQ_BASE + GSI`, the vector the kernel's handler used. aarch64's INTID does
+         not change. So only riscv64 changes identity, as the plan says.
+     - DEPARTURE FROM THE PLAN'S WORDING: "the handoff line gains it" is not possible, because the handoff precedes
+       the binding. Instead the binding says it:
+       - `src/kernel/arch/riscv64/interrupts/mod.rs` `bind_wired_inner`, when the bound source is the console's,
+         prints "console: typed input raises interrupt {eid} now, through the claim that holds the UART";
+       - `src/kernel/arch/riscv64/serial.rs` gains `console_source()`, for both builds.
+     - `src/tools/check-tickless-idle.py`: new `HOLDER` pattern and `console_identity(log, armed)`. After the boot
+       settles, the identity is the last holder the console named: the claim's identity, or the boot's again after
+       "is the kernel's again". A changed identity is noted.
+     - Checked:
+       - `console_identity` on synthetic logs: claim -> 33, handed back -> 16, no handoff -> 16.
+       - `cargo check --target riscv64gc-unknown-none-elf` for the kernel, and `TEST=1 TEST_TAGS="" cargo check
+         --tests` for the same target: both clean, no warnings.
+     - NOT YET RUN: the riscv64 gate. It is an emulated-target run, which this job's rule keeps for the very end.
+  6. `verify.sh --release --plan` - `verify.sh`
+     - The answering actions (`plan json catalog model-hash age trust`) with `--release` no longer run
+       `release_prepare`: no snapshot, no run directory.
+     - `case "$mode"` gains `release) changed=""`, and the "N changed path(s)" note is skipped for a release.
+     - `--release --plan` prints `verify-model release-plan`, with `--required` resolved to an absolute path as the
+       run does. `--release --json` refuses with a reason; the release plan has no JSON form.
+     - The release-plan narrowing moved into a `release_plan_steps` helper in main.rs, shared with `account` (A3).
+     - Watched failing: HEAD's `./verify.sh --release --in-place --plan` created a run directory and printed
+       "changed: unbound variable" twice (exit 3). The stray run directory, run-id and identity.json only, was
+       removed.
+     - Passed: the new `--release --plan`, `--release --in-place --plan` and `--release --plan --required
+       <release-required.toml>` each print 373 steps / 377 keys, exit 0, and create no run directory and no snapshot.
+       `--release --model-hash` and `--release --age` exit 0 with no snapshot either. That is E2's second half, done
+       here because it is the same branch.
+
+C4 - test.sh's guard knows every private file qemu-run.sh creates (implemented, host-verified)
+  - `test.sh` `require_no_stray_qemu` now also admits, owned by the live ancestry:
+    - `usb-media*.<key>.legacy.<pid>.img`;
+    - `logs/test/<stem>-usb-audio.pcap`;
+    - `virtio-serialport*.<pid>.out`;
+    - `uas-scratch`, `nvme-scratch`, `nvme-second`, `scsi-scratch`, `scsi-second`, `scsi-third`, `sd-scratch` and
+      `ahci-scratch.<pid>.img`;
+    - `nvdimm-[01].<pid>.img`.
+    The list was taken from every `$$`-named path in qemu-run.sh that QEMU holds writable.
+  - Test: `check-guest-verdict.py` `ExistingQemuAdmission`, two new tests over the 13 names.
+    - Each is admitted with its owner's pid, directly and from a child.
+    - Each, with another pid, is still refused.
+    - Watched failing on HEAD's test.sh: 13 failures, one per name. With the change: 5 tests OK.
+
+A3 - where the remaining time goes, after the first group (measured; recorded in the plan as well)
+  - New `verify-model account [--jobs N] [--required F]`, backed by `history::Account` (`Account::of`, `total`,
+    `floor`). Over the release plan (the L2 plan) it sums what each step last measured, under any model. It splits
+    the sum into steps that run alone (no guest, or an exclusive guest step) and guest work that shares the slots,
+    and prints the longest step, the sum over the width, the floor (remainder plus the larger of the longest shared
+    step and the shared work over the width), the 15 dearest steps and every unpriced step.
+  - Test: `an_account_separates_the_serial_remainder_from_the_shared_guest_work`. Watched failing with exclusive
+    guest steps counted as shared ("left: 100.0").
+  - Measured 2026-10-26 from the prices on disk. Nothing has been re-measured since the 2026-10-20/21 runs, so B1 and
+    B7's effect is not in these numbers yet; the gates have not run under the runner since.
+    - 373 steps: 331 priced (all under an older model), 42 never measured.
+    - Sum 71,026 s (19.7 h).
+    - Serial remainder 56,930 s (15.8 h); shared guest work 14,096 s (3.9 h).
+    - Longest step: `gate-guest:host:hibernate-ports`, 6,842 s.
+    - At width 1: sum over the width 19.7 h, floor 19.7 h. At width 2: sum over the width 9.9 h, floor 17.8 h.
+  - The largest remaining cost is the serial remainder, mostly exclusive guest gates (hibernate-ports 6,842 s,
+    boot-volume-controllers on both ports 3,901 s each, hibernate 2,795 s, watchdog 1,864 s, ipmi 1,743 s). The items
+    on it are B2 (completion lines), B4 and B5 (the profile switches inside every x86_64 development gate), C1/C2
+    (overlap) and C8 (hibernate-ports split per port), so THE ORDER stands: B4, B5 and B2 next.
+
+B4 - the staging is switched when a step needs another state (implemented, host-verified; real runs below)
+  - `src/tools/staging-state.sh`:
+    - every refusal also appends the command that fixes it to `$LIBER_STATE_REFUSAL` when that is set
+      (`state_refusal_fix`);
+    - the fix commands carry the profile (`profile_env`, `staging_build_command`, `volume_build_command`);
+    - `record_staging_profile` notes a change of profile: "staging: the <arch> staging switched to the <profile>
+      profile (<parts>)".
+  - `qemu-run.sh` collects every refusal of one boot before it refuses: the profile, and on an x86_64 run with no
+    `BOOT_IMAGE` and no `TEST` the bootable volume's mode against `${LIBER_DMA_MODE:-enforcing-required}`. One
+    refusal then names every state the boot needs, and a runner fixes them together before the one retry.
+  - `verify.sh`:
+    - exports `LIBER_STAGING_RUNNER=1` ("under verify.sh, which says so in the environment");
+    - `run_one_step` gives every step `LIBER_STATE_REFUSAL=<outfile>.refusal`;
+    - `record_one_step`: on 75, with a fix and no retry yet, the step is retried by `retry_refused_step` - at once
+      in the foreground, or queued (`state_queue`) and retried at the end of `drain_guests` when it was a
+      backgrounded guest, because other guests may be reading the staging the fix rebuilds;
+    - `retry_refused_step` runs the deduplicated fixes, then the step again (the command is kept in
+      `step_commands`), and records that run as the step's. A failed fix, or a second refusal, is a failure with
+      no envelope and no history;
+    - `staging_fingerprint` (every `built-*.profile` and every `system-volume-bootable-*.dma-mode`) is taken
+      before the loop, and `restore_staging`, after the last barrier, runs only when it changed. It puts every
+      target with a non-shipping part back to shipping and re-signs the x86_64 bootable volume
+      `enforcing-required` when it is in another mode. It is skipped for a sealed snapshot.
+    - IMPLEMENTATION DECISION: "restores ... once, when the run ends" is applied only when the run changed the
+      staging. Otherwise every prepared-plan run of the verify-scheduler gate, and every run over a staging the
+      user left in development, would trigger a full rebuild that no step of it asked for.
+  - `src/tools/guest-gate.sh`: under `LIBER_STAGING_RUNNER=1` a gate never marks the shipping staging for restore.
+    Run by hand it still rebuilds it on the way out.
+  - `identity.rs`: `LIBER_STAGING_RUNNER` and `LIBER_STATE_REFUSAL` are permitted (27 entries). Nested `identity`
+    and `run-start` calls inside steps see both.
+  - Tests:
+    - `check-verify-scheduler.sh` case 8 (prepared plans through the private copy with the recording cargo):
+      - refused once with a fix: the fix runs, the step runs once after it, and gets one passed envelope and one
+        passed record;
+      - refused twice: nothing published or recorded, and reported refused;
+      - a fix that fails: the same;
+      - the run with them fails;
+      - with `--jobs 2`, a guest refused while another guest sleeps 2 s is retried only after that guest ended
+        (order "ended retried"), and the run passes.
+      Watched failing:
+      - with the retry removed: four checks of the once-refused step fail, the guest is never retried and the
+        run fails;
+      - with the retry made immediate in the background context: order "retried ended".
+    - `check-guest-verdict.py` `GuestGateImagePreparation.test_the_shipping_staging_is_put_back_by_hand_and_left_under_the_runner`,
+      with a `build.sh` stub recording calls: by hand from the shipping profile, one restore (`--arch x86_64`,
+      LIBER_DEVELOPMENT unset); under the runner, none. Watched failing on HEAD's guest-gate.sh: one restore under
+      the runner.
+  - Real-run oracles:
+    - (a) two x86_64 development-image gates and then the x86_64 suite under verify.sh: in the x86_64 batch below.
+    - (b) the release rehearsal with a refused suite: needs the narrowed release plan, whose closure builds
+      aarch64 and riscv64 (all 21 build steps). That is a port build, so it moves to the end-of-job runs.
+    - (c) the suite by hand right after `lab.sh scenario-cold`: in the batch.
+
+B5 - one development ISO for all gates (implemented, host-verified; real runs below)
+  - `src/harness/mkimage.sh`: `iso` with `LIBER_IMAGE_KEYED=1` writes `$BUILD/$SLUG$DMA_SUFFIX.<key>.iso`
+    (libersystem-dev.<key>.iso for `--dma-mode harness`). Its existing hit check (key file plus verified digest)
+    then reuses it while the key matches.
+    - The generation sweep, which was testiso-only, now covers these keyed media too: only names with a 64-hex key,
+      older than an hour and not held open.
+    - The installable `libersystem-dev.iso` is never written by a gate.
+  - `src/tools/guest-gate.sh` `guest_gate_prepare_image`: `LIBER_IMAGE_KEYED=1 image.sh --format iso --dma-mode
+    harness`. Standard output is captured on its own (the path mkimage prints last), and stderr goes to the log; it
+    does not rely on the sourcing gate's pipefail.
+  - No private copy is kept for "a gate that writes to its medium": none does. qemu-run.sh opens the ISO read-only
+    and attaches it as `-cdrom /proc/self/fd/N`, and a persistent RUN_DISK is seeded from it as a separate file.
+  - Tests:
+    - New `KeyedGateMedium`: the real mkimage.sh, with make_iso, verify_boot_artifacts and image_input_key stubbed
+      as PerfImageIsolation stubs them. It is run three times (inputs first, first, second):
+      - first, a keyed path and a miss;
+      - again, the same path and "cache hit";
+      - second, a new path;
+      - both generations present, and the installable `libersystem-dev.iso` untouched.
+      Watched failing on HEAD's mkimage.sh: the medium went to `.build/boot/libersystem-dev.iso`, the installable
+      image's own name.
+    - `GuestGateImagePreparation`: the image.sh stub now answers a keyed medium and builds only when that key's
+      medium is absent.
+      - The old "one private image" test becomes "one keyed image serves both boots": the gate asks with
+        `LIBER_IMAGE_KEYED=1` and no `LIBER_IMAGE_OUTPUT`.
+      - New `test_two_gates_in_a_row_build_one_medium_and_a_change_builds_a_second`: built, reused, built again
+        after the change; the first two gates boot one medium.
+      Watched failing on HEAD's guest-gate.sh, which asked for a private medium.
+  - Gates run after B4 and B5: `./check.sh --gate
+    guest-verdict,verify-scheduler,run-verdict,boot-harness,source-hygiene,verify-model,verify-model-tests` ->
+    RESULT ok (388 s).

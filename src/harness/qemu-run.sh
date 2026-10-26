@@ -106,7 +106,11 @@
 #             The development instance's run-private state: its control channel, monitor and QMP
 #             sockets live in DIR rather than in .build/boot, and its writable image set is named
 #             after DIR, so a lifecycle gate's instance never touches a person's and is never
-#             refused by its lock.
+#             refused by its lock. With COLD=1 the sockets live in DIR as well and the image set
+#             stays the cold one, so two cold runs of one target each have their own.
+#   QEMU_MONITOR_SOCKET=PATH, QEMU_QMP_SOCKET=PATH
+#             The monitor and QMP sockets, where a caller names its own (`guest-gate.sh` does,
+#             in its run's directory) - two guests of one target then hold two pairs.
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
 #   IDLE_FIXTURE=1    aarch64 and riscv64: the machine's tree given `/cpus/idle-states` (`fdt_edit.py idle-fixture`)
 #   SYSTEM_SUSPEND_FIXTURE=1  riscv64 UEFI: enable OpenSBI's documented system-suspend test backend through its tree
@@ -1698,6 +1702,14 @@ qemu_port_volume_pairing() {
 			echo "qemu-run: SYSTEM_DISK requires the paired bootable volume and UUID for $arch (build --arch $arch --kernel-on-volume)" >&2
 			return 1
 		fi
+		# AND SIGNED FOR THE MODE THE MEDIUM IS: this port's boot medium is signed `harness`
+		# (`stage_signed_boot_manifest`), and the loader refuses a set whose manifests disagree - so a
+		# volume recorded for another mode is refused here, as `mkimage.sh` refuses it, not booted.
+		local mode_refusal
+		if mode_refusal="$(volume_mode_refusal "$volume" harness "$arch")"; then
+			echo "qemu-run: $mode_refusal" >&2
+			return "$STATE_REFUSED"
+		fi
 		source "$REPO_ROOT/src/tools/volume-pairing.sh"
 		pairing="$(tr -d '[:space:]-' <"$uuid" | tr 'A-F' 'a-f')"
 		if [[ ! "$pairing" =~ ^[0-9a-f]{32}$ || "$pairing" == 00000000000000000000000000000000 ]] || ! pairing_matches_volume "$pairing" "$volume"; then
@@ -1711,7 +1723,7 @@ qemu_port_volume_pairing() {
 stage_signed_boot_manifest() {
 	local esp="$1" bootstrap="$2" arch="$3" package="${4:-}"
 	local out="$QEMU_BUILD_DIR/boot.manifest2.$$" pairing
-	pairing="$(qemu_port_volume_pairing "$arch")" || exit 1
+	pairing="$(qemu_port_volume_pairing "$arch")" || exit $?
 	# The release the manifest names, out of the one file that holds it.
 	local PRODUCT_VERSION_FOR_MANIFEST
 	PRODUCT_VERSION_FOR_MANIFEST="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p;/^PRODUCT_VERSION=/q' "$HERE/../../product.conf")"
@@ -1982,7 +1994,11 @@ fi
 # bound it - so a cold run and the persistent instance this milestone exists to provide destroyed
 # each other. The suffix is what keeps them apart, and x86 was the one target that did not get one.
 dev_channel_socket() {
-	if [[ "${COLD:-0}" == "1" ]]; then
+	if [[ "${COLD:-0}" == "1" && -n "${LIBER_DEV_STATE:-}" ]]; then
+		# A COLD RUN WITH A STATE DIRECTORY OF ITS OWN (`lab.sh scenario-cold` always has one) keeps every socket
+		# there, so two cold runs of one target do not take each other's.
+		printf '%s/dev-channel.sock' "$LIBER_DEV_STATE"
+	elif [[ "${COLD:-0}" == "1" ]]; then
 		printf '%s/dev-channel-cold-%s.sock' "$QEMU_BUILD_DIR" "$TARGET_ARCH"
 	elif [[ "$TARGET_ARCH" == "x86_64" ]]; then
 		printf '%s/dev-channel.sock' "${LIBER_DEV_STATE:-$QEMU_BUILD_DIR}"
@@ -1999,6 +2015,8 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 QEMU_BOOT_DIR="$HERE"
 QEMU_BUILD_DIR="$REPO_ROOT/.build/boot"
 mkdir -p "$QEMU_BUILD_DIR"
+# shellcheck source=../tools/staging-state.sh
+source "$REPO_ROOT/src/tools/staging-state.sh"
 
 timing_event() {
 	if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\t%s\t%s\n' "$(date +%s%N)" "$1" "$2" >>"$LIBER_TIMING_LOG"; fi
@@ -2136,10 +2154,12 @@ qemu_run_x86_64() {
 	# A RUN-PRIVATE DEVELOPMENT INSTANCE gets a set named after its state directory, for the same
 	# reason a cold run does: it must not attach the persistent instance's images, and having a
 	# set of its own is what lets the disk-conflict check below let it through.
-	[[ -n "${LIBER_DEV_STATE:-}" ]] && artifact_suffix="-dev-$(basename "$LIBER_DEV_STATE")"
+	# A COLD RUN KEEPS THE COLD SET even with a state directory of its own: its writable images are private copies of
+	# the set's templates already, and a set per directory would rebuild every fixture medium for every cold run.
+	[[ -n "${LIBER_DEV_STATE:-}" && "${COLD:-0}" != "1" ]] && artifact_suffix="-dev-$(basename "$LIBER_DEV_STATE")"
 	# AND THE SET GOES WITH THE DIRECTORY: the marker names it, and `run-files.py sweep` removes the set once the
 	# directory is gone - a gate killed before its own cleanup ran leaves nothing behind for longer than that.
-	if [[ -n "${LIBER_DEV_STATE:-}" ]]; then
+	if [[ -n "${LIBER_DEV_STATE:-}" && "${COLD:-0}" != "1" ]]; then
 		printf '%s\n' "$(cd "$LIBER_DEV_STATE" && pwd)" >"$QEMU_BUILD_DIR/state$artifact_suffix.path"
 	fi
 	timing_event runner start
@@ -2373,8 +2393,14 @@ qemu_run_x86_64() {
 	local volume_image="$QEMU_BUILD_DIR/system-volume-x86_64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${artifact_suffix}.img"
 	if [[ "$dma_fixture" != "1" ]] && virtio_disk="$(qemu_prepare_system_disk "$volume_image" "$virtio_disk")"; then
-		local run_disk paired_volume="$QEMU_BUILD_DIR/system-volume-bootable-x86_64.img"
+		local run_disk paired_volume="$QEMU_BUILD_DIR/system-volume-bootable-x86_64.img" mode_refusal
 		[[ -f "$paired_volume" ]] || paired_volume=""
+		# A NEW PERSISTENT DISK IS SEEDED FROM THE BOOTABLE VOLUME, which the medium's loader refuses when it
+		# was signed for another mode than the medium: refused here, in `mkimage.sh`'s form, not booted.
+		if [[ -n "$paired_volume" && -n "${RUN_DISK:-}" && ! -e "$RUN_DISK" ]] && mode_refusal="$(volume_mode_refusal "$paired_volume" "$signed_mode" x86_64)"; then
+			echo "qemu-run: $mode_refusal" >&2
+			exit "$STATE_REFUSED"
+		fi
 		run_disk="$(qemu_run_system_disk "$virtio_disk" "$paired_volume")" || {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
 			exit 1
@@ -2792,10 +2818,14 @@ qemu_run_x86_64() {
 	# remove or bind the persistent instance's.
 	local monitor_socket="${LIBER_DEV_STATE:-$QEMU_BUILD_DIR}/qemu-monitor.sock"
 	local qmp_socket="${LIBER_DEV_STATE:-$QEMU_BUILD_DIR}/qemu-qmp.sock"
-	if [[ "${COLD:-0}" == "1" ]]; then
+	if [[ "${COLD:-0}" == "1" && -z "${LIBER_DEV_STATE:-}" ]]; then
 		monitor_socket="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
 		qmp_socket="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
 	fi
+	# A CALLER THAT NAMES ITS OWN (`guest-gate.sh` does, in its run's directory) gets them: two guests of one
+	# target then hold two pairs of sockets rather than taking one pair from each other.
+	monitor_socket="${QEMU_MONITOR_SOCKET:-$monitor_socket}"
+	qmp_socket="${QEMU_QMP_SOCKET:-$qmp_socket}"
 	rm -f "$monitor_socket" "$qmp_socket"
 	qemu_args+=(-monitor "unix:$monitor_socket,server,nowait")
 	qemu_args+=(-qmp "unix:$qmp_socket,server,nowait")
@@ -2891,7 +2921,7 @@ qemu_run_aarch64() {
 	if virtio_disk="$(qemu_prepare_system_disk "$volume_pkg" "$virtio_disk")"; then
 		local run_disk paired_volume=""
 		if [[ -n "${SYSTEM_DISK:-}" ]]; then
-			qemu_port_volume_pairing aarch64 >/dev/null || exit 1
+			qemu_port_volume_pairing aarch64 >/dev/null || exit $?
 			paired_volume="$QEMU_BUILD_DIR/system-volume-bootable-aarch64.img"
 		fi
 		run_disk="$(qemu_run_system_disk "${paired_volume:-$virtio_disk}" "$paired_volume")" || {
@@ -3016,7 +3046,7 @@ qemu_run_aarch64() {
 				# was up and answering everything else.
 				local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
 				local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
-				if [[ "${COLD:-0}" == "1" ]]; then
+				if [[ "${COLD:-0}" == "1" && -z "${LIBER_DEV_STATE:-}" ]]; then
 					dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
 					dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
 				elif [[ -n "${LIBER_DEV_STATE:-}" ]]; then
@@ -3032,8 +3062,8 @@ qemu_run_aarch64() {
 				# A GATE'S GUEST GETS THEM TOO, under the same per-target names: `check-i2c-hid.sh` moves the machine's
 				# tablet through QMP's `input-send-event` on every target, and these two targets opened QMP only for a
 				# development guest - so on them the gate's tablet case dialled a socket that did not exist and failed.
-				local gate_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
-				local gate_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+				local gate_monitor="${QEMU_MONITOR_SOCKET:-$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock}"
+				local gate_qmp="${QEMU_QMP_SOCKET:-$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock}"
 				rm -f "$gate_monitor" "$gate_qmp"
 				qemu_args+=(-monitor "unix:$gate_monitor,server,nowait")
 				qemu_args+=(-qmp "unix:$gate_qmp,server,nowait")
@@ -3287,7 +3317,7 @@ qemu_run_riscv64() {
 	if virtio_disk="$(qemu_prepare_system_disk "$volume_pkg" "$virtio_disk")"; then
 		local run_disk paired_volume=""
 		if [[ -n "${SYSTEM_DISK:-}" ]]; then
-			qemu_port_volume_pairing riscv64 >/dev/null || exit 1
+			qemu_port_volume_pairing riscv64 >/dev/null || exit $?
 			paired_volume="$QEMU_BUILD_DIR/system-volume-bootable-riscv64.img"
 		fi
 		run_disk="$(qemu_run_system_disk "${paired_volume:-$virtio_disk}" "$paired_volume")" || {
@@ -3411,7 +3441,7 @@ qemu_run_riscv64() {
 				# was up and answering everything else.
 				local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
 				local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
-				if [[ "${COLD:-0}" == "1" ]]; then
+				if [[ "${COLD:-0}" == "1" && -z "${LIBER_DEV_STATE:-}" ]]; then
 					dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
 					dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
 				elif [[ -n "${LIBER_DEV_STATE:-}" ]]; then
@@ -3427,8 +3457,8 @@ qemu_run_riscv64() {
 				# A GATE'S GUEST GETS THEM TOO, under the same per-target names: `check-i2c-hid.sh` moves the machine's
 				# tablet through QMP's `input-send-event` on every target, and these two targets opened QMP only for a
 				# development guest - so on them the gate's tablet case dialled a socket that did not exist and failed.
-				local gate_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
-				local gate_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+				local gate_monitor="${QEMU_MONITOR_SOCKET:-$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock}"
+				local gate_qmp="${QEMU_QMP_SOCKET:-$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock}"
 				rm -f "$gate_monitor" "$gate_qmp"
 				qemu_args+=(-monitor "unix:$gate_monitor,server,nowait")
 				qemu_args+=(-qmp "unix:$gate_qmp,server,nowait")
@@ -3648,6 +3678,32 @@ fi
 # console capture and the USB stick a gate reads after the run stay until the next run's sweep.
 python3 "$HERE/run-files.py" sweep "$QEMU_BUILD_DIR" || echo "qemu-run: the sweep of ended runs' files did not finish" >&2
 setsid -f python3 "$HERE/run-files.py" reap "$$" "$QEMU_BUILD_DIR" </dev/null >/dev/null 2>&1 || echo "qemu-run: this run's files will be removed by the next run's sweep, not at its end" >&2
+
+# THE STAGING A BOOT READS IS IN THE PROFILE IT BOOTS IN (`staging-state.sh`). The ports boot the staged
+# volume itself - the bootable one with `SYSTEM_DISK` - and an x86_64 run with no `BOOT_IMAGE` assembles its
+# medium from the staging; a `BOOT_IMAGE` carries its own. A staging another step left in the other profile
+# is refused now, by name, with a refusal's status, rather than booted into a failure that blames the code.
+staging_parts=(libs user packages volume-test)
+if [[ "$TARGET_ARCH" == x86_64 ]]; then
+	[[ "${TEST:-0}" == 1 ]] || staging_parts=(libs user packages volume)
+	[[ -z "${BOOT_IMAGE:-}" ]] || staging_parts=()
+elif [[ -n "${SYSTEM_DISK:-}" ]]; then
+	staging_parts=(libs user packages volume)
+fi
+# AND, ON AN X86_64 RUN THAT ASSEMBLES A SHIPPING-SHAPED MEDIUM, THE BOOTABLE VOLUME SIGNED FOR THE MEDIUM'S
+# MODE (`mkimage.sh iso` signs `LIBER_DMA_MODE`, `enforcing-required` by default) - asked here with the profile,
+# so one refusal names every state the boot needs and a runner fixes them together.
+staging_refusals=()
+if ((${#staging_parts[@]})) && staging_refusal="$(staging_profile_refusal "$REPO_ROOT/.build" "$TARGET_ARCH" "$(run_profile)" "${staging_parts[@]}")"; then
+	staging_refusals+=("$staging_refusal")
+fi
+if [[ "$TARGET_ARCH" == x86_64 && -z "${BOOT_IMAGE:-}" && "${TEST:-0}" != 1 ]] && staging_refusal="$(volume_mode_refusal "$QEMU_BUILD_DIR/system-volume-bootable-x86_64.img" "${LIBER_DMA_MODE:-enforcing-required}" x86_64)"; then
+	staging_refusals+=("$staging_refusal")
+fi
+if ((${#staging_refusals[@]})); then
+	printf 'qemu-run: %s\n' "${staging_refusals[@]}" >&2
+	exit "$STATE_REFUSED"
+fi
 
 case "$TARGET_ARCH" in
 x86_64) qemu_run_x86_64 "$KERNEL_ELF" ;;

@@ -63,10 +63,22 @@ B_TAGS="domain"
 # two-test guest lives about nine seconds, and the second compile takes about as long - so the first
 # guest had exited before the second booted, every time, and the gate proved isolation between two
 # runs that were never simultaneous. The watcher below now REQUIRES the overlap, so the selections
-# have to make it happen whichever run takes the lock first: the whole `kernel.object` family, read
-# from the declarations the model reads, split alternately into two disjoint halves of roughly
-# fifty tests - a guest of half a minute against a compile of a few seconds, in either order.
-mapfile -t object_ids < <(grep -rhoE 'id = "kernel\.object\.[a-z0-9_.]+"' "$REPO_ROOT/src/kernel" | sed 's/^id = "//; s/"$//' | sort -u)
+# have to make it happen whichever run takes the lock first: the whole `kernel.object` family,
+# split alternately into two disjoint halves of roughly fifty tests - a guest of half a minute
+# against a compile of a few seconds, in either order.
+#
+# THE FAMILY THE X86_64 TEST KERNEL COMPILES, NOT THE ONE THE SOURCE DECLARES (corrected 2026-10-26).
+# The ids were read off the source with `grep`, which cannot see `cfg(target_arch)`: since 2026-09-29
+# the family has held `kernel.object.port_range.a_machine_with_no_port_space_mints_nothing`, which
+# only the ports compile, and the runner hard-fails a selection naming an id its kernel does not
+# have - so this gate could not pass on any tree. The whole x86_64 test kernel is compiled first, and
+# its ids are read out of the binary the way the planner reads them (`verify-model kernel-tests`).
+(cd "$REPO_ROOT/src" && harness/test-kernel.sh x86_64 --build-only) >"$work/inventory.log" 2>&1 || {
+	tail -20 "$work/inventory.log" >&2
+	fail "the x86_64 test kernel did not compile, so the tests it carries cannot be read"
+}
+compiled="$(cd "$REPO_ROOT/src" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- kernel-tests --arch x86_64)" || fail "the x86_64 test kernel's tests could not be read"
+mapfile -t object_ids < <(grep '^kernel\.object\.' <<<"$compiled" | sort -u)
 ((${#object_ids[@]} >= 20)) || fail "the kernel.object family has ${#object_ids[@]} declared tests, too few to make two guests that meet"
 a_ids=()
 b_ids=()

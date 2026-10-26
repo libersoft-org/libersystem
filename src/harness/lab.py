@@ -235,10 +235,12 @@ BUILD = os.path.join(BUILD_ROOT, 'boot')
 # the image it boots all under that directory - without depending on, or disturbing, a guest
 # somebody left running. The runner reads the same variable for its side of the boundary.
 DEV_STATE = os.environ.get('LIBER_DEV_STATE') or BUILD
-SERIAL_SOCK = os.path.join(BUILD, 'lab-serial.sock')
-CTL_SOCK = os.path.join(BUILD, 'lab-ctl.sock')
-SERIAL_LOG = os.path.join(BUILD, 'lab-serial.log')
-QEMU_LOG = os.path.join(BUILD, 'lab-qemu.log')
+# AND THE AD-HOC `lab boot` GUEST'S, in the same directory: `.build/boot` for a person's, the run's own when
+# `LIBER_DEV_STATE` names one, so two lab gates of one target boot, drive and read two guests rather than one.
+SERIAL_SOCK = os.path.join(DEV_STATE, 'lab-serial.sock')
+CTL_SOCK = os.path.join(DEV_STATE, 'lab-ctl.sock')
+SERIAL_LOG = os.path.join(DEV_STATE, 'lab-serial.log')
+QEMU_LOG = os.path.join(DEV_STATE, 'lab-qemu.log')
 MON_SOCK = os.path.join(DEV_STATE, 'qemu-monitor.sock')
 QMP_SOCK = os.path.join(DEV_STATE, 'qemu-qmp.sock')
 
@@ -262,7 +264,7 @@ def qmp_sock():
 	return QMP_OVERRIDE or QMP_SOCK
 
 
-PCAP = os.path.join(BUILD, 'lab.pcap')
+PCAP = os.path.join(DEV_STATE, 'lab.pcap')
 VOLUME_IMG = os.path.join(BUILD, 'virtio-blk.img')
 USB_IMG = os.path.join(BUILD, 'usb-media.img')
 
@@ -3428,41 +3430,63 @@ def cmd_scenario_cold(args):
 
 	env = dict(os.environ, LIBER_DEVELOPMENT='1', STRIP='none')
 	build_timeout = arg_value(args, '--build-timeout', 3600)
-	print(f'lab: building {target} with the development profile')
-	# Bounded, and its whole group is stopped on expiry. A cross build for an emulated target is the
-	# longest-running child this file starts, and it had no deadline at all - so a wedged compiler
-	# held a command that is documented as bounded for as long as it liked.
-	try:
-		if run_child(build_command(target), build_timeout, cwd=SRC, env=env).returncode != 0:
-			die(f'the {target} system did not build')
-		# **AND THE BOOTABLE VOLUME, WHICH THE BUILD ABOVE DOES NOT WRITE.**
-		#
-		# `mkimage` lays `system-volume-bootable-x86_64.img` into the medium this run boots, and only
-		# a volume step asked for the KERNEL ON THE VOLUME produces it - `build.sh` on its own
-		# refreshes `system-volume-x86_64.img`, which is a different file. So a cold run booted
-		# whatever that volume happened to be: measured 2026-09-20 at two and a half hours old and of
-		# the SHIPPING configuration, which has no development agent in it at all. The guest then
-		# served no control channel, and this runner waited out its thirty-minute deadline reporting
-		# a handshake that could never arrive, on a tree where everything it was waiting for had been
-		# built minutes earlier.
-		#
-		# x86_64 ONLY, because it is the only target whose medium carries this volume; the
-		# device-tree runners build their own ESP.
-		if target == 'x86_64':
-			volume = [BUILD_SH, '--arch', 'x86_64', '--kernel-on-volume', '--dma-mode', 'enforcing-required', '--part', 'volume']
-			if run_child(volume, build_timeout, cwd=SRC, env=env).returncode != 0:
-				die('the x86_64 bootable volume did not build')
-	except ChildTimeout as expired:
-		die(f'the {target} build did not finish within {build_timeout} s ({expired})')
+	# A COLD RUN BUILDS NOTHING WHEN WHAT IT BOOTS IS CURRENT. It built the development staging and the bootable
+	# volume on every run, so two of one target started together each rebuilt what the other was booting. The
+	# stamps, the profile records and the volume's mode record say whether both are current; under `verify.sh` a
+	# staging that is not is REFUSED with the commands that make it so, which the runner runs as a step of its own -
+	# so cold runs that overlap only read - and run by hand it is built here, as it always was.
+	stale = staging_not_current(target, env)
+	if not stale:
+		print(f'lab: the {target} staging is current in the development profile; nothing is built')
+	elif os.environ.get('LIBER_STAGING_RUNNER') == '1':
+		for line in stale:
+			print(f'lab: REFUSED: {line}', file=sys.stderr)
+		sys.exit(STATE_REFUSED)
+	else:
+		for line in stale:
+			print(f'lab: {line}')
+		print(f'lab: building {target} with the development profile')
+		# Bounded, and its whole group is stopped on expiry. A cross build for an emulated target is the
+		# longest-running child this file starts, and it had no deadline at all - so a wedged compiler
+		# held a command that is documented as bounded for as long as it liked.
+		try:
+			if run_child(build_command(target), build_timeout, cwd=SRC, env=env).returncode != 0:
+				die(f'the {target} system did not build')
+			# **AND THE BOOTABLE VOLUME, WHICH THE BUILD ABOVE DOES NOT WRITE.**
+			#
+			# `mkimage` lays `system-volume-bootable-x86_64.img` into the medium this run boots, and only
+			# a volume step asked for the KERNEL ON THE VOLUME produces it - `build.sh` on its own
+			# refreshes `system-volume-x86_64.img`, which is a different file. So a cold run booted
+			# whatever that volume happened to be: measured 2026-09-20 at two and a half hours old and of
+			# the SHIPPING configuration, which has no development agent in it at all. The guest then
+			# served no control channel, and this runner waited out its thirty-minute deadline reporting
+			# a handshake that could never arrive, on a tree where everything it was waiting for had been
+			# built minutes earlier.
+			#
+			# x86_64 ONLY, because it is the only target whose medium carries this volume; the
+			# device-tree runners build their own ESP.
+			if target == 'x86_64':
+				volume = [BUILD_SH, '--arch', 'x86_64', '--kernel-on-volume', '--dma-mode', 'enforcing-required', '--part', 'volume']
+				if run_child(volume, build_timeout, cwd=SRC, env=env).returncode != 0:
+					die('the x86_64 bootable volume did not build')
+		except ChildTimeout as expired:
+			die(f'the {target} build did not finish within {build_timeout} s ({expired})')
 	triple = {'x86_64': 'x86_64-unknown-none', 'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}[target]
 
 	# A NAMESPACE OF ITS OWN, on every target. This took the persistent instance's unsuffixed x86
 	# path and unlinked it below without checking whether that instance was up - so a cold run and
 	# the persistent instance destroyed each other. `COLD=1` in the guest environment makes the
 	# runner bind the matching names.
-	socket_path = os.path.join(BUILD, f'dev-channel-cold-{target}.sock')
+	#
+	# AND OF THIS RUN, NOT OF THE TARGET: the names were `cold-<target>` in `.build/boot`, so two cold runs of one
+	# target shared one channel, one serial line, one monitor, one log and one scenario record. They are in a state
+	# directory now - the caller's (`LIBER_DEV_STATE`), or one this run makes under `.build/tmp` - which the runner
+	# is handed too, and binds its sockets in.
+	state = os.environ.get('LIBER_DEV_STATE') or os.path.join(BUILD_ROOT, 'tmp', f'cold-{target}.{os.getpid()}')
+	os.makedirs(state, exist_ok=True)
+	socket_path = os.path.join(state, 'dev-channel.sock')
 	kernel = os.path.join(BUILD_ROOT, 'cargo', 'kernel', triple, 'debug', 'kernel')
-	log = os.path.join(BUILD, f'cold-{target}.log')
+	log = os.path.join(state, f'cold-{target}.log')
 	with contextlib.suppress(OSError):
 		os.remove(socket_path)
 	# The previous run's serial log has to go with it. The runner reads readiness out of this
@@ -3477,7 +3501,7 @@ def cmd_scenario_cold(args):
 	# RUN-LOCAL, per target. Every cold run on every architecture shared the persistent instance's
 	# one `dev-scenarios-seen`, so a cold aarch64 run deleted the x86 instance's record and its own
 	# first/repeat verdicts were decided by whatever had run last anywhere.
-	scenario.SEEN_PATH = os.path.join(BUILD, f'cold-{target}-scenarios-seen')
+	scenario.SEEN_PATH = os.path.join(state, f'cold-{target}-scenarios-seen')
 	with contextlib.suppress(OSError):
 		os.remove(scenario.SEEN_PATH)
 	# THE FIXTURES FOR THIS TARGET, built here and checked here.
@@ -3488,18 +3512,21 @@ def cmd_scenario_cold(args):
 	# exercise its stated behaviour at all.
 	scenario.TARGET = target
 	fixture_env = dict(env, FIXTURE_TARGET=target)
-	try:
-		built = run_child([os.path.join(HERE, 'scenarios', 'make-fixtures.py')], 600, cwd=SRC, env=fixture_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-		if built.returncode != 0:
-			# WHAT THE RECIPE SAID, for the reason the runner log below is kept: this captured the
-			# builder's stderr into a pipe and then threw the pipe away, so a refusal arrived as a
-			# sentence naming no cause and had to be re-run by hand to be read. It cost a nine-minute
-			# build to find out that a byte string occurred three times where the recipe expected two.
-			for line in (built.stderr or b'').decode(errors='replace').splitlines():
-				print(f'lab: {line}', file=sys.stderr)
-			die(f'the {target} scenario fixtures could not be built')
-	except ChildTimeout as expired:
-		die(f'building the {target} scenario fixtures did not finish ({expired})')
+	# BUILT ONLY WHEN THEY ARE NOT CURRENT, as the staging is: their record says what they were made from, and a set
+	# that matches the tree is used as it stands.
+	if scenario.stale_fixtures(target):
+		try:
+			built = run_child([os.path.join(HERE, 'scenarios', 'make-fixtures.py')], 600, cwd=SRC, env=fixture_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+			if built.returncode != 0:
+				# WHAT THE RECIPE SAID, for the reason the runner log below is kept: this captured the
+				# builder's stderr into a pipe and then threw the pipe away, so a refusal arrived as a
+				# sentence naming no cause and had to be re-run by hand to be read. It cost a nine-minute
+				# build to find out that a byte string occurred three times where the recipe expected two.
+				for line in (built.stderr or b'').decode(errors='replace').splitlines():
+					print(f'lab: {line}', file=sys.stderr)
+				die(f'the {target} scenario fixtures could not be built')
+		except ChildTimeout as expired:
+			die(f'building the {target} scenario fixtures did not finish ({expired})')
 	stale = scenario.stale_fixtures(target)
 	if stale:
 		for complaint in stale:
@@ -3512,7 +3539,11 @@ def cmd_scenario_cold(args):
 	# frames out of circulation for good. The device-tree targets already cap themselves at 8; this is
 	# the same decision for the one that does not. Four, like the test profile: a driven guest is for
 	# scenarios, and a core count is not what they measure. An explicit SMP still wins.
-	guest_env = dict(env, DEV_PROFILE='1', COLD='1', SERIAL=f'file:{log}', SMP=os.environ.get('SMP', '4'), LIBER_RUN_MODE='development')
+	guest_env = dict(env, DEV_PROFILE='1', COLD='1', SERIAL=f'file:{log}', SMP=os.environ.get('SMP', '4'), LIBER_RUN_MODE='development', LIBER_DEV_STATE=state)
+	# AND A HOST PORT OF ITS OWN, which only the x86_64 guest forwards: under the development profile's fixed 5556 a
+	# second cold run could not forward it at all.
+	if target == 'x86_64':
+		guest_env['HOSTFWD_PORT'] = os.environ.get('HOSTFWD_PORT') or free_port()
 	# UEFI ON THE DEVICE-TREE TARGETS, because a direct boot cannot carry what a driven guest needs.
 	#
 	# `-kernel` on `virt` has no module hand-off: the machine takes one blob, so a direct boot gets
@@ -3523,8 +3554,8 @@ def cmd_scenario_cold(args):
 	# same reason.
 	if target != 'x86_64':
 		guest_env['UEFI'] = '1'
-	serial_sock = os.path.join(BUILD, f'serial-cold-{target}.sock')
-	serial_ctl = os.path.join(BUILD, f'serial-ctl-cold-{target}.sock')
+	serial_sock = os.path.join(state, 'serial.sock')
+	serial_ctl = os.path.join(state, 'serial-ctl.sock')
 	if serial_broker:
 		for path in (serial_sock, serial_ctl):
 			with contextlib.suppress(OSError):
@@ -3535,9 +3566,9 @@ def cmd_scenario_cold(args):
 	# The runner's own diagnosis goes into the serial log's neighbour rather than into /dev/null: it
 	# is the process that says "loader EFI not found" or "init package not found", and discarding
 	# that left every startup failure looking like a guest that never answered.
-	runner_log = open(os.path.join(BUILD, f'cold-{target}-runner.log'), 'wb')
+	runner_log = open(os.path.join(state, f'cold-{target}-runner.log'), 'wb')
 	guest = subprocess.Popen(['bash', 'harness/qemu-run.sh', target, kernel], cwd=SRC, env=guest_env, stdout=runner_log, stderr=runner_log, start_new_session=True)
-	record_lab_guest(guest)
+	record_lab_guest(guest, os.path.join(state, 'lab-guest.pgid'))
 	failures = 0
 	try:
 		CHANNEL_OVERRIDE = socket_path
@@ -3550,7 +3581,7 @@ def cmd_scenario_cold(args):
 			offered = time.time() + 900
 			while True:
 				if guest.poll() is not None:
-					die(f'the {target} guest exited before it offered its serial line (see {os.path.join(BUILD, f"cold-{target}-runner.log")})')
+					die(f'the {target} guest exited before it offered its serial line (see {os.path.join(state, f"cold-{target}-runner.log")})')
 				if time.time() >= offered:
 					die(f'the {target} guest never offered its serial line at {serial_sock}')
 				try:
@@ -3571,8 +3602,8 @@ def cmd_scenario_cold(args):
 		scenario.TIME_SCALE = 1.0 if target == 'x86_64' else 10.0
 		# AND THE RATE THIS TYPES AT, by the same factor and for the same reason.
 		KEY_PACING = 0.05 * scenario.TIME_SCALE
-		MON_OVERRIDE = os.path.join(BUILD, f'qemu-monitor-cold-{target}.sock')
-		QMP_OVERRIDE = os.path.join(BUILD, f'qemu-qmp-cold-{target}.sock')
+		MON_OVERRIDE = os.path.join(state, 'qemu-monitor.sock')
+		QMP_OVERRIDE = os.path.join(state, 'qemu-qmp.sock')
 		# The guest is answering when it answers, not when a timer says so: poll the handshake
 		# rather than sleeping for a number that would be wrong on both a fast and a slow target.
 		# Generous on purpose. An emulated aarch64 or riscv64 guest takes minutes to bring its
@@ -3673,14 +3704,39 @@ def cmd_scenario_cold(args):
 LAB_PGIDFILE = os.path.join(DEV_STATE, 'lab-guest.pgid')
 
 
-def record_lab_guest(process):
+def record_lab_guest(process, path=LAB_PGIDFILE):
 	"""Remember the process group the lab just started, so it can kill that and nothing else."""
 	try:
-		os.makedirs(BUILD, exist_ok=True)
-		with open(LAB_PGIDFILE, 'w') as handle:
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, 'w') as handle:
 			handle.write(str(os.getpgid(process.pid)))
 	except OSError:
 		pass
+
+
+# A FREE PORT ON THE LOOPBACK, for a guest of a run with a state directory of its own: under one fixed number a
+# second x86_64 guest could not forward it at all.
+def free_port():
+	with socket.socket() as probe:
+		probe.bind(('127.0.0.1', 0))
+		return str(probe.getsockname()[1])
+
+
+# THE STATUS A STEP REFUSES WITH when what it boots is not in the state it needs (`staging-state.sh`).
+STATE_REFUSED = 75
+
+
+# Why TARGET's staging - and on x86_64 its bootable volume, signed `enforcing-required` - is not current in the
+# development profile, a reason a line; nothing when it is. Asked of `staging-state.sh`, the one place that reads the
+# stamps, the profile records and the volume's mode record, with ENV's `LIBER_STATE_REFUSAL`, so a runner that asked
+# is handed the commands that make it current.
+def staging_not_current(target, env):
+	mode = 'enforcing-required' if target == 'x86_64' else ''
+	answer = subprocess.run(['bash', '-c', 'source "$1/lib.sh" && staging_current_refusal "$1/.build" "$2" development "$3"', 'staging', REPO, target, mode], env=env, capture_output=True, text=True)
+	if answer.returncode == 1:
+		return []
+	lines = [line for line in answer.stdout.splitlines() if line]
+	return lines if answer.returncode == 0 and lines else [f'the staging could not be checked: {(answer.stderr or answer.stdout).strip() or answer.returncode}']
 
 
 def kill_lab_guest():
@@ -3718,6 +3774,10 @@ def cmd_boot(args):
 	# `server` without `nowait`: QEMU blocks until the broker connects, so no
 	# boot output is ever lost between startup and the connect below.
 	env = dict(os.environ, SERIAL=f'unix:{SERIAL_SOCK},server')
+	# A RUN WITH A STATE DIRECTORY OF ITS OWN FORWARDS A HOST PORT OF ITS OWN: under the fixed 5555 a second one could
+	# not forward it at all.
+	if os.environ.get('LIBER_DEV_STATE') and not os.environ.get('HOSTFWD_PORT'):
+		env['HOSTFWD_PORT'] = free_port()
 	qemu_log = open(QEMU_LOG, 'wb')
 	# BUILD THE ISO, then boot it. image.sh owns the prerequisite system build as well as assembly, so
 	# the runner can consume one inspected artifact without silently refreshing it.

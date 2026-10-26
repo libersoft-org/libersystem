@@ -347,6 +347,196 @@ run_plan "$plan" --jobs 2 || rc=$?
 check "an invalid isolation declaration is refused" 1 "$rc"
 check "invalid metadata starts no step" absent "$([[ -e "$work/invalid-ran" ]] && echo present || echo absent)"
 
+# 7. A REFUSED STEP IS NO OUTCOME. A step that exits `STATE_REFUSED` (`staging-state.sh`) found what it
+#    boots in the wrong state and tested nothing: in a release rehearsal it leaves no envelope and the
+#    history gets no record of it, where a step that FAILED gets both. A private copy with a `cargo`
+#    that records what it was asked, so nothing reaches this checkout's history or a real run.
+refusal="$work/refusal"
+mkdir -p "$refusal/src/tools/verify-model" "$refusal/bin" "$refusal/run/logs"
+cp "$repo/verify.sh" "$repo/lib.sh" "$refusal/"
+cp "$repo/src/tools/result-logs.sh" "$repo/src/tools/evidence.sh" "$repo/src/tools/staging-state.sh" "$refusal/src/tools/"
+cat >"$refusal/bin/cargo" <<'RECORDER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CARGO_CALLS"
+echo "fixture: recorded"
+RECORDER
+chmod +x "$refusal/bin/cargo"
+printf '"gate.refusing / host / host / default",\n"gate.failing / host / host / default",\n' >"$refusal/required.toml"
+plan="$refusal/plan"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	step 0 1 "the refusing gate" "exit 75"
+	printf 'KEY\t0\tgate.refusing / host / host / default\n'
+	step 1 1 "the failing gate" "false"
+	printf 'KEY\t1\tgate.failing / host / host / default\n'
+} >"$plan"
+out="$refusal/out.log"
+rc=0
+(cd "$refusal" && PATH="$refusal/bin:$PATH" CARGO_CALLS="$refusal/calls" LIBER_VERIFY_STEPS="$plan" LIBER_VERIFY_RUN="$refusal/run" LIBER_RELEASE_REQUIRED="$refusal/required.toml" ./verify.sh) >"$out" 2>&1 || rc=$?
+touch "$refusal/calls"
+check "a refused step is reported as refused" 1 "$(grep -c 'REFUSED: the refusing gate' "$out" || true)"
+check "a refused step publishes no envelope" 0 "$(grep -c -- '--key gate.refusing' "$refusal/calls" || true)"
+check "a refused step records no history" 0 "$(grep -c -- 'record --step-id id-0' "$refusal/calls" || true)"
+check "a failed step still publishes its envelope" 1 "$(grep -c -- '--key gate.failing' "$refusal/calls" || true)"
+check "a failed step still records its history" 1 "$(grep -c -- 'record --step-id id-1' "$refusal/calls" || true)"
+check "a run with a refused step does not pass" 1 "$((rc != 0))"
+
+# 8. A REFUSAL THAT NAMES ITS FIX IS FIXED AND RUN AGAIN, ONCE. The step hands the runner the command
+#    that brings the state about (`LIBER_STATE_REFUSAL`); the runner runs it with nothing else running
+#    and runs the step again, and that run is the step's outcome - its envelope and its history, and
+#    nothing for the refused run. Refused twice, or with a fix that fails, it is a failure. A guest
+#    refused while another guest still runs is fixed only once that one has ended.
+state="$refusal/state"
+mkdir -p "$state"
+refuse_until() {
+	# The state file that makes the step run, and the fix that makes it.
+	printf 'if [[ -e %q ]]; then echo ran >>%q; else echo %q >>"$LIBER_STATE_REFUSAL"; exit 75; fi' "$1" "$state/runs" "touch $1"
+}
+plan="$refusal/plan-retry"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	step 0 1 "the step refused once" "$(refuse_until "$state/fixed")"
+	printf 'KEY\t0\tgate.refused-once / host / host / default\n'
+	step 1 1 "the step refused twice" "echo 'true' >>\"\$LIBER_STATE_REFUSAL\"; exit 75"
+	printf 'KEY\t1\tgate.refused-twice / host / host / default\n'
+	step 2 1 "the step whose fix fails" "echo 'false' >>\"\$LIBER_STATE_REFUSAL\"; exit 75"
+	printf 'KEY\t2\tgate.unfixable / host / host / default\n'
+} >"$plan"
+printf '"gate.refused-once / host / host / default",\n"gate.refused-twice / host / host / default",\n"gate.unfixable / host / host / default",\n' >"$refusal/required-retry.toml"
+: >"$refusal/calls"
+rm -rf "$refusal/run" && mkdir -p "$refusal/run/logs"
+out="$refusal/retry.log"
+rc=0
+(cd "$refusal" && PATH="$refusal/bin:$PATH" CARGO_CALLS="$refusal/calls" LIBER_VERIFY_STEPS="$plan" LIBER_VERIFY_RUN="$refusal/run" LIBER_RELEASE_REQUIRED="$refusal/required-retry.toml" ./verify.sh) >"$out" 2>&1 || rc=$?
+check "a refusal with a fix brings the state about first" 1 "$(grep -c 'bringing the staging to the state it needs, then running it once more' "$out" | awk '{print ($1 >= 1)}')"
+check "the step refused once runs once, after its fix" "ran" "$(cat "$state/runs" 2>/dev/null)"
+check "and its second run is its outcome: one passed envelope" 1 "$(grep -- '--key gate.refused-once' "$refusal/calls" | grep -c -- '--outcome passed' || true)"
+check "and one passed record" 1 "$(grep -- 'record --step-id id-0' "$refusal/calls" | grep -vc -- '--failed' || true)"
+check "a step refused twice publishes and records nothing" 0 "$(grep -c -- '--key gate.refused-twice\|record --step-id id-1' "$refusal/calls" || true)"
+check "a step whose fix fails publishes and records nothing" 0 "$(grep -c -- '--key gate.unfixable\|record --step-id id-2' "$refusal/calls" || true)"
+check "and both are reported as refused" 2 "$(grep -c 'REFUSED: the step refused twice - it needs\|REFUSED: the step whose fix fails - it needs' "$out" || true)"
+check "a run with a step refused for good does not pass" 1 "$((rc != 0))"
+
+plan="$refusal/plan-retry-guests"
+rm -f "$state/fixed-guest" "$state/runs" "$state/order"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	printf 'STEP\t0\t0\tthe guest refused while another runs\tif [[ -e %q ]]; then echo retried >>%q; else echo %q >>"$LIBER_STATE_REFUSAL"; exit 75; fi\t\n' "$state/fixed-guest" "$state/order" "touch $state/fixed-guest"
+	printf 'STEPID\t0\tid-0\nSTEPCOST\t0\t1\nSTEPGUESTS\t0\t1\n'
+	printf 'STEP\t1\t0\tthe guest still running\tsleep 2; echo ended >>%q\t\n' "$state/order"
+	printf 'STEPID\t1\tid-1\nSTEPCOST\t1\t1\nSTEPGUESTS\t1\t1\n'
+} >"$plan"
+rc=0
+run_plan "$plan" --jobs 2 || rc=$?
+check "a guest refused beside another is fixed and retried after the barrier" "ended retried" "$(tr '\n' ' ' <"$state/order" | sed 's/ *$//')"
+check "and the run passes" 0 "$rc"
+
+# 9. OVERLAP IS WHAT THE DECLARATIONS ALLOW, AND THE STAGING IS SWITCHED ONCE PER GROUP. A private copy whose
+#    `./build.sh` only records what it was asked and writes the records a real build writes, so the staging's state
+#    and every switch are observed: two writers of one staging never overlap, a reader waits for a writer, two
+#    readers overlap, the steps that need the development profile run as one group between two switches with the
+#    steps that need one volume mode together inside it, and the host lane runs beside a guest.
+staging="$work/staging"
+mkdir -p "$staging/src/tools" "$staging/bin" "$staging/.build/state" "$staging/.build/boot"
+cp "$repo/verify.sh" "$repo/lib.sh" "$staging/"
+cp "$repo/src/tools/result-logs.sh" "$repo/src/tools/evidence.sh" "$repo/src/tools/staging-state.sh" "$staging/src/tools/"
+cat >"$staging/bin/cargo" <<'RECORDER'
+#!/usr/bin/env bash
+exit 0
+RECORDER
+cat >"$staging/build.sh" <<'BUILD'
+#!/usr/bin/env bash
+# What a build would leave: the profile of the parts it built, and the bootable volume's mode.
+set -euo pipefail
+profile=shipping
+[[ "${LIBER_DEVELOPMENT:-0}" == 1 ]] && profile=development
+args=" $* "
+echo "switch $profile${args//  / }" >>"$STAGING_TRACE"
+if [[ "$args" == *" --kernel-on-volume "* ]]; then
+	mode="${args#* --dma-mode }"
+	mode="${mode%% *}"
+	echo "$profile" >.build/state/built-x86_64-volume.profile
+	echo "$mode" >.build/boot/system-volume-bootable-x86_64.dma-mode
+else
+	for part in libs user packages volume-test; do echo "$profile" >".build/state/built-x86_64-$part.profile"; done
+fi
+BUILD
+chmod +x "$staging/bin/cargo" "$staging/build.sh"
+shipped() {
+	local part
+	: >"$staging/.build/boot/system-volume-bootable-x86_64.img"
+	for part in libs user packages volume-test volume; do echo shipping >"$staging/.build/state/built-x86_64-$part.profile"; done
+	echo enforcing-required >"$staging/.build/boot/system-volume-bootable-x86_64.dma-mode"
+	: >"$staging/trace"
+}
+guest_step() {
+	# index label uses [cost]
+	printf 'STEP\t%s\t0\t%s\tsh -c "echo start-%s >> %s; sleep 1; echo end-%s >> %s"\t\n' "$1" "$2" "$2" "$staging/trace" "$2" "$staging/trace"
+	printf 'STEPID\t%s\tid-%s\nSTEPCOST\t%s\t%s\nSTEPGUESTS\t%s\t1\nSTEPUSES\t%s\t%s\n' "$1" "$1" "$1" "${4:-1}" "$1" "$1" "$3"
+}
+run_staging() {
+	out="$staging/out.$RANDOM"
+	local rc=0
+	(cd "$staging" && PATH="$staging/bin:$PATH" STAGING_TRACE="$staging/trace" LIBER_VERIFY_STEPS="$1" ./verify.sh --jobs "$2") >"$out" 2>&1 || rc=$?
+	return "$rc"
+}
+trace_of() { tr '\n' ' ' <"$staging/trace" | sed 's/ *$//'; }
+
+shipped
+plan="$staging/writers"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	guest_step 0 w1 "stage:x86_64=w:shipping"
+	guest_step 1 w2 "stage:x86_64=w:shipping"
+	guest_step 2 r1 "stage:x86_64=r:shipping media=r:-"
+	guest_step 3 r2 "stage:x86_64=r:shipping media=r:-"
+} >"$plan"
+rc=0
+run_staging "$plan" 4 || rc=$?
+check "the declared plan runs" 0 "$rc"
+check "two writers of one staging never overlap, and a reader waits for a writer" "start-w1 end-w1 start-w2 end-w2" "$(trace_of | cut -d' ' -f1-4)"
+check "two readers of one state overlap" "start-r1 start-r2" "$(trace_of | cut -d' ' -f5-6 | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ *$//')"
+check "and nothing was switched" 0 "$(grep -c '^switch' "$staging/trace" || true)"
+
+shipped
+plan="$staging/groups"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	guest_step 0 ship1 "stage:x86_64=r:shipping media=r:-"
+	guest_step 1 ship2 "stage:x86_64=r:shipping media=r:-"
+	guest_step 2 enf1 "stage:x86_64=r:development media=r:- volume:x86_64=r:development/enforcing-required"
+	guest_step 3 enf2 "stage:x86_64=r:development media=r:- volume:x86_64=r:development/enforcing-required"
+	guest_step 4 har1 "stage:x86_64=r:development media=r:- volume:x86_64=r:development/harness"
+	guest_step 5 har2 "stage:x86_64=r:development media=r:- volume:x86_64=r:development/harness"
+	guest_step 6 aside "stage:aarch64=r:shipping media=r:-"
+} >"$plan"
+for part in libs user packages volume-test; do echo shipping >"$staging/.build/state/built-aarch64-$part.profile"; done
+rc=0
+run_staging "$plan" 4 || rc=$?
+check "the grouped plan runs" 0 "$rc"
+order="$(trace_of)"
+check "the development profile is switched to once, after the shipping group has ended" 1 "$(grep -c '^switch development --arch x86_64 $' "$staging/trace" || true)"
+check "and each volume mode once" "1 1" "$(grep -c '^switch development .*--dma-mode enforcing-required' "$staging/trace" || true) $(grep -c '^switch development .*--dma-mode harness' "$staging/trace" || true)"
+check "the shipping group ends before the switch" yes "$(awk '/^end-ship/ {ended=NR} /^switch development --arch x86_64 *$/ {to=NR} END {print ((ended && to > ended) ? "yes" : "no")}' "$staging/trace")"
+check "one volume mode's steps run together, and the next mode is switched to after them" yes "$(awk '/^end-enf/ {ended=NR} /dma-mode harness/ {to=NR} /^start-har/ && !first {first=NR} END {print ((ended && to > ended && first > to) ? "yes" : "no")}' "$staging/trace")"
+check "the steps of one state overlap" yes "$(awk '/^start-enf/ {starts++} /^end-enf/ && !ended {ended=NR; print ((starts == 2) ? "yes" : "no")}' "$staging/trace")"
+check "another architecture's staging is not held back by this one's switches" yes "$(awk '/^start-aside/ {aside=NR} /^switch development --arch x86_64 *$/ {to=NR} END {print ((aside && aside < to) ? "yes" : "no")}' "$staging/trace")"
+check "the run puts the staging back once, at its end" "shipping shipping enforcing-required 1 1" "$(cat "$staging/.build/state/built-x86_64-libs.profile" "$staging/.build/state/built-x86_64-volume.profile" "$staging/.build/boot/system-volume-bootable-x86_64.dma-mode" | tr '\n' ' ')$(grep -c '^switch shipping --arch x86_64 *$' "$staging/trace" || true) $(grep -c '^switch shipping .*--dma-mode enforcing-required' "$staging/trace" || true)"
+[[ "$order" == *start-ship* ]] || failed=1
+
+# THE HOST LANE RUNS BESIDE THE GUESTS: a host step and a guest step start before either ends, even at one guest slot.
+shipped
+plan="$staging/lanes"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	guest_step 0 guest "stage:x86_64=r:shipping media=r:-"
+	printf 'STEP\t1\t0\thost\tsh -c "echo start-host >> %s; sleep 1; echo end-host >> %s"\t\n' "$staging/trace" "$staging/trace"
+	printf 'STEPID\t1\tid-1\nSTEPCOST\t1\t1\nSTEPGUESTS\t1\t0\nSTEPUSES\t1\t\n'
+} >"$plan"
+rc=0
+run_staging "$plan" 1 || rc=$?
+check "a host step and a guest step run at once" "start-guest start-host" "$(trace_of | cut -d' ' -f1-2 | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ *$//')"
+
 if ((failed != 0)); then
 	echo "verify-scheduler: the shell scheduler did not behave as the milestone requires" >&2
 	exit 1

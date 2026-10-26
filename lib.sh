@@ -480,6 +480,13 @@ VOLUME_SOURCES=(abi acpi aml boot fs idl platform procpower proto sdk term tools
 # added there needs a directory added here.
 LOADER_SOURCES=(boot/loader boot/protocol boot/signature boot/uefi fdt fs abi)
 
+# WHAT THE KERNEL IS BUILT FROM: the kernel crate and every crate it links, as the top-level directories the
+# kernel part's stamp digests. That stamp hashed `VOLUME_SOURCES`, which the kernel's own directory is not in, so a
+# kernel edit left it current - and a cold run that boots the staging it finds current would have booted the
+# previous kernel. DERIVED and gated like `VOLUME_SOURCES`: `verify-model check` compares it with the kernel's
+# closure in the model.
+KERNEL_SOURCES=(abi acpi boot buddy dma fdt fs kernel perfbuf platform procpower smbios smpboot term tickclock tools topology tpm user wire)
+
 # A digest of every source file a build reads, so "has it changed" is answered by CONTENT.
 #
 # Modification times cannot answer it. `mkpackages` skips a write whose bytes are unchanged, so an

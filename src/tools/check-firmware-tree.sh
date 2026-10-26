@@ -87,6 +87,10 @@ done
 [[ -e "$guest_gate_work/ready" ]] || guest_gate_fail "the GPIO backend did not start"
 export I2C_FIXTURE=tree I2C_SOCKET="$guest_gate_work/i2c.sock" GPIO_SOCKET="$guest_gate_work/gpio.sock" NET_NONE=1
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-900}" GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-1200}"
+# THE COMPLETION LINE: the second acknowledged edge is the last observation this gate needs, and it types no
+# `poweroff`, so its guest ran out the whole console budget. It also refuses a driver refusal, which a late line
+# could carry, so it keeps a settle window after that line: 20 s on these emulated ports.
+export GUEST_GATE_DONE="$second" GUEST_GATE_SETTLE=20
 
 # Raise each edge only after the preceding acknowledgement is visible. A line whose acknowledge or
 # controller join is missing cannot produce the second observation.

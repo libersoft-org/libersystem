@@ -153,6 +153,17 @@ if [[ "${1:-}" == "--manifest-only" ]]; then
 	exit "$status"
 fi
 
+# THE PACKAGE CHECK 4 READS IS IN THE PROFILE THIS RUN ASKS FOR (`staging-state.sh`), or the gate refuses
+# before it builds anything. A package another step left in the other profile is a state of the staging,
+# not a defect of the boundary - it failed this gate on "not the shipping configuration" for no fault of the
+# code. A package whose record and whose content disagree is still a failure, in check 4.
+# shellcheck source=staging-state.sh
+source tools/staging-state.sh
+if [[ -e ../.build/boot/volume-x86_64.pkg ]] && refusal="$(staging_profile_refusal ../.build x86_64 "$(run_profile)" packages)"; then
+	echo "development-gate: $refusal" >&2
+	exit "$STATE_REFUSED"
+fi
+
 # 3. The shipping configuration builds, and produces none of the gated binaries. Built into
 #    its own target directory so this check never disturbs, or is disturbed by, whatever
 #    configuration the working tree was last built in.

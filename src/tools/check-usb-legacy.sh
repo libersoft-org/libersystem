@@ -71,7 +71,10 @@ done
 export USB_LEGACY=1
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-420}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-600}"
-qmp_socket="$root/../.build/boot/qemu-qmp.sock"
+# THE COMPLETION LINE: the script's last line prints `usb-legacy-done`, after which nothing this gate needs can
+# arrive. It also refuses a panic, which a late line could carry, so it keeps a settle window of 10 s after it.
+export GUEST_GATE_DONE="usb-legacy-done" GUEST_GATE_SETTLE=10
+qmp_socket="$GUEST_GATE_QMP"
 
 # How many lines of the guest's log hold `text`, now - zero before the log exists.
 seen() {

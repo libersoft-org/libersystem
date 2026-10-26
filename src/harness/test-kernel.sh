@@ -434,9 +434,14 @@ trap 'rm -f "$STAGED_TEST_KERNEL" "$STAGED_TEST_KERNEL.sha256" "$STAGED_TEST_KER
 # envelope discharges every kernel test the guest reported `[ok]` beside its own key.
 # shellcheck source=../tools/evidence.sh
 source "$ROOT/tools/evidence.sh"
+# shellcheck source=../tools/staging-state.sh
+source "$ROOT/tools/staging-state.sh"
 SUITE_OUTCOME=failed
+SUITE_REFUSED=0
 publish_suite_evidence() {
 	evidence_active || return 0
+	# A REFUSED RUN TESTED NOTHING, so it claims nothing either way: its outcome is its next run's.
+	[[ "$SUITE_REFUSED" == 0 ]] || return 0
 	[[ "$BUILD_ONLY" != "1" && -z "$TAGS" && -z "${TEST_SELECTION:-}" && -z "${LIBER_NO_DT_PROFILE:-}" && -z "${USB_GADGET:-}" && -z "${I2C_FIXTURE:-}" ]] || return 0
 	local discharges medium
 	discharges="$(mktemp)"
@@ -760,6 +765,13 @@ set -e
 rm -f "$STALL_MARK"
 kill "$STALL_WATCHER" 2>/dev/null || true
 wait "$STALL_WATCHER" 2>/dev/null || true
+# THE RUNNER REFUSED BEFORE THE GUEST (`staging-state.sh`): the staging or the bootable volume is not in
+# the state this boot needs. Nothing was tested, so nothing is published, and the status is passed on.
+if [[ "$status" -eq "$STATE_REFUSED" ]] && grep -aq '^qemu-run: REFUSED: ' "$RUN_LOG"; then
+	grep -a '^qemu-run: REFUSED: ' "$RUN_LOG" >&2
+	SUITE_REFUSED=1
+	exit "$STATE_REFUSED"
+fi
 if [[ -f "$STALL_MARK.hit" ]]; then
 	stuck="$(cut -f1 "$STALL_MARK.hit")"
 	quiet="$(cut -f2 "$STALL_MARK.hit")"

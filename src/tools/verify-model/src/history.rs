@@ -76,9 +76,16 @@ pub struct StepRecord {
 	pub last_run: u64,
 	pub last_seconds: f64,
 	pub runs: u64,
-	// The model this was measured under, for the same reason `Record` carries one: a duration
-	// measured over a different plan is not a duration for this one.
+	// The model this was measured under. It binds EVIDENCE and not cost: a price measured under an older model is
+	// still what the step took, and is used and marked as such (`step_price_is_older`) - a hash that covers the
+	// catalog with every kernel test id left every host step unpriced and every guest step on its seed after one
+	// kernel test was added.
 	pub model_hash: String,
+	// And the command it was measured running: a price is the step's under its id AND its command, so a step whose
+	// command changed under the same id starts unpriced. Empty in a record from before it was kept, which is taken
+	// as the command the id names.
+	#[serde(default)]
+	pub command: String,
 }
 
 // The history file's format version. Bumped when a recorded value stops meaning what it meant.
@@ -86,6 +93,11 @@ pub const SCHEMA: u32 = 3;
 
 impl History {
 	pub fn path(repo_root: &Path) -> PathBuf {
+		// A SEALED RELEASE RUNS IN A SNAPSHOT IT DELETES, and recorded its history there - so the next run started
+		// unpriced. `verify.sh` names the tree's own history for it (`LIBER_VERIFY_HISTORY`).
+		if let Some(path) = std::env::var_os("LIBER_VERIFY_HISTORY").filter(|path| !path.is_empty()) {
+			return PathBuf::from(path);
+		}
 		repo_root.join(".build/state/verify-history.json")
 	}
 
@@ -144,28 +156,22 @@ impl History {
 	// do not cost the same - but it is an approximation that adds up to the truth, which the
 	// alternative did not.
 	pub fn record_step(&mut self, keys: &[PlanItemKey], passed: bool, step_seconds: f64, model_hash: &str, cost: &CostModel) {
-		self.record_step_id(None, keys, passed, step_seconds, model_hash, cost);
+		self.record_step_id(None, "", keys, passed, step_seconds, model_hash, cost);
 	}
 
 	// The same, told WHICH step it was. `step_id` is `None` only for a caller that has no id to give,
 	// which after this milestone is none of them - see `StepRecord`.
-	pub fn record_step_id(&mut self, step_id: Option<&str>, keys: &[PlanItemKey], passed: bool, step_seconds: f64, model_hash: &str, cost: &CostModel) {
+	pub fn record_step_id(&mut self, step_id: Option<&str>, command: &str, keys: &[PlanItemKey], passed: bool, step_seconds: f64, model_hash: &str, cost: &CostModel) {
 		if let Some(id) = step_id.filter(|id| !id.is_empty()) {
 			let entry = self.steps.entry(id.to_string()).or_default();
 			entry.last_run = now();
 			entry.runs += 1;
-			// AND A FAILURE UNDER A NEW MODEL DOES NOT RELABEL THE OLD MODEL'S DURATION AS THIS
-			// ONE'S (corrected 2026-09-03). The hash was overwritten unconditionally while the
-			// duration was kept, so a success under model A followed by a FAILURE under model B left
-			// A's seconds stamped with B - and `step_seconds`, which filters on the hash precisely
-			// to refuse a duration measured over a different plan, then accepted it. A measurement
-			// belongs to the model it was taken under; a run that records no measurement must not
-			// move it to another.
+			// A MEASUREMENT KEEPS THE MODEL AND THE COMMAND IT WAS TAKEN UNDER, and a run that measures nothing moves
+			// neither: a failure under a new model leaves the old model's duration, still marked with that model, as
+			// the step's price. It used to erase it, so every model change left the steps it touched unpriced.
 			if passed && step_seconds > 0.0 {
 				entry.model_hash = model_hash.to_string();
-			} else if entry.model_hash != model_hash {
-				entry.last_seconds = 0.0;
-				entry.model_hash = model_hash.to_string();
+				entry.command = command.to_string();
 			}
 			// A STEP THAT DID NOT RUN IS NOT A MEASUREMENT OF WHAT RUNNING COSTS - the same rule
 			// the fixed-term overshoot below already states, applied to the number the SCHEDULER
@@ -427,13 +433,63 @@ impl Default for CostModel {
 	}
 }
 
+// WHERE A PLAN'S TIME GOES, from what each step last measured (`verify-model account`). A step that boots no guest
+// waits behind the barrier that drains every guest and an exclusive guest step runs alone, so both are the SERIAL
+// REMAINDER; a guest step that is neither shares the slots. A price measured under an older model is used and counted:
+// a model hash binds evidence, and what a step costs is what it took.
+#[derive(Debug, Default)]
+pub struct Account {
+	// Every priced step, dearest first: its price, its id, whether it runs alone.
+	pub priced: Vec<(f64, String, bool)>,
+	pub unpriced: Vec<String>,
+	pub older: usize,
+	pub alone: f64,
+	pub shared: f64,
+}
+
+impl Account {
+	pub fn of(steps: &[crate::commands::Step], history: &History, model_hash: &str) -> Account {
+		let mut account = Account::default();
+		for step in steps {
+			let Some(record) = history.steps.get(&step.id).filter(|record| record.last_seconds > 0.0) else {
+				account.unpriced.push(step.id.clone());
+				continue;
+			};
+			account.older += usize::from(record.model_hash != model_hash);
+			let alone = step.guests == 0 || step.exclusive_guests;
+			if alone {
+				account.alone += record.last_seconds;
+			} else {
+				account.shared += record.last_seconds;
+			}
+			account.priced.push((record.last_seconds, step.id.clone(), alone));
+		}
+		account.priced.sort_by(|left, right| right.0.total_cmp(&left.0));
+		account
+	}
+
+	pub fn total(&self) -> f64 {
+		self.alone + self.shared
+	}
+
+	// The wall clock no schedule over `jobs` slots can beat: the remainder, plus the shared work spread over the
+	// slots or its longest step, whichever is longer.
+	pub fn floor(&self, jobs: usize) -> f64 {
+		let longest_shared = self.priced.iter().filter(|(_, _, alone)| !alone).map(|(seconds, _, _)| *seconds).fold(0.0, f64::max);
+		self.alone + longest_shared.max(self.shared / jobs.max(1) as f64)
+	}
+}
+
 impl History {
-	// What this step measured last time, if it was measured under THIS model.
-	//
-	// A duration from another model is not a duration for this plan - the same argument that makes a
-	// key's record carry a hash - so a stale one is ignored rather than trusted for being a number.
-	pub fn step_seconds(&self, step_id: &str, model_hash: &str) -> Option<f64> {
-		self.steps.get(step_id).filter(|record| record.model_hash == model_hash && record.last_seconds > 0.0).map(|record| record.last_seconds)
+	// WHAT THIS STEP TOOK THE LAST TIME IT RAN TO THE END, under its id and its command, whatever model it was measured
+	// under: a model hash binds evidence, and what a step costs is what it took.
+	pub fn step_seconds(&self, step_id: &str, command: &str) -> Option<f64> {
+		self.steps.get(step_id).filter(|record| record.last_seconds > 0.0 && (record.command.is_empty() || record.command == command)).map(|record| record.last_seconds)
+	}
+
+	// Whether that price was measured under another model than this one - what a level's estimate marks.
+	pub fn step_price_is_older(&self, step_id: &str, model_hash: &str) -> bool {
+		self.steps.get(step_id).is_some_and(|record| record.last_seconds > 0.0 && record.model_hash != model_hash)
 	}
 }
 
@@ -524,7 +580,7 @@ impl CostModel {
 	// None means unpriced, not zero. The unbudgeted runner can execute this work to measure it;
 	// a budget cannot admit it or its dependents using the generic per-key estimate as a bound.
 	pub fn scheduled_seconds(&self, history: &History, step: &crate::commands::Step, model_hash: &str) -> Option<f64> {
-		if let Some(seconds) = history.step_seconds(&step.id, model_hash) {
+		if let Some(seconds) = history.step_seconds(&step.id, &step.command) {
 			return Some(seconds);
 		}
 		let measured_keys = !step.keys.is_empty() && step.keys.iter().all(|key| history.get(&key.display()).is_some_and(|record| record.model_hash == model_hash && record.last_status == "passed" && !record.cost_was_divided && record.last_seconds > 0.0));

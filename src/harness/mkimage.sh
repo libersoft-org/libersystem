@@ -39,6 +39,8 @@ LOADER_EFI="${LOADER_EFI:-$REPO_ROOT/.build/cargo/loader/x86_64-unknown-uefi/deb
 # shellcheck source=/dev/null
 source "$REPO_ROOT/product.conf"
 source "$REPO_ROOT/src/tools/volume-pairing.sh"
+# shellcheck source=../tools/staging-state.sh
+source "$REPO_ROOT/src/tools/staging-state.sh"
 
 BUILD="$REPO_ROOT/.build/boot"
 SLUG="$(echo "$PRODUCT_NAME" | tr '[:upper:]' '[:lower:]')"
@@ -694,15 +696,18 @@ verify_boot_artifacts "$kernel"
 # absent. A medium whose whole purpose is to carry a system volume, published without one, is a
 # medium that fails at boot with nothing on it to explain why.
 if [[ "$cmd" != testiso ]]; then
-	for required in "$IN/system-volume-bootable-x86_64.img" "$IN/system-volume-bootable-x86_64.uuid" "$IN/system-volume-bootable-x86_64.dma-mode"; do
+	for required in "$IN/system-volume-bootable-x86_64.img" "$IN/system-volume-bootable-x86_64.uuid"; do
 		[[ -f "$required" ]] || die "no $required - build it with:  ./build.sh --arch x86_64 --kernel-on-volume --dma-mode $DMA_MODE --part volume"
 	done
 	# AND THE VOLUME WAS SIGNED FOR THE SAME MODE. The loader latches every selected manifest and
 	# refuses a set that disagrees, so a medium signed for one value around a volume signed for
 	# another is an image that cannot boot - refused here, where the two halves are being paired,
-	# rather than on somebody's machine.
-	volume_mode="$(<"$IN/system-volume-bootable-x86_64.dma-mode")"
-	[[ "$volume_mode" == "$DMA_MODE" ]] || die "the bootable volume was signed for DMA mode '$volume_mode' and this medium is being signed for '$DMA_MODE' - rebuild the volume for it:  ./build.sh --arch x86_64 --kernel-on-volume --dma-mode $DMA_MODE --part volume"
+	# rather than on somebody's machine. A REFUSAL, with its own status (`staging-state.sh`): the
+	# volume is in the wrong state for this medium, and nothing about the code has been judged.
+	if volume_refusal="$(volume_mode_refusal "$IN/system-volume-bootable-x86_64.img" "$DMA_MODE" x86_64)"; then
+		echo "mkimage: $volume_refusal" >&2
+		exit "$STATE_REFUSED"
+	fi
 fi
 
 # EVERY COPIED BYTE, not the subset that was easy to name.
@@ -805,19 +810,34 @@ fi
 if [[ "$cmd" == testiso ]]; then
 	output="$BUILD/$SLUG-test.$key.iso"
 fi
+# AND SO DOES THE MEDIUM THE GUEST GATES SHARE (`LIBER_IMAGE_KEYED=1`). Each gate used to assemble a
+# development ISO of its own beside a fresh temporary path, where no key file could ever be found, so
+# thirty-three gates built thirty-three identical media. Named by its key, one medium serves every
+# gate while the key matches, a changed input names a new file beside it, and a guest still booting
+# the old one is untouched. The installable images keep their plain names.
+keyed_prefix=""
+if [[ "$cmd" == iso && "${LIBER_IMAGE_KEYED:-0}" == 1 ]]; then
+	keyed_prefix="$BUILD/$SLUG$DMA_SUFFIX"
+	output="$keyed_prefix.$key.iso"
+fi
 key_file="$output.build-key"
 digest_file="$output.build-digest"
 
 # AND THE OLD GENERATIONS ARE SWEPT, because a content-addressed name grows one file per distinct
 # selection and nothing else would ever remove them. A medium a live guest is reading is never
 # touched: `fuser` answers that question and its absence is answered by keeping the file, which is
-# the safe direction for a sweep. Only the test medium is swept - the shipping media have one name.
+# the safe direction for a sweep. Only the keyed media are swept - the test medium and the gates' shared
+# one; the installable media have one name each.
 # AN HOUR, NOT A DAY: a medium has no lease, so the age is all that covers the moment between this
 # script naming it and the runner opening it - seconds. Twelve hours kept every selection of the day,
 # ten media at 65 MB each on 2026-10-16.
-if [[ "$cmd" == testiso ]]; then
-	for stale in "$BUILD/$SLUG-test."*.iso; do
+generations=()
+[[ "$cmd" != testiso ]] || generations=("$BUILD/$SLUG-test."*.iso)
+[[ -z "$keyed_prefix" ]] || generations=("$keyed_prefix".*.iso)
+if ((${#generations[@]})); then
+	for stale in "${generations[@]}"; do
 		[[ -f "$stale" && "$stale" != "$output" ]] || continue
+		[[ "${stale##*/}" =~ \.[0-9a-f]{64}\.iso$ ]] || continue
 		[[ -n "$(find "$stale" -mmin +60 -print -quit 2>/dev/null)" ]] || continue
 		if command -v fuser >/dev/null && fuser -s "$stale" 2>/dev/null; then
 			continue

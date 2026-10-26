@@ -20,11 +20,16 @@
 #                          state declared, its latency stated - from a grant that opens nothing else
 #   audioctl streams       the operator sees the placement
 #
-# IT BOOTS ITS OWN GUEST unless one is already up, and takes down only what it started.
+# IT BOOTS ITS OWN GUEST, in a state directory of its own, and takes it down.
 
 SCRIPT_NAME=check-audio-routing.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../lib.sh"
 
+# THE LAB GUEST IS THIS GATE'S OWN: `lab.sh` keeps its sockets and logs in the directory `LIBER_DEV_STATE` names and
+# forwards a host port of its own, so a second lab gate beside this one boots, drives and reads a guest of its own -
+# and a guest a person left up in `.build/boot` is neither reused nor touched.
+LIBER_DEV_STATE="$(mktemp -d "${TMPDIR:-/tmp}/liber-lab.XXXXXX")"
+export LIBER_DEV_STATE
 BOOTED=0
 work="$(mktemp -d "${TMPDIR:-/tmp}/liber-audio-routing.XXXXXX")"
 holder=""
@@ -36,6 +41,7 @@ cleanup() {
 	if ((BOOTED)); then
 		"$REPO_ROOT/lab.sh" quit >/dev/null 2>&1 || true
 	fi
+	rm -rf "$LIBER_DEV_STATE"
 	rm -rf "$work"
 }
 trap cleanup EXIT

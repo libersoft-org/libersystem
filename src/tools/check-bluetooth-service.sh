@@ -90,7 +90,7 @@ expect() {
 # THE UNRELATED POINTER, moved and clicked from the host once `btcheck refund` says the Bluetooth service is
 # stopped: the machine's own tablet, through the monitor the runner gives every x86_64 guest. Bounded - a
 # guest that never says so leaves it to give up by itself.
-monitor="$root/../.build/boot/qemu-monitor.sock"
+monitor="$GUEST_GATE_MONITOR"
 unrelated_pointer() {
 	local polls=0
 	until grep -aqF 'btcheck: the Bluetooth service is stopped; move another pointer now' "$guest_gate_work/guest" 2>/dev/null; do

@@ -131,6 +131,10 @@ declare -A GATES=(
 	# the machine off, the next boot replacing memory on the core the image's boot core was and every other core turned
 	# on again at its record, a running program going on; the boot after finding none, and a modified image refused.
 	["hibernate-ports"]="python3 tools/check-hibernate-ports.py"
+	# ONE GATE PER PORT, with a key and a price of its own: run as one step the pair was the longest step of the
+	# release rehearsal (6,842 s), both emulated ports one after the other. The pair above stays a command.
+	["hibernate-ports-aarch64"]="python3 tools/check-hibernate-ports.py aarch64"
+	["hibernate-ports-riscv64"]="python3 tools/check-hibernate-ports.py riscv64"
 	# The real SBI system-suspend handshake, retained RTC wake and repeated saved-hart returns; absent firmware too.
 	["system-suspend-riscv64"]="python3 tools/check-system-suspend.py"
 	# PROCESSOR AND THERMAL POWER ON x86_64 q35 WITH THE FIXTURE'S PROCESSORS, ZONE AND FANS: every core's tables installed
@@ -668,6 +672,11 @@ run_gate() {
 	# watching still sees it - and copied into the run by the envelope. `pipefail` makes the
 	# pipeline's status the gate's, a killed gate included.
 	local gate_log="" gate_pid
+	# THE TRACE AN INJECTION GATE KEEPS IS NAMED HERE, one per gate, so a failure prints this gate's and removes
+	# this gate's: the glob over every `liber-injection-trace.*.log` printed and deleted another gate's beside it.
+	local trace
+	trace="$(mktemp -u "${TMPDIR:-/tmp}/liber-injection-trace.XXXXXXXX").log"
+	export LIBER_INJECTION_TRACE="$trace"
 	if evidence_active; then
 		gate_log="$(mktemp "${TMPDIR:-/tmp}/liber-gate-$name.XXXXXX")"
 		{ (cd "$SRC_DIR" && eval "$cmd") 2>&1 | tee "$gate_log"; } &
@@ -680,7 +689,16 @@ run_gate() {
 	register_run_child "$gate_pid"
 	wait "$gate_pid" || status=$?
 	forget_run_child "$gate_pid"
-	unset LIBER_GATE_KEY
+	unset LIBER_GATE_KEY LIBER_INJECTION_TRACE
+	# A REFUSED GATE JUDGED NOTHING (`staging-state.sh`): what it boots or pairs was not in the state it
+	# needs, and it said so before it ran. So it publishes nothing either way, and its outcome is that of
+	# its next run.
+	if [[ "$status" -eq "$STATE_REFUSED" ]]; then
+		[[ -z "$gate_log" ]] || rm -f "$gate_log"
+		rm -f "$trace"
+		note "gate '$name' REFUSED to run (exit $status) - it needs another state of the staging, named above"
+		return "$status"
+	fi
 	if [[ -n "$gate_log" ]]; then
 		# PUBLISHED BEFORE THE FAILURE IS REPORTED, because reporting returns. `--if-absent`: a gate
 		# that published its own envelope - the lifecycle producer - is not published over.
@@ -701,16 +719,15 @@ run_gate() {
 		# The injection gates write one as they go, precisely because their unexplained deaths are the
 		# ones where nothing is left alive to report: a signal skips the gate's own EXIT trap, so the
 		# gate cannot print its own trace and the only thing that can is out here. Printed and then
-		# removed, so a later run is never read as this one's.
-		local trace
-		for trace in "${TMPDIR:-/tmp}"/liber-injection-trace.*.log; do
-			[[ -s "$trace" ]] || continue
+		# removed, so a later run is never read as this one's - and only this gate's.
+		if [[ -s "$trace" ]]; then
 			note "the last commands '$name' ran, from $trace:"
 			tail -n 15 "$trace" | sed 's/^/    /' >&2
-			rm -f "$trace"
-		done
+		fi
+		rm -f "$trace"
 		return "$status"
 	fi
+	rm -f "$trace"
 }
 
 run_conformance() {

@@ -36,8 +36,13 @@ esac
 
 scenario="$root/harness/scenarios/dfu-tool.toml"
 backup_scenario="$root/harness/scenarios/dfu-backup.toml"
-log="$repo/.build/boot/cold-x86_64.log"
 work="$(mktemp -d "${TMPDIR:-/tmp}/liber-dfu-tool.XXXXXX")"
+# THE COLD RUN'S STATE IS THIS GATE'S: `lab.sh scenario-cold` keeps its sockets, its serial log and its scenario
+# record in the directory `LIBER_DEV_STATE` names, so a second cold run of the same target beside this one drives
+# and reads a guest of its own.
+export LIBER_DEV_STATE="$work/cold"
+mkdir -p "$LIBER_DEV_STATE"
+log="$LIBER_DEV_STATE/cold-x86_64.log"
 device_pid=""
 cleanup() {
 	if [[ -n "$device_pid" ]]; then

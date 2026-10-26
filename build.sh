@@ -371,6 +371,16 @@ fi
 BUILD_STEP_MARK="$BUILD_DIR/state/build-step.$$"
 BUILD_STEP_GENERATION=0
 mkdir -p "$BUILD_DIR/state"
+# A MARK WHOSE BUILD IS GONE IS SWEPT. A build killed outright cannot remove its own, and a mark is named by its
+# build's pid, so one whose pid is gone can never be claimed again; a live build's mark is never touched.
+for stale_mark in "$BUILD_DIR"/state/build-step.*; do
+	[[ -e "$stale_mark" ]] || continue
+	stale_owner="${stale_mark##*/build-step.}"
+	stale_owner="${stale_owner%.tmp}"
+	[[ "$stale_owner" =~ ^[0-9]+$ ]] || continue
+	kill -0 "$stale_owner" 2>/dev/null || rm -f "$stale_mark"
+done
+unset stale_mark stale_owner
 
 # Announce a step AND stamp it, so the two cannot drift: a step that printed and did not stamp would
 # be a step the observer thinks never started.
@@ -498,10 +508,31 @@ for arch in "${archs[@]}"; do
 	for part in "${parts[@]}"; do
 		case "$part" in
 		loader) printf '%s\n' "$(source_digest "${LOADER_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$part" ;;
-		volume) printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$volume_stamp" ;;
+		kernel) printf '%s\n' "$(source_digest "${KERNEL_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$part" ;;
+		volume)
+			# THE BOOTABLE SHAPE CARRIES THE KERNEL, so its receipt covers the kernel's sources as well: a kernel edit
+			# leaves the userspace's digest as it was, and the kernel on that volume behind it.
+			if [[ "$kernel_on_volume" == 1 ]]; then
+				printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}" "${KERNEL_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$volume_stamp"
+			else
+				printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$volume_stamp"
+			fi
+			;;
 		*) printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$part" ;;
 		esac
 	done
+	# AND THE PROFILE EACH PART OF THE STAGING WAS BUILT IN (`staging-state.sh`), so a step that boots
+	# the staging in the other profile refuses at once instead of failing on what it finds. `user`
+	# builds the shared libraries as well, so it records them too.
+	profiled=()
+	for part in "${parts[@]}"; do
+		case "$part" in
+		libs | packages) profiled+=("$part") ;;
+		user) profiled+=(user libs) ;;
+		volume) profiled+=("$volume_stamp") ;;
+		esac
+	done
+	((${#profiled[@]} == 0)) || record_staging_profile "$BUILD_DIR" "$arch" "${profiled[@]}"
 done
 
 note "built: ${parts[*]} for ${archs[*]}"

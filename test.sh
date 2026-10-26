@@ -230,15 +230,25 @@ require_no_stray_qemu() {
 			# Match qemu-run.sh's private image/firmware/console names and
 			# test-kernel.sh's private log names, including their live owner PID.
 			# Unknown writable paths, templates and another run's files still block.
+			#
+			# EVERY PRIVATE FILE `qemu-run.sh` HANDS A GUEST (corrected 2026-10-26): the scratch disks
+			# behind the UAS, NVMe, SCSI, SD and AHCI controllers, the NVDIMM backing files, the second
+			# serial port's capture, the legacy controllers' second USB stick and the suite's USB audio
+			# capture were not on this list, so six profile rows failed in one second on "already holds
+			# this tree's disk images" for a run that held only its own.
 			relative="${target#"$build/"}"
 			owner=""
 			if [[ "$relative" =~ ^boot/(virtio-blk|usb-media)[a-z0-9_-]*\.[0-9a-f]{64}\.([0-9]+)\.img$ ]]; then
 				owner="${BASH_REMATCH[2]}"
-			elif [[ "$relative" =~ ^logs/test/(x86_64|aarch64|riscv64)-[0-9]{8}T[0-9]{6}Z-([0-9]+)-(run|guest)\.log$ ]]; then
+			elif [[ "$relative" =~ ^boot/usb-media[a-z0-9_-]*\.[0-9a-f]{64}\.legacy\.([0-9]+)\.img$ ]]; then
+				owner="${BASH_REMATCH[1]}"
+			elif [[ "$relative" =~ ^logs/test/(x86_64|aarch64|riscv64)-[0-9]{8}T[0-9]{6}Z-([0-9]+)-(run\.log|guest\.log|usb-audio\.pcap)$ ]]; then
 				owner="${BASH_REMATCH[2]}"
 			else
 				case "$relative" in
-				boot/esp-x86_64.*.img | boot/esp-aarch64.*.img | boot/esp-riscv64.*.img | boot/ovmf-vars.*.fd | boot/aavmf-vars.*.fd | boot/virtio-console*.out)
+				boot/esp-x86_64.*.img | boot/esp-aarch64.*.img | boot/esp-riscv64.*.img | boot/ovmf-vars.*.fd | boot/aavmf-vars.*.fd | boot/virtio-console*.out | boot/virtio-serialport*.out | \
+					boot/uas-scratch.*.img | boot/nvme-scratch.*.img | boot/nvme-second.*.img | boot/scsi-scratch.*.img | boot/scsi-second.*.img | boot/scsi-third.*.img | \
+					boot/sd-scratch.*.img | boot/ahci-scratch.*.img | boot/nvdimm-[01].*.img)
 					owner="${relative%.*}"
 					owner="${owner##*.}"
 					[[ "$relative" =~ ^boot/[a-z0-9_-]+\.[0-9]+\.[a-z]+$ ]] || owner=""
@@ -290,6 +300,14 @@ require_built() {
 	if [[ "$(cat "$stamp")" != "$(source_digest "${VOLUME_SOURCES[@]}")" ]]; then
 		die "the $arch build does not match the sources
     Nothing here rebuilds it, so the suite would test the previous one:  ./build.sh --arch $arch"
+	fi
+	# AND IN THE PROFILE THIS RUN BOOTS IN (`staging-state.sh`). A staging another step left in the
+	# development profile failed the suite an hour in, on "system volume contains an undeclared entry
+	# drivers/acpi_fixture.lsexe"; it is refused now, in seconds, by name, with a refusal's status.
+	local refusal
+	if refusal="$(staging_profile_refusal "$BUILD_DIR" "$arch" "$(run_profile)" libs user packages volume-test)"; then
+		note "$refusal"
+		exit "$STATE_REFUSED"
 	fi
 	if [[ "$arch" != x86_64 ]]; then
 		local efi="$BUILD_DIR/cargo/loader/$(loader_triple "$arch")/debug/libersystem-loader.efi"

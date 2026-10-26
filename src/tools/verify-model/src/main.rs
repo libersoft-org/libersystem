@@ -26,6 +26,8 @@ usage: verify-model <command> [options]
   owner PATH...                       which component owns each path, and why
   check                               the model's own gates: ownership, graph and catalog
   guest-selection --arch A            the guest test ids a change selects on one target
+  kernel-tests --arch A               the test ids one target's built test kernel carries
+  account [--jobs N] [--required F]   where a full verification's time goes, from the measured prices
   shadow --guest-log F --arch A       compare a full sweep against what a change would have scoped
                                       (add --scoped-log F to also EXECUTE the selection and compare)
   shadow --host-log F | --dev-log F   the same comparison for the host and dev-guest universes
@@ -77,6 +79,8 @@ fn run() -> Result<ExitCode, String> {
 	// Which STEP a `record` is about, so its whole duration can be stored against it rather than
 	// only divided among the keys it discharged. See `History::steps`.
 	let mut step_id: Option<String> = None;
+	// And the command it ran, which its price is kept under with its id.
+	let mut step_command: Option<String> = None;
 	// A frozen narrowing to plan against, instead of the canonical model. See `Model::load_with_candidate`.
 	let mut candidate_path: Option<String> = None;
 	let mut scoped_log: Option<String> = None;
@@ -103,6 +107,8 @@ fn run() -> Result<ExitCode, String> {
 	let mut range: Option<String> = None;
 	let mut passed = true;
 	let mut seconds = 0.0f64;
+	// How many guest slots an `account` divides the shareable work over.
+	let mut jobs = 1usize;
 	let mut positional: Vec<String> = Vec::new();
 	// The evidence commands' arguments.
 	let mut run_dir: Option<PathBuf> = None;
@@ -217,6 +223,10 @@ fn run() -> Result<ExitCode, String> {
 				index += 1;
 				step_id = Some(arguments.get(index).ok_or("--step-id needs a StepId")?.clone());
 			}
+			"--command" => {
+				index += 1;
+				step_command = Some(arguments.get(index).ok_or("--command needs the command the step ran")?.clone());
+			}
 			"--keys-file" => {
 				index += 1;
 				keys_file = Some(arguments.get(index).ok_or("--keys-file needs a path")?.clone());
@@ -224,6 +234,13 @@ fn run() -> Result<ExitCode, String> {
 			"--seconds" => {
 				index += 1;
 				seconds = arguments.get(index).ok_or("--seconds needs a number")?.parse().map_err(|_| "--seconds takes a number")?;
+			}
+			"--jobs" => {
+				index += 1;
+				jobs = arguments.get(index).ok_or("--jobs needs a number")?.parse().map_err(|_| "--jobs takes a whole number")?;
+				if jobs == 0 {
+					return Err(String::from("--jobs takes a whole number above zero"));
+				}
 			}
 			"--run" => {
 				index += 1;
@@ -298,7 +315,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "shadow-publish" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash" | "discard-divided-costs" | "candidate-activate" | "identity" | "run-start" | "envelope" | "keep-log" | "dossier" | "release-required" | "release-plan")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "shadow-publish" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash" | "discard-divided-costs" | "candidate-activate" | "identity" | "run-start" | "envelope" | "keep-log" | "dossier" | "release-required" | "release-plan" | "kernel-tests" | "account")
 	{
 		command = positional.remove(0);
 	}
@@ -331,6 +348,21 @@ fn run() -> Result<ExitCode, String> {
 	let repo_root = find_repo_root()?;
 	if matches!(command.as_str(), "identity" | "run-start" | "envelope" | "keep-log") {
 		return evidence_command(&command, &repo_root, run_dir, evidence_key, outcome, producer, &inputs, &outputs, &logs, discharges_file, seconds, out_path, out_root, if_absent);
+	}
+	// THE IDS A TARGET'S TEST KERNEL COMPILES, read from its test binary exactly as the planner reads
+	// them, and without loading the model a caller that only needs the ids does not use. The source
+	// cannot answer this - `cfg(target_arch)` decides which declared tests a target has - and a
+	// selection naming an id its kernel does not have hard-fails.
+	if command == "kernel-tests" {
+		let architecture = architecture.ok_or("kernel-tests needs --arch")?;
+		let discovery = verify_model::kerneltests::discover(&repo_root, &[architecture.as_str()])?;
+		if !discovery.missing_targets.is_empty() {
+			return Err(format!("there is no {architecture} test kernel to read under .build/cargo/kernel - compile one first:  ./test.sh --arch {architecture} --build-only"));
+		}
+		for test in &discovery.tests {
+			println!("{}", test.id);
+		}
+		return Ok(ExitCode::SUCCESS);
 	}
 	// THE MODEL EVERY COMMAND WORKS AGAINST, and `--candidate` is what makes a NARROWER one available
 	// without installing it.
@@ -572,34 +604,39 @@ fn run() -> Result<ExitCode, String> {
 		"check" => self_check(&model),
 		// THE RELEASE PLAN, in the executor's own format: every release-required key at this revision.
 		"release-plan" => {
-			let mut steps = verify_model::commands::release_steps(&model.catalog, &model.registry);
-			// A NARROWED REQUIRED SET narrows the plan to the steps discharging those keys and
-			// everything they require, transitively - a rehearsal of the release path in minutes.
-			// A required key no step discharges is refused here, before anything runs.
-			if let Some(path) = &required_path {
-				let required = verify_model::evidence::load_required(path)?;
-				for key in &required {
-					if !steps.iter().any(|step| step.keys.iter().any(|k| &k.display() == key)) {
-						return Err(format!("--required names `{key}`, which no release step discharges"));
-					}
-				}
-				let mut keep: BTreeSet<String> = steps.iter().filter(|step| step.keys.iter().any(|k| required.contains(&k.display()))).map(|step| step.id.clone()).collect();
-				loop {
-					let before = keep.len();
-					for step in &steps {
-						if keep.contains(&step.id) {
-							keep.extend(step.requires.iter().cloned());
-						}
-					}
-					if keep.len() == before {
-						break;
-					}
-				}
-				steps.retain(|step| keep.contains(&step.id));
-			}
+			let steps = release_plan_steps(&model, required_path.as_deref())?;
 			let keys: usize = steps.iter().map(|step| step.keys.len()).sum();
 			println!("STATUS\trelease\t{keys} release-required key(s) over {} step(s)", steps.len());
 			emit_steps(&model, steps)?;
+			Ok(ExitCode::SUCCESS)
+		}
+		// WHERE THE TIME OF A FULL VERIFICATION GOES, from what each of its steps last measured. A step that boots
+		// no guest waits behind the barrier that drains every guest, and an exclusive guest step runs alone, so
+		// both are work that runs alone - the serial remainder; a guest step that is neither shares the slots.
+		// So: the remainder, the shareable work, the longest single step, the sum over the width and the floor
+		// they set together. A price measured under an older model is used and counted as such - a model hash
+		// binds evidence, and what a step costs is what it took.
+		"account" => {
+			let steps = release_plan_steps(&model, required_path.as_deref())?;
+			let history = verify_model::history::History::load(&repo_root)?;
+			let account = verify_model::history::Account::of(&steps, &history, &model.model_hash());
+			let hours = |seconds: f64| seconds / 3600.0;
+			let total = account.total();
+			println!("account: {} step(s), {} priced, {} of those under an older model, {} never measured", steps.len(), account.priced.len(), account.older, account.unpriced.len());
+			println!("account: the sum of the priced steps            {:>8.0} s  ({:.1} h)", total, hours(total));
+			println!("account: the serial remainder - runs alone       {:>8.0} s  ({:.1} h)", account.alone, hours(account.alone));
+			println!("account: guest work that shares {jobs} slot(s)        {:>8.0} s  ({:.1} h)", account.shared, hours(account.shared));
+			if let Some((seconds, id, _)) = account.priced.first() {
+				println!("account: the longest single step                 {:>8.0} s  ({id})", seconds);
+			}
+			println!("account: the sum over the width ({jobs})             {:>8.0} s  ({:.1} h)", total / jobs as f64, hours(total / jobs as f64));
+			println!("account: the floor - remainder + shared share    {:>8.0} s  ({:.1} h)", account.floor(jobs), hours(account.floor(jobs)));
+			for (seconds, id, alone) in account.priced.iter().take(15) {
+				println!("    {:>7.0} s  {}  {id}", seconds, if *alone { "alone " } else { "shared" });
+			}
+			for id in &account.unpriced {
+				println!("    unpriced  {id}");
+			}
 			Ok(ExitCode::SUCCESS)
 		}
 		"dossier" => {
@@ -1186,7 +1223,7 @@ fn run() -> Result<ExitCode, String> {
 					None => unknown += 1,
 				}
 			}
-			history.record_step_id(step_id.as_deref(), &keys, passed, seconds, &hash, &verify_model::history::CostModel::default());
+			history.record_step_id(step_id.as_deref(), step_command.as_deref().unwrap_or(""), &keys, passed, seconds, &hash, &verify_model::history::CostModel::default());
 			history.save(&repo_root)?;
 			eprintln!("verify-model: recorded {} key(s) as {}{}", keys.len(), if passed { "passed" } else { "failed" }, if unknown > 0 { format!(", {unknown} not in the catalog") } else { String::new() });
 			Ok(ExitCode::SUCCESS)
@@ -1279,10 +1316,9 @@ fn emit_steps(model: &Model, steps: Vec<verify_model::commands::Step>) -> Result
 	let cost = verify_model::history::CostModel { whole_suite_tests: model.kernel_tests.declared_ids, ..verify_model::history::CostModel::default() };
 	let history = verify_model::history::History::load(&model.repo_root).unwrap_or_default();
 	let model_hash = model.model_hash();
-	// Use the same measured cost or conservative seed that STEPCOST reports. Validate before
-	// walking the graph, and choose from the ready steps again after every prerequisite. Unpriced
-	// work follows priced ready work; its provisional per-key estimate is not a scheduling cost.
-	let ordered = verify_model::commands::order_by_cost(steps, |step| cost.scheduled_seconds(&history, step, &model_hash).unwrap_or(f64::INFINITY)).map_err(|faults| {
+	// Use the same measured cost or conservative seed that STEPCOST reports, and the state each step needs. Validate
+	// before walking the graph, and choose from the ready steps again after every prerequisite (`order_for_slots`).
+	let ordered = verify_model::commands::order_for_slots(steps, |step| cost.scheduled_seconds(&history, step, &model_hash), |step| verify_model::resources::step_declaration(step).map_or(0, |declared| declared.state_rank())).map_err(|faults| {
 		for fault in &faults {
 			eprintln!("verify-model: {fault}");
 		}
@@ -1325,12 +1361,48 @@ fn emit_steps(model: &Model, steps: Vec<verify_model::commands::Step>) -> Result
 		// command containing `./test.sh --arch `, and it stopped being true the moment a
 		// gate row that boots QEMU through `check.sh` became its own step.
 		println!("STEPGUESTS\t{index}\t{}", step.guests);
-		println!("STEPEXCLUSIVE\t{index}\t{}", u8::from(step.exclusive_guests));
+		// WHAT IT USES, as tokens the runner compares (`Declaration::tokens`): two steps whose tokens conflict never
+		// run at once. A step with no declaration - a gate that declares nothing, which `verify-model check` refuses -
+		// runs ALONE, since nothing says what it may share.
+		let declared = verify_model::resources::step_declaration(&step);
+		if let Some(declared) = &declared {
+			println!("STEPUSES\t{index}\t{}", declared.tokens().join(" "));
+		}
+		println!("STEPEXCLUSIVE\t{index}\t{}", u8::from(step.exclusive_guests || declared.is_none()));
 		for key in &step.keys {
 			println!("KEY\t{index}\t{}", key.display());
 		}
 	}
 	Ok(())
+}
+
+// The release plan's steps: every release-required key, or - with `--required` - the steps discharging those keys and
+// everything they require, transitively, which is a rehearsal of the release path in minutes. A required key no step
+// discharges is refused here, before anything runs.
+fn release_plan_steps(model: &Model, required_path: Option<&Path>) -> Result<Vec<verify_model::commands::Step>, String> {
+	let mut steps = verify_model::commands::release_steps(&model.catalog, &model.registry);
+	if let Some(path) = required_path {
+		let required = verify_model::evidence::load_required(path)?;
+		for key in &required {
+			if !steps.iter().any(|step| step.keys.iter().any(|k| &k.display() == key)) {
+				return Err(format!("--required names `{key}`, which no release step discharges"));
+			}
+		}
+		let mut keep: BTreeSet<String> = steps.iter().filter(|step| step.keys.iter().any(|k| required.contains(&k.display()))).map(|step| step.id.clone()).collect();
+		loop {
+			let before = keep.len();
+			for step in &steps {
+				if keep.contains(&step.id) {
+					keep.extend(step.requires.iter().cloned());
+				}
+			}
+			if keep.len() == before {
+				break;
+			}
+		}
+		steps.retain(|step| keep.contains(&step.id));
+	}
+	Ok(steps)
 }
 
 fn emit(plan: &Plan, json: bool, explain: bool, quiet: bool, model: &Model) -> Result<(), String> {
@@ -1700,6 +1772,12 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 		}
 	}
 
+	// EVERY GATE SAYS WHAT IT USES, and two halves of what it says are held to its own scripts: whether it boots a
+	// guest and whether it writes a staging - and its booting to the slot the catalog gives it. The scheduler overlaps
+	// two steps only where their declarations do not conflict, so a declaration nobody checked would be a guess it
+	// trusts (`resources`).
+	failures.extend(verify_model::resources::declaration_failures(&model.repo_root, &verify_model::resources::GATE_RESOURCES, &verify_model::resources::NAMES_WHAT_IT_DOES_NOT_RUN, &verify_model::catalog::gate_schedules_a_guest));
+
 	// `lib.sh`'s VOLUME_SOURCES against the derived answer. A literal list on a hot path is fine; a
 	// literal list nobody checks is how `src/term` and `src/volume` went missing from it, and a
 	// staleness check that cannot see a change lets a guest boot the previous userspace and pass.
@@ -1716,6 +1794,26 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 				}
 			}
 			None => failures.push(String::from("lib.sh has no VOLUME_SOURCES array to check")),
+		},
+		Err(error) => failures.push(format!("lib.sh: {error}")),
+	}
+
+	// AND ITS KERNEL_SOURCES, for the same reason: the kernel part's stamp is how a cold run knows the kernel it would
+	// boot is built from these sources, and a list that missed a crate the kernel links would let it boot the
+	// previous kernel and call it current.
+	match std::fs::read_to_string(model.repo_root.join("lib.sh")) {
+		Ok(text) => match text.split("KERNEL_SOURCES=(").nth(1).and_then(|rest| rest.split(')').next()) {
+			Some(list) => {
+				let declared: std::collections::BTreeSet<String> = list.split_whitespace().map(str::to_string).collect();
+				let derived = kernel_sources(model);
+				for missing in derived.difference(&declared) {
+					failures.push(format!("lib.sh's KERNEL_SOURCES is missing '{missing}' - the kernel links a crate there, and its stamp would not see a change to it"));
+				}
+				for extra in declared.difference(&derived) {
+					failures.push(format!("lib.sh's KERNEL_SOURCES names '{extra}', which the kernel does not reach"));
+				}
+			}
+			None => failures.push(String::from("lib.sh has no KERNEL_SOURCES array to check")),
 		},
 		Err(error) => failures.push(format!("lib.sh: {error}")),
 	}
@@ -1829,6 +1927,20 @@ fn volume_sources(model: &Model) -> BTreeSet<String> {
 	directories.insert(String::from("volume"));
 	directories.insert(String::from("tools"));
 	directories.insert(String::from("idl"));
+	directories
+}
+
+// What the kernel is built FROM: the kernel crate's closure over the edges that can change a byte of it, as the
+// top-level directories under `src/` its part's stamp digests - the same shape as `volume_sources`.
+fn kernel_sources(model: &Model) -> BTreeSet<String> {
+	let mut directories: BTreeSet<String> = BTreeSet::new();
+	for component in model.graph.reaches("kernel", &["link.static", "link.dynamic", "generation.build"]) {
+		if let Some(entry) = model.crates.iter().find(|entry| entry.name == component)
+			&& let Some(top) = entry.dir.strip_prefix("src/").and_then(|rest| rest.split('/').next())
+		{
+			directories.insert(top.to_string());
+		}
+	}
 	directories
 }
 

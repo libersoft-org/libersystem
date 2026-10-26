@@ -18,5 +18,18 @@ case "${1:-}" in
 *) fail "unexpected argument '$1'" ;;
 esac
 
-"$repo/lab.sh" scenario-cold x86_64 "$root/harness/scenarios/shell-large-output.toml" || fail "the scenario failed (serial log: $repo/.build/boot/cold-x86_64.log)"
+# THE COLD RUN'S STATE IS THIS GATE'S: `lab.sh scenario-cold` keeps its sockets, its serial log and its scenario
+# record in the directory `LIBER_DEV_STATE` names, so a second cold run of the same target beside this one drives
+# and reads a guest of its own.
+LIBER_DEV_STATE="$(mktemp -d "${TMPDIR:-/tmp}/liber-shell-output.XXXXXX")"
+export LIBER_DEV_STATE
+trap 'rm -rf "$LIBER_DEV_STATE"' EXIT
+# A FAILED RUN'S SERIAL LOG IS KEPT, in the one folder this gate writes and replaces.
+kept="$repo/.build/logs/shell-large-output"
+rm -rf "$kept"
+"$repo/lab.sh" scenario-cold x86_64 "$root/harness/scenarios/shell-large-output.toml" || {
+	mkdir -p "$kept"
+	cp -f "$LIBER_DEV_STATE/cold-x86_64.log" "$kept/serial.log" 2>/dev/null || true
+	fail "the scenario failed (serial log: $kept/serial.log)"
+}
 echo "shell-large-output: PASS - a 5 KiB file read back whole through the shell's relay, a pipe's edge and head's window"

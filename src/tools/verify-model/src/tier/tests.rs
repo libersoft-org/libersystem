@@ -398,18 +398,18 @@ fn a_shared_prerequisite_executes_twice_but_its_key_is_accounted_once() {
 }
 
 #[test]
-fn an_exclusive_guest_prerequisite_keeps_its_barrier_after_key_stripping() {
-	let earlier = PlanItemKey { check: "gate.brightness-usb".into(), architecture: "host".into(), environment: Environment::Host, configuration: "default".into() };
+fn a_prerequisite_that_runs_alone_still_does_after_key_stripping() {
+	let earlier = PlanItemKey { check: "gate.concurrent-selection".into(), architecture: "host".into(), environment: Environment::Host, configuration: "default".into() };
 	let later = PlanItemKey { check: "kernel.port".into(), architecture: "aarch64".into(), environment: Environment::TestGuest, configuration: "test".into() };
 	let steps = vec![
-		Step { id: "fixture".into(), requires: vec![], label: "fixture".into(), command: "./check.sh --gate brightness-usb".into(), keys: vec![earlier], note: None, guests: 1, exclusive_guests: true },
+		Step { id: "fixture".into(), requires: vec![], label: "fixture".into(), command: "./check.sh --gate concurrent-selection".into(), keys: vec![earlier], note: None, guests: 2, exclusive_guests: true },
 		Step { id: "consumer".into(), requires: vec!["fixture".into()], label: "consumer".into(), command: "consume".into(), keys: vec![later.clone()], note: None, guests: 1, exclusive_guests: false },
 	];
 	let lowered = closed_steps(&steps, &[later].into_iter().collect()).unwrap();
 	assert_eq!(lowered.len(), 2);
 	assert!(lowered[0].keys.is_empty(), "a retained prerequisite does not record its answered key again");
-	assert!(lowered[0].exclusive_guests, "the same command still owns the same shared resources");
-	assert_eq!(lowered[0].guests, 1, "isolation does not alter its actual guest-slot claim");
+	assert!(lowered[0].exclusive_guests, "the same command still runs alone");
+	assert_eq!(lowered[0].guests, 2, "running alone does not alter its actual guest-slot claim");
 	assert!(!lowered[1].exclusive_guests, "the unrelated isolated consumer keeps ordinary scheduling");
 }
 
@@ -470,7 +470,7 @@ fn hot_cost(model: &Model, history: &mut crate::history::History, target: &str, 
 	let key = PlanItemKey { check: "kernel.hot".into(), architecture: target.into(), environment: Environment::TestGuest, configuration: "test".into() };
 	let cost = crate::history::CostModel::default();
 	let fixed = cost.fixed_seconds[&(target.into(), "test-guest".into())];
-	history.record_step_id(Some(&format!("hot-{target}")), &[key], true, fixed + if wide { 1_000_000.0 } else { 1.0 }, &model.model_hash(), &cost);
+	history.record_step_id(Some(&format!("hot-{target}")), "", &[key], true, fixed + if wide { 1_000_000.0 } else { 1.0 }, &model.model_hash(), &cost);
 }
 
 #[test]
@@ -488,7 +488,7 @@ fn live_history_crosses_the_escalation_threshold_both_ways_including_inner_step_
 		assert_eq!(cold_before > 0, !expanding);
 		for step in &steps {
 			let seconds = if expanding { 1_000_000.0 } else { 100.0 };
-			history.record_step_id(Some(&step.id), &step.keys, true, seconds, &model.model_hash(), &crate::history::CostModel::default());
+			history.record_step_id(Some(&step.id), &step.command, &step.keys, true, seconds, &model.model_hash(), &crate::history::CostModel::default());
 		}
 		// Other completed runs may also alter the shared cache; merge must read it live.
 		for target in ["aarch64", "riscv64"] {

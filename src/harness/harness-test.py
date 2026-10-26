@@ -181,6 +181,80 @@ class ColdPromptTest(unittest.TestCase):
 		self.assertEqual(self.typed, [], 'nothing was typed into a running command')
 
 
+# A COLD RUN IS ITS OWN, AND BUILDS NOTHING WHEN WHAT IT BOOTS IS CURRENT. Two runs of one target get two state
+# directories, and every name the guest is handed - the control channel, the serial log, the monitor and QMP, the host
+# port - is in its own; a current staging starts no build; and under the runner a staging that is not current is
+# refused, with a refusal's status, rather than built under the runs beside it. Watched failing against the runner as
+# it stood: every name was `cold-x86_64` in `.build/boot`, and the staging was built on every run.
+class ColdRunPrivacyTest(unittest.TestCase):
+	SCENARIO = os.path.join(HERE, 'scenarios', 'launch-program.toml')
+
+	def setUp(self):
+		self.directory = tempfile.TemporaryDirectory()
+		self.addCleanup(self.directory.cleanup)
+		for name in ('SEEN_PATH', 'TARGET', 'TIME_SCALE'):
+			self.addCleanup(setattr, scenario, name, getattr(scenario, name))
+
+	def run_cold(self, environ, stale=()):
+		started, built = [], []
+
+		class Exited:
+			pid = 2 ** 22 + 7
+			returncode = 1
+
+			def poll(self):
+				return 1
+
+			def wait(self, timeout=None):
+				return 1
+
+		def popen(command, **kwargs):
+			started.append(dict(kwargs.get('env') or {}))
+			return Exited()
+
+		def run_child(command, timeout, **kwargs):
+			built.append(command)
+			return subprocess.CompletedProcess(command, 0, b'', b'')
+
+		environment = {name: value for name, value in os.environ.items() if name not in ('LIBER_DEV_STATE', 'LIBER_STAGING_RUNNER', 'HOSTFWD_PORT')}
+		environment.update(environ)
+		with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(lab, 'BUILD_ROOT', self.directory.name), mock.patch.object(lab, 'staging_not_current', lambda target, env: list(stale)), mock.patch.object(lab, 'run_child', run_child), mock.patch.object(lab.subprocess, 'Popen', popen), mock.patch.object(scenario, 'stale_fixtures', lambda target=None: []), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			with self.assertRaises(SystemExit) as raised:
+				lab.cmd_scenario_cold(['x86_64', self.SCENARIO])
+		return raised.exception.code, started, built
+
+	def test_two_runs_of_one_target_name_two_guests_and_build_nothing_on_a_current_staging(self):
+		first, second = (os.path.join(self.directory.name, name) for name in ('first', 'second'))
+		runs = [self.run_cold({'LIBER_DEV_STATE': state}) for state in (first, second)]
+		for state, (_, started, built) in zip((first, second), runs):
+			self.assertEqual(built, [], 'a current staging starts no build')
+			self.assertEqual(len(started), 1, 'the guest was started')
+			env = started[0]
+			self.assertEqual(env['LIBER_DEV_STATE'], state, "the runner binds the guest's sockets in this run's directory")
+			self.assertEqual(env['SERIAL'], f'file:{state}/cold-x86_64.log', "and the serial log is this run's")
+			self.assertEqual(env['COLD'], '1')
+			self.assertRegex(env['HOSTFWD_PORT'], r'^[0-9]+$')
+			self.assertNotEqual(env['HOSTFWD_PORT'], '5556', 'the host port is not the shared one')
+			self.assertTrue(os.path.exists(os.path.join(state, 'cold-x86_64-runner.log')), "the runner's own log is in this run's directory")
+
+	def test_a_run_by_hand_makes_a_directory_of_its_own(self):
+		_, started, _ = self.run_cold({})
+		state = started[0]['LIBER_DEV_STATE']
+		self.assertEqual(os.path.dirname(state), os.path.join(self.directory.name, 'tmp'))
+		self.assertTrue(os.path.basename(state).startswith('cold-x86_64.'))
+
+	def test_under_the_runner_a_stale_staging_is_refused_and_not_built(self):
+		code, started, built = self.run_cold({'LIBER_DEV_STATE': os.path.join(self.directory.name, 'refused'), 'LIBER_STAGING_RUNNER': '1'}, stale=["the x86_64 staging's 'libs' is not built from these sources"])
+		self.assertEqual(code, lab.STATE_REFUSED)
+		self.assertEqual(built, [], 'nothing is built under the runs beside it')
+		self.assertEqual(started, [], 'and no guest is started')
+
+	def test_by_hand_a_stale_staging_is_built_as_it_always_was(self):
+		_, started, built = self.run_cold({'LIBER_DEV_STATE': os.path.join(self.directory.name, 'hand')}, stale=["the x86_64 staging's 'libs' is not built from these sources"])
+		self.assertEqual([os.path.basename(command[0]) for command in built], ['build.sh', 'build.sh'], 'the staging and the bootable volume')
+		self.assertEqual(len(started), 1)
+
+
 class AbsentTest(unittest.TestCase):
 	def setUp(self):
 		self.directory = tempfile.TemporaryDirectory()
@@ -1516,6 +1590,91 @@ class GuestConsoleTest(unittest.TestCase):
 				recorded = handle.read()
 			self.assertIn(b'# guest-console sent: poweroff', recorded)
 			self.assertIn(b'power: the system is going down', recorded)
+
+
+
+# A GATE'S COMPLETION LINE ends the recording, the settle window after it, and nothing else. The gates that name one,
+# each with the line it refuses: the driver ends within seconds of the window rather than at its deadline, and a line
+# arriving late inside the window is in the log the gate's oracle reads. Watched failing with the window taken away:
+# the same late line is then missing, so a gate that judged it would pass.
+COMPLETION_LINES = (
+	# (gate script, the completion line it names, its settle window, a line its oracle refuses)
+	('check-firmware-tree.sh', 'tree-fixture: event 2: GPIO line 2 high, acknowledged', 20, 'tree-fixture: refused: injected late'),
+	('check-usb-release.sh', 'usb-release-done', 10, "thread 'main' panicked at injected late"),
+	('check-usb-legacy.sh', 'usb-legacy-done', 10, "thread 'main' panicked at injected late"),
+	('check-i2c-hid.sh', 'hidcheck: PASS malformed', 10, 'hidcheck: FAIL injected late'),
+	('check-bluetooth-le.sh', 'btclassic: PASS ctkd', 5, 'btclassic: BEGIN SC authentication downgrade'),
+)
+
+
+class CompletionLineTest(unittest.TestCase):
+	def drive(self, done, settle, late):
+		directory = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, directory, True)
+		path = os.path.join(directory, 'console')
+		server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		self.addCleanup(server.close)
+		server.bind(path)
+		server.listen(1)
+		script = os.path.join(directory, 'script')
+		with open(script, 'w') as handle:
+			handle.write('probe\n')
+		log = os.path.join(directory, 'guest')
+		stop = threading.Event()
+		self.addCleanup(stop.set)
+
+		def guest():
+			connection, _ = server.accept()
+			connection.settimeout(30)
+			connection.sendall(b'shell attached\r\n')
+			time.sleep(0.3)
+			connection.sendall(b'vol://system> ')
+			typed = b''
+			while b'\n' not in typed:
+				typed += connection.recv(64)
+			# The shell echoes what was typed, which carries no completion line of its own.
+			connection.sendall(b'probe\r\n\x1b[32m' + done.encode() + b'\x1b[0m\r\n')
+			time.sleep(settle / 2)
+			connection.sendall(late.encode() + b'\r\n')
+			stop.wait(120)
+			connection.close()
+
+		threading.Thread(target=guest, daemon=True).start()
+		started = time.monotonic()
+		done_run = subprocess.run([sys.executable, os.path.join(HERE, 'guest-console.py'), '--socket', path, '--log', log, '--script', script, '--seconds', '90', '--done', done, '--settle', str(settle)], capture_output=True, text=True, timeout=150)
+		elapsed = time.monotonic() - started
+		with open(log, 'rb') as handle:
+			return done_run, elapsed, handle.read()
+
+	def test_each_gate_names_its_completion_line_and_window(self):
+		for name, done, settle, _ in COMPLETION_LINES:
+			with self.subTest(gate=name):
+				with open(os.path.join(os.path.dirname(HERE), 'tools', name)) as handle:
+					text = handle.read()
+				self.assertIn(done, text, 'the gate names its completion line')
+				self.assertRegex(text, r'GUEST_GATE_SETTLE=%d\b' % settle, 'and states its settle window')
+
+	def test_a_late_line_inside_the_window_is_recorded_and_the_driver_ends_after_it(self):
+		results = {}
+
+		def one(case):
+			_, done, settle, late = case
+			results[case] = (self.drive(done, settle, late), self.drive(done, 0, late))
+
+		threads = [threading.Thread(target=one, args=(case,)) for case in COMPLETION_LINES]
+		for thread in threads:
+			thread.start()
+		for thread in threads:
+			thread.join()
+		for case in COMPLETION_LINES:
+			name, done, settle, late = case
+			with self.subTest(gate=name):
+				(run, elapsed, recorded), (_, unwindowed, missed) = results[case]
+				self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+				self.assertLess(elapsed, settle + 20, 'the driver ran past its completion line and window toward its deadline')
+				self.assertIn(late.encode(), recorded, 'a failure line inside the window reaches the log the oracle reads')
+				self.assertLess(unwindowed, settle / 2 + 15)
+				self.assertNotIn(late.encode(), missed, 'with no window the late line is missed - which is why a gate with negative checks keeps one')
 
 
 # A suite run's two logs, named as `test-kernel.sh` names them, passed or failed by its own pass line.

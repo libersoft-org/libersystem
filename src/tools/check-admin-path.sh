@@ -37,7 +37,6 @@ case "${1:-}" in
 esac
 
 scenario="$root/harness/scenarios/admin-path.toml"
-log="$repo/.build/boot/cold-x86_64.log"
 idle="$repo/.build/boot/admin-path-idle.ppm"
 prompt="$repo/.build/boot/admin-path-prompt.ppm"
 rm -f "$idle" "$prompt"
@@ -50,6 +49,12 @@ export QEMU_EXTRA="-device edu,addr=0x18"
 disk_dir="$(mktemp -d)"
 trap 'rm -rf "$disk_dir"' EXIT
 export RUN_DISK="$disk_dir/system.img"
+# THE COLD RUN'S STATE IS THIS GATE'S: `lab.sh scenario-cold` keeps its sockets, its serial log and its scenario
+# record in the directory `LIBER_DEV_STATE` names, so a second cold run of the same target beside this one drives
+# and reads a guest of its own.
+export LIBER_DEV_STATE="$disk_dir/cold"
+mkdir -p "$LIBER_DEV_STATE"
+log="$LIBER_DEV_STATE/cold-x86_64.log"
 "$repo/lab.sh" scenario-cold x86_64 "$scenario" || fail "the scenario failed (serial log: $log)"
 [[ -f "$log" ]] || fail "the scenario left no serial log at $log"
 

@@ -17,6 +17,7 @@ until the socket exists; the alternative races the guest's own startup for the f
 
 import argparse
 import os
+import re
 import socket
 import sys
 import time
@@ -36,6 +37,15 @@ READY = b"shell attached"
 # second of quiet after the prompt is far longer than that hand-back and far shorter than any line's
 # budget.
 SETTLE_SECONDS = 0.5
+
+# A LINE OF THE GUEST'S OUTPUT, as a gate names one: colour codes and carriage returns taken off, so the line the
+# shell printed compares equal to the text the gate wrote down.
+ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def output_lines(data):
+	# Whole lines only: the last piece has no newline yet, and a line still being printed is not the line yet.
+	return [ANSI.sub(b"", line).replace(b"\r", b"").strip() for line in data.split(b"\n")[:-1]]
 
 
 def connect(path, deadline):
@@ -62,7 +72,13 @@ def main():
 	# design, so a per-line limit that assumed a shell command is instant would fail the very rows
 	# the timing is the subject of.
 	parser.add_argument("--line-seconds", type=float, default=60.0, help="how long one line may take")
+	# THE GATE'S OWN COMPLETION LINE, after which nothing it judges can still arrive. Recording stops once the line
+	# has been printed - a whole line of output, so the shell echoing the command that prints it does not count - and
+	# `--settle` seconds more have passed, the window a gate with negative checks keeps for a line arriving late.
+	parser.add_argument("--done", help="a line of output after which nothing the gate judges can arrive")
+	parser.add_argument("--settle", type=float, default=0.0, help="how long to keep recording after the --done line")
 	arguments = parser.parse_args()
+	done = arguments.done.encode() if arguments.done else None
 
 	commands = []
 	with open(arguments.script, encoding="utf-8") as handle:
@@ -82,6 +98,9 @@ def main():
 	ready = False
 	prompt_at = None
 	prompt_first = 0.0
+	# Everything printed since the last line was typed, for the completion line; and when that line came.
+	after_last = bytearray()
+	done_at = None
 	client.settimeout(0.1)
 	with open(arguments.log, "wb") as log:
 		while time.monotonic() < deadline:
@@ -100,10 +119,20 @@ def main():
 					log.write(b"\n# guest-console: the console closed\n")
 					log.flush()
 					break
+			if done_at is not None and time.monotonic() - done_at >= arguments.settle:
+				log.write(b"\n# guest-console: the completion line came, and the settle window after it has passed\n")
+				log.flush()
+				break
 			if chunk:
 				log.write(chunk)
 				log.flush()
 				seen += chunk
+				if done is not None and sent >= len(commands) and done_at is None:
+					after_last += chunk
+					if done in output_lines(after_last):
+						done_at = time.monotonic()
+					elif len(after_last) > 65536:
+						del after_last[:-4096]
 				# Only the tail can contain a prompt, and an unbounded buffer on a chatty console is
 				# a memory leak with a deadline.
 				if len(seen) > 8192:
@@ -138,6 +167,7 @@ def main():
 				log.write(b"\n# guest-console sent: " + commands[sent].encode() + b"\n")
 				log.flush()
 				sent += 1
+				after_last.clear()
 				line_deadline = time.monotonic() + arguments.line_seconds
 				continue
 			if time.monotonic() > line_deadline:

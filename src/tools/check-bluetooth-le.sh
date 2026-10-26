@@ -47,6 +47,10 @@ guest_gate_require_programs bt_fixture btclassic btgatt bluetooth_service blueto
 export QEMU_EXTRA="-device edu,addr=0x1d"
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-160}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-330}"
+# THE COMPLETION LINE: `btclassic: PASS ctkd` is the last probe's verdict, and every line this gate requires comes
+# before it. It also requires the downgrade scenario's markers to appear once, so it keeps 5 s for a line arriving
+# late.
+export GUEST_GATE_DONE="btclassic: PASS ctkd" GUEST_GATE_SETTLE=5
 
 guest_gate_run $'btclassic le\nbtgatt\nbtgatt again\nbtclassic ctkd' ""
 lines="$GUEST_LINES"

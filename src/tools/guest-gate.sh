@@ -34,10 +34,13 @@ trap guest_gate_cleanup EXIT
 # rebuilds `.build/image` and the system volume in the profile it runs under, so every later step reading them - a
 # kernel suite above all - would find development fixtures in a shipping volume: on 2026-10-13 the x86_64 suite failed
 # "system volume contains an undeclared entry drivers/acpi_fixture.lsexe" right after such a gate. A run that began in
-# the shipping profile rebuilds the gate's architecture's staging on the way out.
+# the shipping profile rebuilds the gate's architecture's staging on the way out - when it is run by hand. Under
+# `verify.sh` (`LIBER_STAGING_RUNNER`) the staging stays in the development profile for the next step that needs
+# it, and a step that needs the shipping one refuses and has the runner switch it back: one switch per change of
+# state, not two per gate.
 guest_gate_shipping_to_restore=""
 guest_gate_development() {
-	if [[ "${LIBER_DEVELOPMENT:-}" != 1 ]]; then
+	if [[ "${LIBER_DEVELOPMENT:-}" != 1 && "${LIBER_STAGING_RUNNER:-}" != 1 ]]; then
 		guest_gate_shipping_to_restore=1
 	fi
 	export LIBER_DEVELOPMENT=1
@@ -66,6 +69,11 @@ guest_gate_arch() {
 	*) guest_gate_fail "unsupported architecture '$GUEST_ARCH'" ;;
 	esac
 	guest_gate_work="$(mktemp -d)"
+	# THE GUEST'S MONITOR AND QMP SOCKETS ARE THIS GATE'S, in its own directory, and so is the host port it
+	# forwards: under the shared names a second x86_64 guest took the first one's sockets and could not forward
+	# port 5555 at all.
+	GUEST_GATE_MONITOR="$guest_gate_work/monitor.sock"
+	GUEST_GATE_QMP="$guest_gate_work/qmp.sock"
 }
 
 guest_gate_triple() {
@@ -109,11 +117,14 @@ guest_gate_require_quarantine() {
 	[[ -f "$staged" ]] || guest_gate_fail "$name is not staged for $GUEST_ARCH - build the development image:  LIBER_DEVELOPMENT=1 ./build.sh --arch $GUEST_ARCH"
 }
 
-# One current ISO per owned x86 gate. A caller's explicit image is authoritative;
-# otherwise image.sh builds the required system and writes a private medium. The
-# public run.sh deliberately builds nothing and must receive its --image flag.
-# Harness signing follows the lab's development image; the existing gate carrier
-# still selects the actual enforced/no-IOMMU machine. Build/profile flags are inherited.
+# One current development ISO for every owned x86 gate. A caller's explicit image is
+# authoritative; otherwise image.sh builds the required system and `mkimage` names the
+# medium by its key (`LIBER_IMAGE_KEYED`), so consecutive gates over an unchanged staging
+# boot one medium, built once, and a changed input names a second beside it. No gate
+# writes to its medium - the runner attaches it read-only, by descriptor - so none needs
+# a private copy. The public run.sh deliberately builds nothing and must receive its
+# --image flag. Harness signing follows the lab's development image; the existing gate
+# carrier still selects the actual enforced/no-IOMMU machine. Build/profile flags are inherited.
 guest_gate_image=""
 guest_gate_image_args=()
 guest_gate_prepare_image() {
@@ -127,11 +138,14 @@ guest_gate_prepare_image() {
 			# unless whoever ran the gate had exported LIBER_DEVELOPMENT=1 first, which `./check.sh --gate` and
 			# `verify.sh` never do. The shared staging is rebuilt in the caller's profile on the way out.
 			guest_gate_development
-			guest_gate_image="$guest_gate_work/guest.iso"
-			LIBER_IMAGE_OUTPUT="$guest_gate_image" "$root/../image.sh" --format iso --dma-mode harness >"$guest_gate_work/image.log" 2>&1 || {
+			# `mkimage` answers the medium's path on standard output, last; everything else it and
+			# the build say goes to the log.
+			local produced
+			produced="$(LIBER_IMAGE_KEYED=1 "$root/../image.sh" --format iso --dma-mode harness 2>"$guest_gate_work/image.log")" || {
 				cat "$guest_gate_work/image.log" >&2
 				guest_gate_fail "the current x86 gate image did not build"
 			}
+			guest_gate_image="$(tail -n 1 <<<"$produced")"
 		fi
 		image="$guest_gate_image"
 	fi
@@ -173,9 +187,19 @@ guest_gate_run() {
 		console="${GUEST_GATE_SECONDS:-600}"
 		deadline="${GUEST_GATE_TIMEOUT:-900}"
 	fi
-	python3 src/harness/guest-console.py --socket "$socket" --log "$GUEST_LOG" --script "$script" --seconds "$console" >"$guest_gate_work/driver" 2>&1 &
+	# A GATE'S OWN COMPLETION LINE (`GUEST_GATE_DONE`), after which nothing it judges can still arrive: the driver
+	# stops recording once that line and the settle window the gate states after it (`GUEST_GATE_SETTLE`) are
+	# over, and the guest stops with it. A gate that names none records to its budget, as it always has.
+	local done_args=()
+	[[ -z "${GUEST_GATE_DONE:-}" ]] || done_args=(--done "$GUEST_GATE_DONE" --settle "${GUEST_GATE_SETTLE:-0}")
+	python3 src/harness/guest-console.py --socket "$socket" --log "$GUEST_LOG" --script "$script" --seconds "$console" "${done_args[@]}" >"$guest_gate_work/driver" 2>&1 &
 	guest_gate_driver=$!
-	SERIAL="unix:$socket,server=on,wait=off" timeout "$deadline" ./run.sh --arch "$GUEST_ARCH" --smp 2 "${guest_gate_image_args[@]}" >"$guest_gate_work/run" 2>&1 &
+	local port="${HOSTFWD_PORT:-}"
+	[[ -n "$port" ]] || port="$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])')"
+	QEMU_MONITOR_SOCKET="$GUEST_GATE_MONITOR" QEMU_QMP_SOCKET="$GUEST_GATE_QMP" HOSTFWD_PORT="$port" SERIAL="unix:$socket,server=on,wait=off" timeout "$deadline" ./run.sh --arch "$GUEST_ARCH" --smp 2 "${guest_gate_image_args[@]}" >"$guest_gate_work/run" 2>&1 &
 	guest_gate_guest=$!
 	wait "$guest_gate_driver" 2>/dev/null || true
 	guest_gate_driver=""

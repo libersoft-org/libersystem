@@ -90,7 +90,9 @@ trap cleanup EXIT
 # In `TMPDIR` and not under `.build`, because this is armed BEFORE the source root is resolved -
 # that resolution is itself one of the lines that has died wordlessly, so nothing here may depend on
 # it having succeeded.
-trace_log="${TMPDIR:-/tmp}/liber-injection-trace.$$.log"
+# THE PATH `check.sh` NAMES FOR IT when it runs this gate (`LIBER_INJECTION_TRACE`), so the runner prints and removes
+# this gate's trace and no other's; the pid-named one otherwise.
+trace_log="${LIBER_INJECTION_TRACE:-${TMPDIR:-/tmp}/liber-injection-trace.$$.log}"
 if exec {trace_fd}>"$trace_log"; then
 	BASH_XTRACEFD="$trace_fd"
 	PS4='+ $(date +%H:%M:%S.%3N) ${BASH_SOURCE##*/}:${LINENO}: '

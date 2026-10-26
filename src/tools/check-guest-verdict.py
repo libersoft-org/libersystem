@@ -186,6 +186,37 @@ note() { printf '%s\n' "$*" >&2; }
         self.assertEqual(self.exercise(paths, child=True), 0)
         self.assertNotEqual(self.exercise(paths, mutation="reject_private"), 0)
 
+    # EVERY PRIVATE FILE THE RUNNER HANDS A GUEST, by the name `qemu-run.sh` gives it. The break, watched: the
+    # scratch disks, the NVDIMM backing files, the second serial port's capture, the legacy controllers' USB stick
+    # and the suite's audio capture were not on the guard's list, so a run holding only its own failed as though
+    # another run held this tree's images.
+    PRIVATE_SCRATCH = (
+        "boot/uas-scratch.{owner}.img",
+        "boot/nvme-scratch.{owner}.img",
+        "boot/nvme-second.{owner}.img",
+        "boot/scsi-scratch.{owner}.img",
+        "boot/scsi-second.{owner}.img",
+        "boot/scsi-third.{owner}.img",
+        "boot/sd-scratch.{owner}.img",
+        "boot/ahci-scratch.{owner}.img",
+        "boot/nvdimm-0.{owner}.img",
+        "boot/nvdimm-1.{owner}.img",
+        "boot/virtio-serialport-test.{owner}.out",
+        "boot/usb-media-x86_64.{key}.legacy.{owner}.img",
+        "logs/test/x86_64-20261020T120000Z-{owner}-usb-audio.pcap",
+    )
+
+    def test_every_private_scratch_file_is_admitted_with_its_owner(self):
+        for name in self.PRIVATE_SCRATCH:
+            with self.subTest(path=name):
+                self.assertEqual(self.exercise([(name, True)]), 0)
+                self.assertEqual(self.exercise([(name, True)], child=True), 0)
+
+    def test_another_runs_scratch_file_is_still_refused(self):
+        for name in self.PRIVATE_SCRATCH:
+            with self.subTest(path=name):
+                self.assertNotEqual(self.exercise([(name.replace("{owner}", "{wrong_owner}"), True)]), 0)
+
     def test_actual_read_only_shared_descriptors_are_safe(self):
         paths = [(name, False) for name in (
             "boot/fat-media-aarch64.{key}.img",
@@ -586,6 +617,8 @@ class PerfImageIsolation(unittest.TestCase):
             stager.write_text((HERE / "stage-kernel.sh").read_text())
             stager.chmod(0o755)
             (tools / "volume-pairing.sh").write_text((HERE / "volume-pairing.sh").read_text())
+            # And the staging-state helpers `mkimage.sh` sources for its DMA-mode refusal.
+            (tools / "staging-state.sh").write_text((HERE / "staging-state.sh").read_text())
             # THE FIXTURE COPIES WHAT THE SCRIPT SOURCES, and `check-perf-anchor.sh` grew an
             # `evidence.sh` of its own. A sandbox missing one of a script's sources does not test the
             # script, it tests the sandbox - and the failure reads as the gate's subject rather than
@@ -678,11 +711,79 @@ log.write_text('boot OK\n' + ('PERF tsc_hz 123\n' if profile == 'development-tra
         self.assertFalse(self.exercise(ignore_private_output=True))
 
 
+class KeyedGateMedium(unittest.TestCase):
+    """The real `mkimage.sh` over a fixture tree, expensive payload stubbed as the perf fixture stubs it:
+    `LIBER_IMAGE_KEYED` names the gates' development medium by its key, so the same inputs hit the medium
+    already built and changed ones name a second beside it - and the installable medium is not touched.
+    The break, watched: without it the medium went to the installable image's own name."""
+
+    def exercise(self):
+        import re
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            tools = root / "src/tools"
+            harness = root / "src/harness"
+            tools.mkdir(parents=True)
+            harness.mkdir(parents=True)
+            boot = root / ".build/boot"
+            boot.mkdir(parents=True)
+            kernel = root / ".build/cargo/kernel/x86_64-unknown-none/debug/kernel"
+            kernel.parent.mkdir(parents=True)
+            kernel.write_text("kernel fixture")
+            (root / "product.conf").write_text((ROOT / "product.conf").read_text())
+            manifest = root / "src/user/services/manifest.toml"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text((ROOT / "src/user/services/manifest.toml").read_text())
+            stager = tools / "stage-kernel.sh"
+            stager.write_text((HERE / "stage-kernel.sh").read_text())
+            stager.chmod(0o755)
+            for name in ("volume-pairing.sh", "staging-state.sh"):
+                (tools / name).write_text((HERE / name).read_text())
+            maker = (ROOT / "src/harness/mkimage.sh").read_text()
+
+            def replace_function(name, body):
+                nonlocal maker
+                pattern = r"(^" + name + r"\(\) \{\n).*?(^\}\n)"
+                maker, count = re.subn(pattern, lambda match: match.group(1) + body + match.group(2), maker, count=1, flags=re.M | re.S)
+                self.assertEqual(count, 1)
+            prologue = re.search(r"^make_iso\(\) \{\n(.*?)\tlocal iso_root=", maker, re.M | re.S).group(1)
+            replace_function("make_iso", prologue + '\tprintf "inputs=%s\\n" "$FIXTURE_INPUTS" >"$out"\n\tmv "$out" "$final"\n\techo "$final"\n')
+            replace_function("verify_boot_artifacts", '\tmanifest_rows=fixture\n')
+            replace_function("image_input_key", '\tprintf "inputs=%s\\n" "$FIXTURE_INPUTS"\n')
+            script = harness / "mkimage.sh"
+            script.write_text(maker)
+            script.chmod(0o755)
+            for name, text in (("system-volume-bootable-x86_64.img", "fixture"), ("system-volume-bootable-x86_64.uuid", "fixture"), ("system-volume-bootable-x86_64.dma-mode", "harness")):
+                (boot / name).write_text(text)
+            installable = boot / "libersystem-dev.iso"
+            installable.write_text("the installable development image")
+            loader = root / "loader.efi"
+            loader.write_text("loader")
+            answers = []
+            for inputs in ("first", "first", "second"):
+                env = dict(os.environ, LIBER_IMAGE_KEYED="1", LIBER_DMA_MODE="harness", LOADER_EFI=str(loader), FIXTURE_INPUTS=inputs)
+                env.pop("LIBER_IMAGE_OUTPUT", None)
+                done = subprocess.run([str(script), "iso", str(kernel)], cwd=root, env=env, text=True, capture_output=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                answers.append((done.stdout.strip().splitlines()[-1], "cache hit" in done.stderr))
+            return answers, installable.read_text(), sorted(path.name for path in boot.glob("libersystem-dev.*.iso"))
+
+    def test_the_gates_medium_is_named_by_its_key_and_reused_while_it_matches(self):
+        answers, installable, media = self.exercise()
+        (first, first_hit), (again, again_hit), (second, second_hit) = answers
+        self.assertRegex(first, r"/libersystem-dev\.[0-9a-f]{64}\.iso$")
+        self.assertEqual((first_hit, again, again_hit), (False, first, True), "the same inputs reuse the medium already built")
+        self.assertNotEqual(second, first, "changed inputs name a second medium")
+        self.assertFalse(second_hit)
+        self.assertEqual(len(media), 2, "the earlier generation stays while it is young")
+        self.assertEqual(installable, "the installable development image")
+
+
 class GuestGateImagePreparation(unittest.TestCase):
     """Execute the real shared gate boundary; only producers and guest launch are fakes."""
 
     def exercise(self, *, arch="x86_64", pinned=False, missing_pin=False, build_fails=False,
-                 disk=None, mutate_disk=False):
+                 disk=None, mutate_disk=False, development="1", runner=None, gates_after=()):
         import json
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "tree with spaces"
@@ -708,19 +809,33 @@ class GuestGateImagePreparation(unittest.TestCase):
                 path.write_text(text)
                 path.chmod(0o755)
 
+            # `mkimage`'s keyed answer, as the gate asks for it: the medium named by the key of the
+            # inputs, assembled only when no medium of that key exists, and its path printed last.
             executable(root / "image.sh", '''#!/usr/bin/env python3
-import json,os,pathlib,sys
+import hashlib,json,os,pathlib,sys
 root=pathlib.Path(os.environ['FIXTURE_ROOT'])
+inputs=(root/'inputs').read_text() if (root/'inputs').exists() else 'current inputs'
+image=root/'.build/boot'/('libersystem-dev.'+hashlib.sha256(inputs.encode()).hexdigest()+'.iso')
+built=not image.exists()
 with (root/'build.jsonl').open('a') as out:
-    out.write(json.dumps({'args':sys.argv[1:],'output':os.environ['LIBER_IMAGE_OUTPUT'],
+    out.write(json.dumps({'args':sys.argv[1:],'keyed':os.environ.get('LIBER_IMAGE_KEYED'),
+                         'output':os.environ.get('LIBER_IMAGE_OUTPUT'),'built':built,
                          'development':os.environ.get('LIBER_DEVELOPMENT'),
                          'rustflags':os.environ.get('RUSTFLAGS')})+'\\n')
 if os.environ.get('FIXTURE_BUILD_FAIL') == '1':
     raise SystemExit(19)
-image=pathlib.Path(os.environ['LIBER_IMAGE_OUTPUT'])
-image.write_text('fresh paired volume')
-pathlib.Path(str(image)+'.build-key').write_text('current inputs')
-pathlib.Path(str(image)+'.build-digest').write_text('current output')
+if built:
+    image.write_text('fresh paired volume')
+    pathlib.Path(str(image)+'.build-key').write_text(inputs)
+    pathlib.Path(str(image)+'.build-digest').write_text('current output')
+print(image)
+''')
+            # THE SHIPPING STAGING PUT BACK ON THE WAY OUT is a `build.sh` call, recorded.
+            executable(root / "build.sh", '''#!/usr/bin/env python3
+import json,os,pathlib,sys
+root=pathlib.Path(os.environ['FIXTURE_ROOT'])
+with (root/'restores.jsonl').open('a') as out:
+    out.write(json.dumps({'args':sys.argv[1:],'development':os.environ.get('LIBER_DEVELOPMENT')})+'\\n')
 ''')
             executable(root / "run.sh", '''#!/usr/bin/env python3
 import json,os,pathlib,sys
@@ -760,9 +875,13 @@ pathlib.Path(args[3]).write_bytes(pathlib.Path(args[1]).read_bytes())
 ''')
             env = dict(os.environ, PATH=f"{binaries}:{os.environ['PATH']}",
                        FIXTURE_ROOT=str(root), FIXTURE_BUILD_FAIL=str(int(build_fails)),
-                       TMPDIR=str(temporary), LIBER_DEVELOPMENT="1", RUSTFLAGS="--cfg fixture_flag")
-            for name in ("BOOT_IMAGE", "RUN_DISK", "LIBER_IMAGE_OUTPUT"):
+                       TMPDIR=str(temporary), RUSTFLAGS="--cfg fixture_flag")
+            for name in ("BOOT_IMAGE", "RUN_DISK", "LIBER_IMAGE_OUTPUT", "LIBER_DEVELOPMENT", "LIBER_STAGING_RUNNER"):
                 env.pop(name, None)
+            if development is not None:
+                env["LIBER_DEVELOPMENT"] = development
+            if runner is not None:
+                env["LIBER_STAGING_RUNNER"] = runner
             if pinned:
                 env["BOOT_IMAGE"] = str(image)
             if disk:
@@ -779,23 +898,29 @@ guest_gate_run 'probe second' fixture
             result = subprocess.run(["bash", "-c", script, "fixture", str(root), arch,
                                      str(int(mutate_disk))], cwd=root, env=env,
                                     text=True, capture_output=True, timeout=10)
+            # AND A SECOND GATE, when asked: over the same inputs, then over changed ones.
+            for inputs in gates_after:
+                (root / "inputs").write_text(inputs)
+                self.later = subprocess.run(["bash", "-c", script, "fixture", str(root), arch, "0"], cwd=root, env=env, text=True, capture_output=True, timeout=10)
             def records(name):
                 path = root / name
                 return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
             builds, runs = records("build.jsonl"), records("runs.jsonl")
+            self.restores = records("restores.jsonl")
             self.assertFalse(list(temporary.iterdir()), "owned image, receipts and temporary directories must be cleaned")
             self.assertEqual((boot / "libersystem.iso").read_text(), "stale public artifact")
             self.assertEqual((boot / "libersystem-dev.iso").read_text(), "stale public artifact")
             return result, builds, runs
 
-    def test_stale_defaults_are_ignored_and_one_private_image_serves_both_boots(self):
+    def test_stale_defaults_are_ignored_and_one_keyed_image_serves_both_boots(self):
         result, builds, runs = self.exercise()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(builds), 1)
         self.assertEqual(builds[0]["args"], ["--format", "iso", "--dma-mode", "harness"])
+        self.assertEqual((builds[0]["keyed"], builds[0]["output"]), ("1", None), "the gate asks for the keyed medium, not a private one")
         self.assertEqual(len(runs), 2)
         self.assertEqual(runs[0]["args"], runs[1]["args"])
-        self.assertIn("private tmp", runs[0]["args"][-1])
+        self.assertRegex(runs[0]["args"][-1], r"/\.build/boot/libersystem-dev\.[0-9a-f]{64}\.iso$")
         for run in runs:
             self.assertEqual(run["image_bytes"], "fresh paired volume")
             self.assertTrue(run["receipts"])
@@ -803,6 +928,33 @@ guest_gate_run 'probe second' fixture
             self.assertEqual(run["rustflags"], "--cfg fixture_flag")
         self.assertEqual(builds[0]["development"], "1")
         self.assertEqual(builds[0]["rustflags"], "--cfg fixture_flag")
+
+    # ONE DEVELOPMENT MEDIUM FOR CONSECUTIVE GATES. The break, watched: every gate assembled a private
+    # medium beside a fresh temporary path, so two gates over one unchanged staging built two.
+    def test_two_gates_in_a_row_build_one_medium_and_a_change_builds_a_second(self):
+        result, builds, runs = self.exercise(gates_after=("current inputs", "changed inputs"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.later.returncode, 0, self.later.stdout + self.later.stderr)
+        self.assertEqual([build["built"] for build in builds], [True, False, True], "built, reused by the next gate, built again after the change")
+        media = [run["args"][-1] for run in runs]
+        self.assertEqual(len(set(media[:4])), 1, "the first two gates boot one medium")
+        self.assertNotEqual(media[4], media[0], "the changed inputs name a second medium")
+
+    # THE STAGING IS PUT BACK BY HAND AND LEFT ALONE UNDER THE RUNNER. Run by hand from the shipping
+    # profile, a gate that built the development image rebuilds the shipping staging on its way out, as
+    # it always has. Under `verify.sh` (`LIBER_STAGING_RUNNER`) it leaves the development staging for
+    # the next step that needs it, and the runner switches it back only when a step needs the other.
+    # The break, watched: the gate restored the staging under the runner too, two rebuilds per gate.
+    def test_the_shipping_staging_is_put_back_by_hand_and_left_under_the_runner(self):
+        result, builds, _ = self.exercise(development=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(builds[0]["development"], "1", "the gate's own image is the development one")
+        self.assertEqual([row["args"] for row in self.restores], [["--arch", "x86_64"]], "run by hand, the shipping staging is rebuilt on the way out")
+        self.assertIsNone(self.restores[0]["development"])
+        result, builds, _ = self.exercise(development=None, runner="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(builds[0]["development"], "1")
+        self.assertEqual(self.restores, [], "under the runner the development staging is left for the next step")
 
     def test_explicit_pin_with_spaces_avoids_build_and_remains_authoritative(self):
         result, builds, runs = self.exercise(pinned=True)
@@ -936,6 +1088,7 @@ class KernelBuildOnly(unittest.TestCase):
             tools = root / "src/tools"
             tools.mkdir(parents=True)
             (tools / "evidence.sh").write_text((HERE / "evidence.sh").read_text())
+            (tools / "staging-state.sh").write_text((HERE / "staging-state.sh").read_text())
             source = (ROOT / "src/harness/test-kernel.sh").read_text()
             if remove_return:
                 start = source.index('if [[ "$BUILD_ONLY" == "1" ]]; then\n\tif [[ -n "${LIBER_TIMING_LOG:-}"')

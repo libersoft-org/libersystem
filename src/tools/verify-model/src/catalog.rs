@@ -178,11 +178,17 @@ impl Check {
 
 // THE SHIPPING IMAGES ARE BUILT WORK, NOT FOUND WORK: each construction the mandatory gates consume
 // is a producer row with a key of its own, and the gates that read one name it as a prerequisite.
-// `(id, command, artifact)`.
-pub const IMAGE_PRODUCERS: [(&str, &str, &str); 3] = [
-	("image.libersystem-iso", "./image.sh --format iso --dma-mode enforcing-required", "artifact:libersystem.iso"),
-	("image.libersystem-no-iommu-iso", "./image.sh --format iso --dma-mode no-iommu", "artifact:libersystem-no-iommu.iso"),
-	("image.libersystem-dev-iso", "./image.sh --format iso --dma-mode harness", "artifact:libersystem-dev.iso"),
+// `(id, command, artifact, volume)`.
+//
+// AND THE BOOTABLE VOLUME EACH LEAVES IN THE STAGING: `image.sh` rebuilds the shared
+// `system-volume-bootable-x86_64.img` signed for its medium's DMA mode on the way to the medium, and
+// a gate that assembles a medium of its own from that volume consumes it - `perf-anchor`, whose
+// direct `qemu-run.sh` boot pairs it with an `enforcing-required` medium and had no declared producer
+// for it.
+pub const IMAGE_PRODUCERS: [(&str, &str, &str, &str); 3] = [
+	("image.libersystem-iso", "./image.sh --format iso --dma-mode enforcing-required", "artifact:libersystem.iso", "artifact:system-volume-bootable-x86_64.enforcing-required"),
+	("image.libersystem-no-iommu-iso", "./image.sh --format iso --dma-mode no-iommu", "artifact:libersystem-no-iommu.iso", "artifact:system-volume-bootable-x86_64.no-iommu"),
+	("image.libersystem-dev-iso", "./image.sh --format iso --dma-mode harness", "artifact:libersystem-dev.iso", "artifact:system-volume-bootable-x86_64.harness"),
 ];
 
 // Which gates consume which image. A gate not listed here reads no shipping image.
@@ -192,7 +198,12 @@ pub const IMAGE_PRODUCERS: [(&str, &str, &str); 3] = [
 // `rollback-floor-x86_64` builds four media at three generations, and `qemu-virtio-iommu-x86_64`
 // assembles the degraded image itself after its traffic phase. What they CONSUME from the release
 // run is the shipping image the traffic half boots, and only that.
-pub const GATE_IMAGE_INPUTS: [(&str, &[&str]); 3] = [("secure-boot", &["artifact:libersystem.iso"]), ("signed-boot", &["artifact:libersystem.iso"]), ("qemu-virtio-iommu-x86_64", &["artifact:libersystem.iso"])];
+pub const GATE_IMAGE_INPUTS: [(&str, &[&str]); 4] = [
+	("secure-boot", &["artifact:libersystem.iso"]),
+	("signed-boot", &["artifact:libersystem.iso"]),
+	("qemu-virtio-iommu-x86_64", &["artifact:libersystem.iso"]),
+	("perf-anchor", &["artifact:system-volume-bootable-x86_64.enforcing-required"]),
+];
 
 // THE DEVELOPMENT GUEST HAS A RUNNABLE LIFECYCLE. One self-contained producer row owns setup,
 // build, the immutable image, boot, readiness and teardown; the development checks name it as
@@ -230,7 +241,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 195] = [
+const GATES: [(&str, &str); 197] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -517,6 +528,9 @@ const GATES: [(&str, &str); 195] = [
 	// component sealed and in the clear - with the disk's header and QEMU's exit at the firmware's power-off as the
 	// oracles. Its subject is the kernel mechanism and the services above it.
 	("hibernate-ports", "kernel"),
+	// And one per port, as the boot volume's controllers are: the pair's umbrella above is a command, these the keys.
+	("hibernate-ports-aarch64", "kernel"),
+	("hibernate-ports-riscv64", "kernel"),
 	("system-suspend-riscv64", "kernel"),
 	// PROCESSOR AND THERMAL POWER, on development instances of its own with the fixture's processors, zone and fans: the
 	// kernel's tables, governors and register writes, ProcessorPowerService, the zone's and the fan's drivers and the
@@ -891,7 +905,8 @@ pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shado
 // The entry stays in `GATES` so the two lists still agree - check.sh really does run it - and it gets
 // no catalog check, so nothing can select it. Running the union by hand stays a command a person can
 // type; paying for it twice in a sweep does not.
-const UMBRELLA_GATES: [&str; 9] = [
+const UMBRELLA_GATES: [&str; 10] = [
+	"hibernate-ports",
 	"qemu-arch-profiles",
 	"qemu-numa",
 	"dma-mode-ports",
@@ -968,8 +983,17 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 94] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 101] = [
 	"dma-mode-x86_64",
+	// FIVE THAT BOOTED A GUEST AS HOST GATES: the selection slot, the static lifecycle, the ported loader and the
+	// foreign facilities each type a probe at a development image through `guest_gate_run`, and `ipv6-peer` boots
+	// its rows against a peer through `run.sh`. Scheduled with no slot, each was one more QEMU than `--jobs` counted -
+	// found when every gate's declaration was held to its scripts (`resources`).
+	"icd-selection",
+	"lifecycle",
+	"foreign-loader-guest",
+	"foreign-facilities-guest",
+	"ipv6-peer",
 	// The lab machine the audio device model is driven on, with a card hot-plugged under a playing stream.
 	"audio-routing",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
@@ -1041,6 +1065,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 94] = [
 	"sleep",
 	"hibernate",
 	"hibernate-ports",
+	"hibernate-ports-aarch64",
+	"hibernate-ports-riscv64",
 	"system-suspend-riscv64",
 	// And processor power's, which boots two.
 	"processor-power",
@@ -1084,84 +1110,29 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 94] = [
 	"smp-core-cap",
 ];
 
-// Guest slots are a capacity bound, not an isolation contract. These gates also own shared
-// gadget, lab or image state for their entire scenario, so they run behind the guest barrier.
-// Kernel suites and isolated profile rows retain ordinary parallel scheduling. Keep this list
-// explicit: adding a gate here does not change its keys, command, cost, prerequisites or slots.
-pub const EXCLUSIVE_GUEST_GATES: &[&str] = &[
-	// The global dummy_hcd/configfs gadget, including the private development guest that drives it.
-	"brightness-usb",
-	"brightness-acpi",
-	"brightness-acpi-no-dos",
-	"power-ups",
-	// Development-image gates: shared ordinary control/media paths and current image preparation.
-	"bluetooth-service",
-	"bluetooth-classic",
-	"bluetooth-input",
-	"bluetooth-le",
-	"bluetooth-audio",
-	"bluetooth-transfer",
-	"bluetooth-le-audio",
-	"power-service",
-	"smartcard-service",
-	"host-share",
-	"balloon",
-	"memory-hotplug",
-	"usb-legacy",
-	"usb-release",
-	"qemu-modem-service",
-	"qemu-camera-service",
-	"qemu-midi-service",
-	"qemu-gamepad-tool",
-	"i2c-hid",
-	"boot-volume-controllers",
-	"boot-volume-controllers-aarch64",
-	"boot-volume-controllers-riscv64",
-	"camera-usb",
-	"camera-usb-aarch64",
-	"camera-usb-riscv64",
-	"virtio-gpu-edid",
-	"firmware-tree-aarch64",
-	"firmware-tree-riscv64",
-	// The lab broker/cold-run namespace or dev-up image producer, even with private instance state.
-	"audio-routing",
-	"qemu-2d-demo",
+// THE GATES THAT RUN ALONE: nothing else on the machine beside them, guest or host work. Guest slots are a capacity
+// bound, and what two steps share is in their declarations (`resources`), so every other gate overlaps whatever its
+// declaration does not conflict with. These are the ones for which LOAD is the conflict - what they measure is the
+// machine's own time, or its whole process table - so another step beside them changes what they measure.
+//
+// THE WIDTH GROWS BY MEASUREMENT. The runner starts at four guest slots (`verify.sh`), and the width is raised only
+// after five L2 runs in which the flake ledger (`docs/verification/FLAKES.md`) attributes no failure to load; a gate
+// that fails under load and passes alone is listed here until its bound holds on an emulated target. Keep this list
+// explicit: adding a gate here changes none of its keys, its command, its cost, its prerequisites or its slots.
+pub const ALONE_GATES: &[&str] = &[
+	// Measurements of the machine's time: frame accounts, frame rates and render medians.
 	"qemu-2d-account",
 	"qemu-3d-demo",
 	"qemu-3d-extended",
-	"qemu-pcie-hotplug",
-	"qemu-pcie-aer",
-	"qemu-admin-path",
-	"qemu-dfu-tool",
-	"qemu-ipmi-admin",
-	"qemu-tpm-tool",
-	"shell-large-output",
-	"serial-handoff",
-	"acpi",
-	"hibernate",
-	"ipmi",
-	"processor-power",
-	"sleep",
-	"typec-ucsi",
-	"typec-tcpci",
-	"typec-tcpci-aarch64",
+	"soft2d-performance",
+	// Timing steps that failed under load on 2026-10-20/21 (the ledger): the Bluetooth fixture's OPP model, and the
+	// riscv64 TCPCI partner's timing.
+	"bluetooth-transfer",
 	"typec-tcpci-riscv64",
-	"watchdog",
-	// Python cold scenarios share the same per-architecture cold QMP/media namespace.
-	"hibernate-ports",
-	"system-suspend-riscv64",
-	"tickless-idle",
-	// Direct x86 development image/ordinary-media consumers and the shipping-image producer.
-	"bluetooth-independent",
-	"perf-anchor",
-	"dma-mode-x86_64",
-	"rollback-floor-x86_64",
-	// Its degraded half builds no-iommu globally and then restores the ordinary volume.
-	"qemu-virtio-iommu-x86_64",
-	// This legacy oracle chooses the newest global capture; another test guest can replace that choice.
-	"virtio-multiport",
-	// Its internal two-guest overlap must be observed without another gate changing the process baseline.
+	// Oracles of the machine's processes: the two-guest overlap is observed against the process baseline, and the
+	// multiport capture chosen is the newest on the machine.
 	"concurrent-selection",
+	"virtio-multiport",
 ];
 
 // Whether this gate boots a guest of its own and therefore needs one of the runner's slots.
@@ -1172,6 +1143,13 @@ pub fn gate_boots_a_guest(gate: &str) -> bool {
 // Whether this gate is one profile row of a multi-profile gate. See `PROFILE_ROW_GATES`.
 pub fn gate_is_profile_row(name: &str) -> bool {
 	PROFILE_ROW_GATES.contains(&name)
+}
+
+// Whether the scheduler gives this gate a guest slot, by any of the catalog's routes: a gate that boots a guest of its
+// own, a profile row, a gate that starts several at once, or the development lifecycle. What the gate's declaration
+// says it boots (`resources`) is held to this.
+pub fn gate_schedules_a_guest(gate: &str) -> bool {
+	gate_boots_a_guest(gate) || gate_is_profile_row(gate) || gate_concurrent_guests(gate) > 1 || gate == DEV_LIFECYCLE_GATE
 }
 
 // HOW MANY GUESTS A GATE STARTS AT THE SAME TIME.
@@ -1239,9 +1217,9 @@ impl Catalog {
 		// prerequisite of the rows that consume its artifact, not a check a change selects - the
 		// gate that reads the image is what a change selects, and the release run builds the image
 		// before it.
-		for (id, command, artifact) in IMAGE_PRODUCERS {
+		for (id, command, artifact, volume) in IMAGE_PRODUCERS {
 			let mut check = Check::classified(id.to_string(), CheckKind::Gate, Vec::new(), vec![Variant { architecture: String::from("x86_64"), environment: Environment::Host, configuration: String::from("shared-image") }], command.to_string(), CheckClass::Producer);
-			check.produces = vec![artifact.to_string()];
+			check.produces = vec![artifact.to_string(), volume.to_string()];
 			check.prerequisites = BUILD_PARTS.iter().map(|part| format!("build.{part}")).collect();
 			check.evidence.push(String::from("artifact-digest"));
 			catalog.checks.push(check);
@@ -1305,7 +1283,7 @@ impl Catalog {
 			let mut check = Check::classified(format!("gate.{gate}"), CheckKind::Gate, covers, vec![Variant { architecture: String::from("host"), environment: Environment::Host, configuration: String::from("default") }], format!("./check.sh --gate {gate}"), class);
 			if let Some((_, inputs)) = GATE_IMAGE_INPUTS.iter().find(|(name, _)| *name == gate) {
 				check.inputs = inputs.iter().map(|i| i.to_string()).collect();
-				check.prerequisites = IMAGE_PRODUCERS.iter().filter(|(_, _, artifact)| inputs.contains(artifact)).map(|(id, _, _)| id.to_string()).collect();
+				check.prerequisites = IMAGE_PRODUCERS.iter().filter(|(_, _, artifact, volume)| inputs.contains(artifact) || inputs.contains(volume)).map(|(id, _, _, _)| id.to_string()).collect();
 			}
 			if GATES_THAT_BOOT_A_GUEST.contains(&gate) {
 				check.evidence.push(String::from("guest-log"));

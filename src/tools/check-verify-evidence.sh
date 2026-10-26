@@ -49,6 +49,16 @@ trap cleanup EXIT
 model() {
 	(cd src/tools/verify-model && cargo run --quiet --manifest-path Cargo.toml -- "$@")
 }
+# THE RELEASE THIS GATE MAY BE A STEP OF IS NOT ITS NESTED RUNS' RELEASE (corrected 2026-10-26).
+# Inside `verify.sh --release` this script inherits the outer run's `LIBER_RELEASE_REQUIRED`, which is
+# not on the permitted list - deliberately: it is the outer run's - so every `run-start` below refused
+# it as "an undeclared environment override", and the gate could not pass inside the very release it
+# is part of. The runs below are its own fixtures, so it is cleared for all of them, as
+# `LIBER_VERIFY_RUN` is cleared for the rehearsal. Its own envelope is the outer `check.sh`'s, which
+# does not read it.
+unset LIBER_RELEASE_REQUIRED
+# And the history a release names for its steps, which is the outer run's tree's and not the fixtures'.
+unset LIBER_VERIFY_HISTORY
 refusals() {
 	python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print("\n".join(r["reason"] for r in d["refusals"]))' "$1"
 }

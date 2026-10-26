@@ -358,6 +358,14 @@ absent_list_case() {
 # own manifest in exactly one header field. So a boot that accepts one is not accepting a forgery: it
 # is accepting a valid release that was not made for it, which is the whole point.
 signer="$PWD/src/tools/sign-manifest"
+# THE MODE THE MEDIUM WAS SIGNED FOR, which every case below keeps (corrected 2026-10-26).
+#
+# `sign-manifest` has REQUIRED `--dma-mode` since 2026-09-10, and these cases never passed it - so the
+# signer refused every one of them and the gate failed on "could not sign the ... case", not on any
+# boot. A case differs from the medium's own manifest in exactly one header field, and the mode is not
+# that field: it is read off the medium and passed through as it is, so each case is refused for its
+# own reason.
+medium_mode="$(src/harness/image-dma-mode.sh "$ISO")" || fail "could not read the DMA mode $ISO is signed for"
 # The rows the medium's own manifest carries, rebuilt from the files on the ESP: the point is a
 # manifest that is right about the CONTENT and wrong about the CONTEXT.
 extract_from_esp() {
@@ -387,7 +395,7 @@ resign_with() {
 	fi
 	(cd "$signer" && cargo run --quiet -- --profile test-trust --product LiberSystem \
 		--arch x86_64 --source boot-medium --release 0.0.1 \
-		--volume-uuid 00000000000000000000000000000000 "$@" "${rows[@]}" --out "$out") >/dev/null 2>&1
+		--volume-uuid 00000000000000000000000000000000 --dma-mode "$medium_mode" "$@" "${rows[@]}" --out "$out") >/dev/null 2>&1
 }
 
 wrong_context() {

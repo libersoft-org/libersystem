@@ -412,6 +412,34 @@ else
 	complain "the stale-image fixture failed for some other reason: $(tail -2 "$stale_log" | tr '\n' ' ')"
 fi
 
+# A STAGING IN THE OTHER PROFILE, which is a refusal of its own (`staging-state.sh`): the build is
+# current, and another step left its parts in the development profile. The suite refuses at once, by
+# name, with its own status - before it compiles or boots anything - instead of failing an hour in on
+# an undeclared entry.
+tree="$(private_root)"
+: >"$tree/.build/boot/system-volume-x86_64.img"
+mkdir -p "$tree/src/user"
+printf 'fn main() {}\n' >"$tree/src/user/fixture.rs"
+(
+	SCRIPT_NAME=fixture
+	source "$tree/lib.sh"
+	source_digest "${VOLUME_SOURCES[@]}" >"$tree/.build/state/built-x86_64-volume-test"
+	LIBER_DEVELOPMENT=1 record_staging_profile "$tree/.build" x86_64 libs user packages volume-test
+)
+profile_log="$scratch/profile.log"
+profile_status="$(fresh_status)"
+profile_started=$SECONDS
+set +e
+env -u LIBER_DEVELOPMENT RUN_STATUS_FILE="$profile_status" "$tree/test.sh" --arch x86_64 --build-only >/dev/null 2>"$profile_log"
+profile_exit=$?
+set -e
+expect_one_verdict "a staging in the other profile" test.sh failed 75 "$profile_log" "$profile_status" "$profile_exit" || true
+if grep -q "REFUSED: the x86_64 staging's 'libs' was built in the development profile, and this step needs the shipping one" "$profile_log"; then
+	note "the profile fixture produced the suite's own refusal, naming the part and the profile, in $((SECONDS - profile_started)) s"
+else
+	complain "the profile fixture failed for some other reason: $(tail -2 "$profile_log" | tr '\n' ' ')"
+fi
+
 # THE VERIFICATION BRANCHES. The planner is a stub, so the branch is exercised without a real model:
 # a plan that cannot be produced is a failure with a verdict, and the prepared-plan executor runs
 # synthetic steps whose commands are `true` and `false` and carries the failing one's status out.
@@ -601,11 +629,24 @@ expect_run "a fractional stall window" build.sh failed 1 ./build.sh --stall 1.5 
 expect_run "a stall window out of range" build.sh failed 1 ./build.sh --stall 99999999999 --part libs --arch x86_64
 expect_run "a stall flag with no value" build.sh failed 1 ./build.sh --stall
 
+# THE BUILDS THIS GATE STARTS IN THE TREE, by pid: their step marks are the ones it judges. Another build's mark -
+# one running beside this gate, or one a killed build left (`build.sh` sweeps those) - is not this gate's to judge,
+# and judging every mark in the tree failed this gate beside a concurrent build that was doing nothing wrong.
+own_builds=()
+own_build() {
+	local pid status=0
+	"$@" &
+	pid=$!
+	own_builds+=("$pid")
+	wait "$pid" || status=$?
+	return "$status"
+}
+
 # AN INVALID ENVIRONMENT DOES NOT DEFEAT A VALID FLAG: the flag is the one the person typed.
 stall_log="$scratch/stall-override.log"
 stall_status="$(fresh_status)"
 set +e
-BUILD_STALL=nonsense RUN_STATUS_FILE="$stall_status" ./build.sh --stall 0 --part libs --arch x86_64 >/dev/null 2>"$stall_log"
+BUILD_STALL=nonsense RUN_STATUS_FILE="$stall_status" own_build ./build.sh --stall 0 --part libs --arch x86_64 >/dev/null 2>"$stall_log"
 stall_exit=$?
 set -e
 expect_one_verdict "a valid flag over an invalid environment" build.sh ok 0 "$stall_log" "$stall_status" "$stall_exit" || true
@@ -615,7 +656,7 @@ expect_one_verdict "a valid flag over an invalid environment" build.sh ok 0 "$st
 timing_log="$scratch/stall-timing.log"
 timing_status="$(fresh_status)"
 set +e
-RUN_STATUS_FILE="$timing_status" ./build.sh --stall 1 --part libs,user --arch x86_64 >/dev/null 2>"$timing_log"
+RUN_STATUS_FILE="$timing_status" own_build ./build.sh --stall 1 --part libs,user --arch x86_64 >/dev/null 2>"$timing_log"
 timing_exit=$?
 set -e
 expect_one_verdict "a build watched with a one-second window" build.sh ok 0 "$timing_log" "$timing_status" "$timing_exit" || true
@@ -631,7 +672,7 @@ fi
 quiet_log="$scratch/stall-quiet.log"
 quiet_status="$(fresh_status)"
 set +e
-RUN_STATUS_FILE="$quiet_status" ./build.sh --stall 0 --part libs --arch x86_64 >/dev/null 2>"$quiet_log"
+RUN_STATUS_FILE="$quiet_status" own_build ./build.sh --stall 0 --part libs --arch x86_64 >/dev/null 2>"$quiet_log"
 quiet_exit=$?
 set -e
 expect_one_verdict "a build with observation disabled" build.sh ok 0 "$quiet_log" "$quiet_status" "$quiet_exit" || true
@@ -641,12 +682,17 @@ else
 	note "a disabled window starts no observer"
 fi
 
-# THE OBSERVER AND ITS SLEEPER ARE GONE WHEN THE BUILD IS, and so is the mark.
-if compgen -G "$ROOT/.build/state/build-step.*" >/dev/null; then
-	marks=("$ROOT"/.build/state/build-step.*)
-	complain "a finished build left its step mark behind: ${marks[0]}"
+# THE OBSERVER AND ITS SLEEPER ARE GONE WHEN THE BUILD IS, and so is the mark - of each build this gate started.
+left=()
+for pid in "${own_builds[@]}"; do
+	[[ -e "$ROOT/.build/state/build-step.$pid" || -e "$ROOT/.build/state/build-step.$pid.tmp" ]] && left+=("build-step.$pid")
+done
+if ((${#own_builds[@]} == 0)); then
+	complain "this gate started no build of its own, so it judged no mark"
+elif ((${#left[@]})); then
+	complain "a finished build left its step mark behind: ${left[0]}"
 else
-	note "a finished build leaves no step mark"
+	note "a finished build leaves no step mark (${#own_builds[@]} build(s) of this gate's)"
 fi
 
 if ((failed)); then

@@ -160,13 +160,14 @@ class Guest:
 		self.tpm = tpm
 		self.scale = 10.0
 		self.serial_path = os.path.join(lab.BUILD, f'hibernate-serial-{target}.sock')
+		self.state = tickless.guest_state(f'hibernate-{target}')
 		self.log_path = os.path.join(work, f'hibernate-{target}-{label}.log')
 		self.runner_log = open(os.path.join(work, f'hibernate-{target}-{label}-runner.log'), 'wb')
 		kernel = os.path.join(lab.BUILD_ROOT, 'cargo', 'kernel', TRIPLES[target], 'debug', 'kernel')
 		if os.path.exists(self.serial_path):
 			os.unlink(self.serial_path)
 		# AN ENTROPY DEVICE: neither port has a random instruction, and the image's keys are drawn from the kernel's pool.
-		env = dict(os.environ, LIBER_DEVELOPMENT='1', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{self.serial_path},server', SMP=str(SMP), MEM=f'{MEM_MIB}M', RUN_DISK=disk.path, LIBER_RUN_MODE='development', UEFI='1', ENTROPY='1')
+		env = dict(os.environ, LIBER_DEVELOPMENT='1', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{self.serial_path},server', SMP=str(SMP), MEM=f'{MEM_MIB}M', RUN_DISK=disk.path, LIBER_RUN_MODE='development', UEFI='1', ENTROPY='1', LIBER_DEV_STATE=self.state)
 		env.pop('TPM_SOCKET', None)
 		env.pop('TPM_FRONTEND', None)
 		if tpm is not None:
@@ -227,6 +228,7 @@ class Guest:
 			self.tpm.stop()
 		self.log.close()
 		self.runner_log.close()
+		shutil.rmtree(self.state, ignore_errors=True)
 
 
 # THE COUNTER ACROSS THE TIME OFF, read from its file once it has ended: one unbroken run of values from 1, whose widest
@@ -389,6 +391,8 @@ def main():
 	if shutil.which('swtpm') is None:
 		print('check-hibernate-ports: swtpm is not installed - setup.sh installs it, and this gate fails rather than skips without it', file=sys.stderr)
 		return 1
+	if not skip_build:
+		tickless.refuse_unless_current('check-hibernate-ports', targets)
 	work = os.path.join(lab.BUILD_ROOT, 'logs', 'hibernate-ports')
 	os.makedirs(work, exist_ok=True)
 	failed = []

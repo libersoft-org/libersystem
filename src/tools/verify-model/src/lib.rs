@@ -19,6 +19,7 @@ pub mod kerneltests;
 pub mod ownership;
 pub mod plan;
 pub mod registry;
+pub mod resources;
 pub mod shadow;
 pub mod tier;
 pub mod trust;

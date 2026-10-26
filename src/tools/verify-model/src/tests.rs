@@ -2468,25 +2468,25 @@ fn a_candidate_that_narrows_only_the_registry_is_still_a_narrowing() {
 fn a_failed_run_never_becomes_a_cost_however_the_models_are_ordered() {
 	// TWO SEQUENCES, AND THE FIRST FIX CAUGHT NEITHER.
 	//
-	// A step's duration is filtered on the model it was measured under, because a duration measured
-	// over a different plan is not a duration for this one. `record_step_id` withheld a FAILED run's
-	// seconds and then overwrote the model hash anyway - so a success under model A followed by a
-	// failure under model B left A's duration wearing B's label, and the filter that exists to
-	// refuse exactly that accepted it.
+	// `record_step_id` withheld a FAILED run's seconds and then overwrote the model hash anyway, so a success under
+	// model A followed by a failure under model B left A's duration wearing B's label. A measurement keeps the model
+	// it was taken under, and a failure under another model neither becomes the price nor erases the one there is:
+	// the price is the step's last measured duration, MARKED as measured under an older model.
 	let mut history = crate::history::History { schema: crate::history::SCHEMA, entries: Default::default(), fixed_overshoot: Default::default(), steps: Default::default() };
 	let cost = crate::history::CostModel::default();
 	let keys = vec![crate::plan::PlanItemKey { check: String::from("gate.one"), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from("default") }];
-	history.record_step_id(Some("step-a"), &keys, true, 120.0, "model-a", &cost);
-	assert_eq!(history.step_seconds("step-a", "model-a"), Some(120.0), "a passing run under this model is a measurement");
-	history.record_step_id(Some("step-a"), &keys, false, 2.0, "model-b", &cost);
-	assert_eq!(history.step_seconds("step-a", "model-b"), None, "a failure under a second model does not relabel the first model's duration as this one's");
-	assert_eq!(history.step_seconds("step-a", "model-a"), None, "and the run really did happen, so the stale measurement is not kept under the old label either");
+	history.record_step_id(Some("step-a"), "./check.sh --gate one", &keys, true, 120.0, "model-a", &cost);
+	assert_eq!(history.step_seconds("step-a", "./check.sh --gate one"), Some(120.0), "a passing run is a measurement");
+	assert!(!history.step_price_is_older("step-a", "model-a"));
+	history.record_step_id(Some("step-a"), "./check.sh --gate one", &keys, false, 2.0, "model-b", &cost);
+	assert_eq!(history.step_seconds("step-a", "./check.sh --gate one"), Some(120.0), "a failure under a second model does not become the price, and does not erase the one there is");
+	assert!(history.step_price_is_older("step-a", "model-b"), "and the price is marked as measured under an older model");
 
 	// AND A FAILED SINGLE-KEY STEP DOES NOT PRICE ITS KEY. The merged guard covers members that
 	// never started; a one-key step has no such member and wrote its partial duration straight into
 	// the key record, which `estimate` reads.
 	let mut priced = crate::history::History { schema: crate::history::SCHEMA, entries: Default::default(), fixed_overshoot: Default::default(), steps: Default::default() };
-	priced.record_step_id(Some("step-b"), &keys, false, 3.0, "model-a", &cost);
+	priced.record_step_id(Some("step-b"), "./check.sh --gate one", &keys, false, 3.0, "model-a", &cost);
 	let after_failure = cost.estimate(&priced, &keys, Some("model-a"));
 	let unmeasured = cost.estimate(&crate::history::History { schema: crate::history::SCHEMA, entries: Default::default(), fixed_overshoot: Default::default(), steps: Default::default() }, &keys, Some("model-a"));
 	assert_eq!(after_failure, unmeasured, "a step that failed at its first instruction is not what running that key costs");
@@ -2648,21 +2648,30 @@ fn a_candidate_that_does_not_record_what_it_overwrites_is_refused() {
 // Ordering on them is ordering on the batching. A step has ONE duration and it is measurable, so
 // once it has been measured under this model that is the number, and the estimate is only the seed
 // for a step nobody has timed.
+// A PRICE SURVIVES A CATALOG EDIT. The model hash covers the catalog with every kernel test id, so adding one test
+// moved it and left every host step unpriced and every guest step on its seed; a model hash binds evidence, and what
+// a step costs is what it took - under its id AND its command, so a step whose command changed starts unpriced.
 #[test]
-fn a_measured_step_cost_replaces_the_estimate_and_a_stale_one_does_not() {
+fn a_measured_step_cost_replaces_the_estimate_and_survives_a_catalog_edit() {
 	let mut history = crate::history::History::default();
 	let cost = crate::history::CostModel::default();
 	let keys = alloc_keys();
+	let command = "./test.sh --arch x86_64";
 
 	// Nothing measured: the estimate is all there is.
-	assert_eq!(history.step_seconds("guest:x86_64", "hash-a"), None, "a step nobody has run has no measurement");
+	assert_eq!(history.step_seconds("guest:x86_64", command), None, "a step nobody has run has no measurement");
 
-	history.record_step_id(Some("guest:x86_64"), &keys, true, 187.0, "hash-a", &cost);
-	assert_eq!(history.step_seconds("guest:x86_64", "hash-a"), Some(187.0), "the whole step's duration, against the step");
+	history.record_step_id(Some("guest:x86_64"), command, &keys, true, 187.0, "hash-a", &cost);
+	assert_eq!(history.step_seconds("guest:x86_64", command), Some(187.0), "the whole step's duration, against the step");
 
-	// A measurement taken under a DIFFERENT model is not a measurement for this plan - the same rule
-	// a key's record follows, and for the same reason.
-	assert_eq!(history.step_seconds("guest:x86_64", "hash-b"), None, "a duration measured over another model is not a duration for this one");
+	// The catalog edited: another model hash, the same step and command - the same price, marked older.
+	let mut step = step_for_test("guest:x86_64", &[]);
+	step.command = String::from(command);
+	step.keys = keys.clone();
+	step.guests = 1;
+	assert_eq!(cost.scheduled_seconds(&history, &step, "hash-b"), Some(187.0), "a price measured under an older model is still the step's price");
+	assert!(history.step_price_is_older("guest:x86_64", "hash-b"), "and it is marked as measured under an older model");
+	assert_eq!(history.step_seconds("guest:x86_64", "TEST_SELECTION=a ./test.sh --arch x86_64"), None, "another command under the same id is unpriced");
 
 	// And the per-key records are still written, because the age bound and the shadow both range
 	// over keys rather than steps.
@@ -2696,21 +2705,23 @@ fn an_unmeasured_step_is_never_priced_at_zero() {
 	assert_eq!(cost.seed_seconds(0), None, "a host gate may rebuild the entire runtime; an arbitrary positive floor is not conservative");
 }
 
+// A BUDGET NEVER ADMITS A HOST STEP THAT WAS NEVER MEASURED: it has no price and no seed, and a step that ran to the
+// end under another model is priced by that run.
 #[test]
-fn unpriced_host_work_needs_a_current_measurement_and_orders_after_known_work() {
+fn unpriced_host_work_needs_a_measurement_and_orders_after_known_work() {
 	let fixture = Fixture::new("unpriced-step");
 	let cost = crate::history::CostModel::default();
 	let mut history = crate::history::History::default();
 	let mut gate = step_for_test("gate:host:targeted-cache", &[]);
 	gate.keys.push(crate::plan::PlanItemKey { check: String::from("gate.targeted-cache"), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from("default") });
 	assert_eq!(cost.scheduled_seconds(&history, &gate, "hash-a"), None);
-	history.record_step_id(Some(&gate.id), &gate.keys, false, 3.0, "hash-a", &cost);
+	history.record_step_id(Some(&gate.id), &gate.command, &gate.keys, false, 3.0, "hash-a", &cost);
 	assert_eq!(cost.scheduled_seconds(&history, &gate, "hash-a"), None, "an early failure does not measure successful work");
-	history.record_step_id(Some(&gate.id), &gate.keys, true, 571.0, "hash-a", &cost);
+	history.record_step_id(Some(&gate.id), &gate.command, &gate.keys, true, 571.0, "hash-a", &cost);
 	history.save(&fixture.dir).unwrap();
 	let history = crate::history::History::load(&fixture.dir).unwrap();
 	assert_eq!(cost.scheduled_seconds(&history, &gate, "hash-a"), Some(571.0), "a persisted measurement restores an admissible cost");
-	assert_eq!(cost.scheduled_seconds(&history, &gate, "hash-b"), None, "another model's measurement cannot price this one");
+	assert_eq!(cost.scheduled_seconds(&history, &gate, "hash-b"), Some(571.0), "a measurement taken under another model still prices the step");
 	let unknown = step_for_test("unknown", &[]);
 	let ordered = crate::commands::order_by_cost(vec![unknown, gate], |step| cost.scheduled_seconds(&history, step, "hash-a").unwrap_or(f64::INFINITY)).unwrap();
 	assert_eq!(ordered.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(), vec!["gate:host:targeted-cache", "unknown"]);
@@ -2873,32 +2884,88 @@ fn every_profile_row_is_a_step_of_its_own() {
 	}
 }
 
+// THE GATES THAT RUN ALONE keep their keys and their slots, and nothing else runs alone: what every other step shares
+// is in its declaration, and every step of the release plan has one.
 #[test]
-fn shared_guest_scenarios_keep_their_keys_and_slots_but_require_isolation() {
+fn the_gates_that_run_alone_keep_their_keys_and_slots_and_every_other_step_declares_what_it_shares() {
 	let model = model();
 	let steps = crate::commands::release_steps(&model.catalog, &model.registry);
 	let known = crate::catalog::catalog_gate_names();
-	for gate in crate::catalog::EXCLUSIVE_GUEST_GATES {
-		assert!(known.contains(*gate), "unknown exclusive gate {gate}");
+	for gate in crate::catalog::ALONE_GATES {
+		assert!(known.contains(*gate), "unknown gate {gate} runs alone");
 		let selected: Vec<_> = steps.iter().filter(|step| step.keys.iter().any(|key| key.check == format!("gate.{gate}"))).collect();
 		assert_eq!(selected.len(), 1, "the real release plan keeps exactly one step for {gate}");
-		assert!(selected[0].exclusive_guests, "{gate} must hold its scenario's shared resources");
-		assert_eq!(selected[0].guests, crate::catalog::gate_concurrent_guests(gate));
+		assert!(selected[0].exclusive_guests, "{gate} runs alone");
+		assert_eq!(selected[0].guests, if crate::catalog::gate_schedules_a_guest(gate) { crate::catalog::gate_concurrent_guests(gate) } else { 0 });
 	}
 	for step in &steps {
-		if step.id.starts_with("guest:") || step.id.starts_with("gate-profile:") {
-			assert!(!step.exclusive_guests, "isolated suites and profile rows still overlap: {}", step.id);
-		}
-	}
-	for gate in ["virtio-gpu-edid-aarch64", "virtio-gpu-edid-riscv64"] {
-		let step = steps.iter().find(|step| step.keys.iter().any(|key| key.check == format!("gate.{gate}"))).unwrap();
-		assert!(!step.exclusive_guests, "the private port EDID guest builds no image and keeps its concurrency");
+		let alone = step.command.strip_prefix("./check.sh --gate ").is_some_and(|gate| crate::catalog::ALONE_GATES.contains(&gate));
+		assert_eq!(step.exclusive_guests, alone, "only the gates listed run alone: {}", step.id);
+		assert!(crate::resources::step_declaration(step).is_some(), "the release step {} declares what it uses", step.id);
 	}
 	let lifecycle = steps.iter().find(|step| step.id == "dev:lifecycle").unwrap();
-	assert!(lifecycle.exclusive_guests);
+	assert!(!lifecycle.exclusive_guests, "the lifecycle's instance is its own, with its own port");
 	assert_eq!(lifecycle.guests, 1);
 	let overlap = steps.iter().find(|step| step.keys.iter().any(|key| key.check == "gate.concurrent-selection")).unwrap();
-	assert_eq!(overlap.guests, 2, "isolation must not trim the two actual concurrent guests");
+	assert_eq!(overlap.guests, 2, "running alone must not trim the two actual concurrent guests");
+}
+
+// THE ORDER SERVES THE WALL CLOCK. With two slots and guest steps of 100, 10, 10 and 10 s, the 100-s step starts first,
+// so it is not the last to start; the host suites come first on their lane, the cheap host work before the dear and a
+// host step never measured after the measured ones; and the steps that need the development profile come after the
+// shipping profile's, whatever they cost - a state is switched once.
+#[test]
+fn the_dearest_guest_step_starts_first_and_one_state_is_one_group() {
+	let guest = |id: &str| crate::commands::Step { guests: 1, ..step_for_test(id, &[]) };
+	let prices: std::collections::BTreeMap<&str, f64> = [
+		("guest:a", 10.0),
+		("guest:b", 100.0),
+		("guest:c", 10.0),
+		("guest:d", 10.0),
+		("gate:host:dear", 60.0),
+		("gate:host:cheap", 2.0),
+		("host:suite", 30.0),
+		("guest:dev", 500.0),
+	]
+	.into_iter()
+	.collect();
+	let steps = vec![
+		guest("guest:a"),
+		guest("guest:b"),
+		guest("guest:c"),
+		guest("guest:d"),
+		step_for_test("gate:host:dear", &[]),
+		step_for_test("gate:host:cheap", &[]),
+		step_for_test("gate:host:unmeasured", &[]),
+		step_for_test("host:suite", &[]),
+		guest("guest:dev"),
+	];
+	let order = crate::commands::order_for_slots(steps, |step| prices.get(step.id.as_str()).copied(), |step| if step.id == "guest:dev" { 4 } else { 0 }).unwrap();
+	let ids: Vec<&str> = order.iter().map(|step| step.id.as_str()).collect();
+	let guests: Vec<&str> = ids.iter().copied().filter(|id| id.starts_with("guest:")).collect();
+	assert_eq!(guests[0], "guest:b", "the 100-s step starts first: {ids:?}");
+	assert_eq!(guests.last(), Some(&"guest:dev"), "the development profile's step after the shipping ones, dear as it is: {ids:?}");
+	let host: Vec<&str> = ids.iter().copied().filter(|id| !id.starts_with("guest:")).collect();
+	assert_eq!(host, vec!["host:suite", "gate:host:cheap", "gate:host:dear", "gate:host:unmeasured"], "host suites, then the cheap, then the dear, then the unmeasured");
+	// And never before what it requires.
+	let ordered = crate::commands::order_for_slots(vec![guest("guest:late"), crate::commands::Step { guests: 1, ..step_for_test("guest:needs", &["guest:late"]) }], |step| Some(if step.id == "guest:needs" { 1000.0 } else { 1.0 }), |_| 0).unwrap();
+	assert_eq!(ordered.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(), vec!["guest:late", "guest:needs"]);
+}
+
+// WHAT A PLAN'S STEPS USE, derived from what each is, and the tokens the runner compares.
+#[test]
+fn a_steps_declaration_follows_from_what_it_is() {
+	let tokens = |id: &str, command: &str| {
+		let step = crate::commands::Step { command: command.to_string(), ..step_for_test(id, &[]) };
+		crate::resources::step_declaration(&step).map(|declared| declared.tokens())
+	};
+	assert_eq!(tokens("build:x86_64:libs", "./build.sh --arch x86_64 --part libs"), Some(vec![String::from("stage:x86_64=w:shipping")]));
+	assert_eq!(tokens("guest:aarch64:all", "./test.sh --arch aarch64"), Some(vec![String::from("stage:aarch64=r:shipping"), String::from("media=r:-")]));
+	assert_eq!(tokens("producer:x86_64:image.libersystem-iso", "./image.sh --format iso --dma-mode enforcing-required"), Some(vec![String::from("stage:x86_64=w:shipping"), String::from("volume:x86_64=w:shipping/enforcing-required"), String::from("media=r:-")]));
+	assert_eq!(tokens("host:abi:default", "cargo test"), Some(Vec::new()));
+	assert_eq!(tokens("dev:dev.selftest", "(cd src && harness/dev-selftest.py)"), Some(vec![String::from("lab:dev-instance=x:-")]));
+	assert_eq!(tokens("gate-guest:host:usb-release", "./check.sh --gate usb-release"), Some(vec![String::from("stage:x86_64=r:development"), String::from("media=r:-"), String::from("volume:x86_64=r:development/harness")]));
+	assert_eq!(tokens("gate:host:nonexistent", "./check.sh --gate nonexistent"), None, "a gate that declares nothing has no declaration, and runs alone");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3081,7 +3148,10 @@ fn the_release_plan_discharges_every_required_key_once_with_producers_before_con
 	let ordered = crate::commands::order_by_cost(steps.clone(), |_| 1.0).expect("orderable");
 	let position = |id: &str| ordered.iter().position(|step| step.id == id).unwrap_or_else(|| panic!("no step {id}"));
 	let producer = "producer:x86_64:image.libersystem-iso";
-	for gate in ["secure-boot", "signed-boot", "qemu-virtio-iommu-x86_64"] {
+	// `perf-anchor` boots no image of the producer's but assembles its own from the bootable volume
+	// that producer leaves signed `enforcing-required` - a prerequisite it did not declare, so a plan
+	// could start it before any producer had signed that volume for the medium it pairs it with.
+	for gate in ["secure-boot", "signed-boot", "qemu-virtio-iommu-x86_64", "perf-anchor"] {
 		let step = steps.iter().find(|step| step.keys.iter().any(|key| key.check == format!("gate.{gate}"))).unwrap_or_else(|| panic!("no step for {gate}"));
 		assert!(step.requires.contains(&String::from(producer)), "{gate} requires the image it boots: {:?}", step.requires);
 		assert!(position(&step.id) > position(producer));
@@ -3166,4 +3236,107 @@ fn a_scoped_run_is_trusted_only_under_current_model_evidence_covering_its_change
 	assert_eq!(store.level("audio", "hash-current", Universe::Host, &earned), Level::Shadow);
 	// A component nothing certified is SHADOW by default, which is the safe default.
 	assert_eq!(store.level("wire", "hash-current", Universe::TestGuest, &earned), Level::Shadow);
+}
+
+// WHERE A PLAN'S TIME GOES: a step that boots nothing and an exclusive guest step run alone, a shared guest step divides
+// over the slots, an unmeasured step is named and not priced at zero, and a price from an older model still counts.
+#[test]
+fn an_account_separates_the_serial_remainder_from_the_shared_guest_work() {
+	let step = |id: &str, guests: usize, exclusive_guests: bool| crate::commands::Step { id: id.to_string(), requires: Vec::new(), label: id.to_string(), command: String::from("true"), keys: Vec::new(), note: None, guests, exclusive_guests };
+	let steps = vec![step("host", 0, false), step("shared-guest", 1, false), step("exclusive-guest", 1, true), step("never-measured", 1, false)];
+	let mut history = crate::history::History::default();
+	for (id, seconds, hash) in [("host", 100.0, "current"), ("shared-guest", 50.0, "older"), ("exclusive-guest", 30.0, "current")] {
+		history.steps.insert(id.to_string(), crate::history::StepRecord { last_seconds: seconds, model_hash: hash.to_string(), ..Default::default() });
+	}
+	let account = crate::history::Account::of(&steps, &history, "current");
+	assert_eq!(account.alone, 130.0, "the host step and the exclusive guest step run alone");
+	assert_eq!(account.shared, 50.0);
+	assert_eq!(account.unpriced, vec![String::from("never-measured")]);
+	assert_eq!(account.older, 1, "a price from an older model is used and counted");
+	assert_eq!(account.priced.first().map(|(seconds, id, _)| (*seconds, id.as_str())), Some((100.0, "host")));
+	assert_eq!(account.floor(2), 180.0, "the remainder plus the longest shared step, which is more than half the shared work");
+	assert_eq!(account.total() / 2.0, 90.0);
+}
+
+// WHAT A GATE USES, DECLARED AND HELD TO ITS SCRIPTS. Every gate check.sh runs has a declaration, and every
+// declaration agrees with what the gate's scripts call and with how the catalog schedules it - the nine gates that
+// boot only through `test.sh` or `guest-verdict.py` included. The break, watched: with the catalogue as it stood,
+// `icd-selection`, `lifecycle`, `foreign-loader-guest`, `foreign-facilities-guest` and `ipv6-peer` boot a guest and
+// were scheduled as host gates.
+#[test]
+fn every_gate_declares_what_it_uses_and_its_scripts_agree() {
+	let failures = crate::resources::declaration_failures(&repo_root(), &crate::resources::GATE_RESOURCES, &crate::resources::NAMES_WHAT_IT_DOES_NOT_RUN, &crate::catalog::gate_schedules_a_guest);
+	assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// A fixture tree: a `check.sh` whose GATES table runs `tools/<script>` for each gate, and the scripts.
+fn resource_fixture(name: &str, gates: &[(&str, &str)]) -> std::path::PathBuf {
+	let root = std::env::temp_dir().join(format!("verify-model-resources-{name}-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&root);
+	std::fs::create_dir_all(root.join("src/tools")).expect("fixture tree");
+	let mut table = String::from("declare -A GATES=(\n");
+	for (gate, script) in gates {
+		table.push_str(&format!("\t[\"{gate}\"]=\"tools/check-{gate}.sh\"\n"));
+		std::fs::write(root.join(format!("src/tools/check-{gate}.sh")), script).expect("fixture script");
+	}
+	table.push_str(")\n");
+	std::fs::write(root.join("check.sh"), table).expect("fixture check.sh");
+	root
+}
+
+#[test]
+fn a_gate_added_without_a_declaration_is_refused() {
+	let root = resource_fixture("undeclared", &[("declared", "#!/usr/bin/env bash\ntrue\n"), ("added", "#!/usr/bin/env bash\ntrue\n")]);
+	let failures = crate::resources::declaration_failures(&root, &[("declared", "host")], &[], &|_| false);
+	assert_eq!(failures, vec![String::from("gate 'added' declares no resources - say what it reads and writes, or that it is a host gate that shares nothing")]);
+	let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_host_gate_whose_script_boots_a_guest_is_refused_and_a_guest_gate_with_no_runner_too() {
+	let root = resource_fixture(
+		"booting",
+		&[
+			("probe", "#!/usr/bin/env bash\nsource \"$root/tools/guest-gate.sh\"\n# ./run.sh in a comment boots nothing\nguest_gate_run 'probe' probe\n"),
+			("quiet", "#!/usr/bin/env bash\necho \"run ./test.sh to see\"\n"),
+		],
+	);
+	let failures = crate::resources::declaration_failures(&root, &[("probe", "host"), ("quiet", "guest stage:x86_64:r profile:shipping media")], &[], &|gate| gate == "quiet");
+	assert!(failures.iter().any(|failure| failure.starts_with("gate 'probe' is declared as a host gate, and its scripts call guest_gate_run")), "{failures:#?}");
+	assert!(failures.iter().any(|failure| failure == "gate 'quiet' is declared to boot a guest, and none of its scripts calls a runner"), "{failures:#?}");
+	// A runner's own image build is no staging write: the staging is brought to the declared state before the step.
+	assert!(!failures.iter().any(|failure| failure.contains("write no staging")), "{failures:#?}");
+	let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_staging_write_is_declared_in_both_directions() {
+	let root = resource_fixture("staging", &[("builder", "#!/usr/bin/env bash\n\"$repo/build.sh\" --arch x86_64\n"), ("reader", "#!/usr/bin/env bash\nls .build/image\n")]);
+	let failures = crate::resources::declaration_failures(&root, &[("builder", "host stage:x86_64:r profile:shipping"), ("reader", "host stage:x86_64:w profile:shipping")], &[], &|_| false);
+	assert!(failures.contains(&String::from("gate 'builder' is declared to write no staging, and its scripts build")), "{failures:#?}");
+	assert!(failures.contains(&String::from("gate 'reader' is declared to write a staging, and none of its scripts builds")), "{failures:#?}");
+	let _ = std::fs::remove_dir_all(&root);
+}
+
+// THE CONFLICTS A SCHEDULER READS: a shared write, a staging in two profiles and a volume in two modes keep two
+// steps apart; two readers of one state, and two steps on different stagings, may run together.
+#[test]
+fn declarations_conflict_on_a_shared_write_or_state_and_not_on_shared_reads() {
+	let parse = |text: &str| crate::resources::parse(text).expect(text);
+	let writer = parse("guest stage:x86_64:w profile:development media volume:x86_64:harness:w");
+	let reader = parse("guest stage:x86_64:r profile:shipping media");
+	let other_reader = parse("host stage:x86_64:r profile:shipping");
+	let development_reader = parse("host stage:x86_64:r profile:development");
+	let port = parse("guest stage:aarch64:r profile:shipping media");
+	let enforcing = parse("guest stage:x86_64:r profile:shipping media volume:x86_64:enforcing-required:r");
+	let no_iommu = parse("guest stage:x86_64:r profile:shipping media volume:x86_64:no-iommu:r");
+	assert!(writer.conflicts_with(&reader) && reader.conflicts_with(&writer));
+	assert!(!reader.conflicts_with(&other_reader), "two readers of one state overlap");
+	assert!(reader.conflicts_with(&development_reader), "one staging cannot be in two profiles");
+	assert!(enforcing.conflicts_with(&no_iommu), "one volume cannot be in two modes");
+	assert!(!writer.conflicts_with(&port), "different stagings overlap");
+	let gadget = parse("guest stage:x86_64:w profile:development media gadget");
+	assert!(gadget.conflicts_with(&parse("host gadget")), "the gadget has one holder");
+	assert!(crate::resources::parse("guest stage:x86_64:r").is_err(), "a staging use names its profile");
+	assert!(crate::resources::parse("lab:cold-x86_64").is_err(), "a declaration starts with guest or host");
 }

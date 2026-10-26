@@ -58,7 +58,10 @@ printf 'the release stick, plugged after the boot\n' | mcopy -i "$sticks/release
 
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-180}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-300}"
-qmp_socket="$root/../.build/boot/qemu-qmp.sock"
+# THE COMPLETION LINE: the script's last line prints `usb-release-done`, after which nothing this gate needs can
+# arrive. It also refuses a panic, which a late line could carry, so it keeps a settle window of 10 s after it.
+export GUEST_GATE_DONE="usb-release-done" GUEST_GATE_SETTLE=10
+qmp_socket="$GUEST_GATE_QMP"
 
 # How many lines of the guest's log hold `text`, now - zero before the log exists.
 seen() {

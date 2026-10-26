@@ -6,6 +6,7 @@
 import importlib.util
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -250,11 +251,12 @@ def check(serial, qmp_path, work, fixture):
 def drive(work, fixture):
 	label = 'fixture' if fixture else 'unsupported'
 	serial_path = os.path.join(lab.BUILD, 'system-suspend-riscv64.sock')
-	qmp_path = os.path.join(lab.BUILD, 'qemu-qmp-cold-riscv64.sock')
+	state = tickless.guest_state('system-suspend-riscv64')
+	qmp_path = os.path.join(state, 'qemu-qmp.sock')
 	if os.path.exists(serial_path):
 		os.unlink(serial_path)
 	kernel = os.path.join(lab.BUILD_ROOT, 'cargo', 'kernel', tickless.TRIPLES[TARGET], 'debug', 'kernel')
-	env = dict(os.environ, LIBER_DEVELOPMENT='1', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{serial_path},server', SMP=str(SMP), LIBER_RUN_MODE='development', UEFI='1')
+	env = dict(os.environ, LIBER_DEVELOPMENT='1', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{serial_path},server', SMP=str(SMP), LIBER_RUN_MODE='development', UEFI='1', LIBER_DEV_STATE=state)
 	for name in ('SYSTEM_SUSPEND_FIXTURE', 'IDLE_FIXTURE', 'I2C_FIXTURE', 'DMA_DTB_NODE', 'QEMU_EXTRA'):
 		env.pop(name, None)
 	if fixture:
@@ -293,6 +295,7 @@ def drive(work, fixture):
 					guest.wait()
 				if os.path.exists(serial_path):
 					os.unlink(serial_path)
+				shutil.rmtree(state, ignore_errors=True)
 
 
 def main():
@@ -311,6 +314,7 @@ def main():
 		if '--self-test' in args:
 			return 0
 		if '--no-build' not in args:
+			tickless.refuse_unless_current('check-system-suspend', [TARGET])
 			tickless.build(TARGET)
 		work = os.path.join(lab.BUILD_ROOT, 'logs', 'system-suspend-riscv64')
 		os.makedirs(work, exist_ok=True)

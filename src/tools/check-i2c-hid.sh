@@ -84,6 +84,11 @@ else
 	export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-900}"
 	export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-1200}"
 fi
+# THE COMPLETION LINE: `hidcheck: PASS malformed` is the last case's verdict, and every line this gate requires comes
+# before it. It also refuses a probe failure and lines that must not appear, which a late line could carry, so it
+# keeps a settle window after it: 10 s under KVM, 30 s on an emulated target.
+export GUEST_GATE_DONE="hidcheck: PASS malformed" GUEST_GATE_SETTLE=10
+[[ "$GUEST_ARCH" == x86_64 ]] || GUEST_GATE_SETTLE=30
 
 # One command to the backend's control socket; its one-line answer.
 control() {
@@ -120,11 +125,8 @@ reports() {
 	control "hid script touchscreen" >>"$backend_dir/host.log"
 }
 
-# THE QMP SOCKET `qemu-run.sh` opened for this guest: x86_64's name, or a device-tree target's own.
-qmp_socket="$root/../.build/boot/qemu-qmp.sock"
-if [[ "$GUEST_ARCH" != x86_64 ]]; then
-	qmp_socket="$root/../.build/boot/qemu-qmp-$GUEST_ARCH.sock"
-fi
+# THE QMP SOCKET `qemu-run.sh` opened for this guest, in this gate's own directory (`guest-gate.sh`), on every target.
+qmp_socket="$GUEST_GATE_QMP"
 
 # ONE QMP COMMAND on a connection of its own: `query-status` answers the run state.
 qmp() {

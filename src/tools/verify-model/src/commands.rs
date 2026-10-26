@@ -44,8 +44,8 @@ pub struct Step {
 	// HOW MANY GUESTS THIS STEP STARTS AT ONCE, which is the number `--jobs` is the answer for.
 	//
 	// Zero for everything that boots nothing. A gate that boots one machine after another needs
-	// one slot however many boots it makes. Shared-resource isolation is a separate declaration
-	// (`exclusive_guests`), so a one-slot step is not automatically safe to overlap.
+	// one slot however many boots it makes. What a step shares with others is its declaration
+	// (`resources::step_declaration`), so a one-slot step overlaps only what it does not conflict with.
 	//
 	// It is not zero for a step whose whole subject is OVERLAP. `concurrent-selection` starts two
 	// same-architecture suites at the same time, and the runner counted it as a host gate - so at
@@ -53,8 +53,8 @@ pub struct Step {
 	// The count travels with the step so the scheduler can refuse to start it inside a budget that
 	// cannot hold it, rather than the step deciding for itself.
 	pub guests: usize,
-	// Whole-scenario ownership of shared gadget/lab/image state. This is attached while
-	// lowering the command, before tiers remove already-accounted evidence keys.
+	// WHETHER THE STEP RUNS ALONE, nothing else on the machine beside it (`catalog::ALONE_GATES`): load is what it
+	// conflicts with. Attached while lowering the command, before tiers remove already-accounted evidence keys.
 	pub exclusive_guests: bool,
 }
 
@@ -124,6 +124,52 @@ pub fn order_by_cost(mut pending: Vec<Step>, cost: impl Fn(&Step) -> f64) -> Res
 	let mut completed = BTreeSet::new();
 	while !pending.is_empty() {
 		let next = pending.iter().enumerate().filter(|(_, step)| step.requires.iter().all(|required| completed.contains(required))).min_by(|(_, left), (_, right)| cost(left).partial_cmp(&cost(right)).unwrap_or(std::cmp::Ordering::Equal).then(left.id.cmp(&right.id))).map(|(index, _)| index).expect("validated dependency graph has a ready step");
+		let step = pending.remove(next);
+		completed.insert(step.id.clone());
+		ordered.push(step);
+	}
+	Ok(ordered)
+}
+
+// THE ORDER A RUN CONSIDERS ITS STEPS IN, which serves the wall clock. The steps that need one state of a staging come
+// together - the shipping profile's first, since every build of the run leaves the staging there, then the development
+// profile's, and within each the bootable volume's modes (`rank`, from `Declaration::state_rank`) - so the runner
+// switches each state once. Within that the builds come first, in their order; then the host steps, which run on a lane
+// of their own beside the guests: the host suites first and the cheap before the dear, so their failures come in the
+// first minutes, and a host step never measured after the measured ones; and the guest steps dearest first, so a long
+// one is never the last to start. A step never comes before what it requires.
+//
+// `cost` is a step's price, `None` when it has none.
+pub fn order_for_slots(mut pending: Vec<Step>, cost: impl Fn(&Step) -> Option<f64>, rank: impl Fn(&Step) -> usize) -> Result<Vec<Step>, Vec<String>> {
+	validate(&pending)?;
+	let key = |step: &Step| {
+		let class = if step.id.starts_with("build:") {
+			0u8
+		} else if step.guests == 0 {
+			1
+		} else {
+			2
+		};
+		let (kind, unpriced, seconds) = match (class, cost(step)) {
+			(1, price) => (u8::from(!step.id.starts_with("host:")), u8::from(price.is_none()), price.unwrap_or(0.0)),
+			(2, price) => (0, 0, -price.unwrap_or(0.0)),
+			_ => (0, 0, 0.0),
+		};
+		(rank(step), class, kind, unpriced, seconds)
+	};
+	let mut ordered = Vec::with_capacity(pending.len());
+	let mut completed = BTreeSet::new();
+	while !pending.is_empty() {
+		let next = pending
+			.iter()
+			.enumerate()
+			.filter(|(_, step)| step.requires.iter().all(|required| completed.contains(required)))
+			.min_by(|(_, left), (_, right)| {
+				let (one, two) = (key(left), key(right));
+				(one.0, one.1, one.2, one.3).cmp(&(two.0, two.1, two.2, two.3)).then(one.4.partial_cmp(&two.4).unwrap_or(std::cmp::Ordering::Equal)).then(left.id.cmp(&right.id))
+			})
+			.map(|(index, _)| index)
+			.expect("validated dependency graph has a ready step");
 		let step = pending.remove(next);
 		completed.insert(step.id.clone());
 		ordered.push(step);
@@ -272,7 +318,7 @@ pub fn release_steps(catalog: &crate::catalog::Catalog, registry: &crate::regist
 			}
 			let mut requires: Vec<String> = build_last.get(&variant.architecture).cloned().into_iter().collect();
 			requires.extend(lifecycle.prerequisites.iter().filter_map(|id| producer_ids.get(id).cloned()));
-			steps.push(Step { id: scoped_id("dev", "lifecycle", &[]), requires, label: String::from("development lifecycle (image, boot, readiness, the development checks, teardown)"), command: item(lifecycle, variant).command, keys, note: Some(String::from("one self-contained step owns the development guest: the four development checks run against the instance it brought up and publish their own envelopes")), guests: 1, exclusive_guests: true });
+			steps.push(Step { id: scoped_id("dev", "lifecycle", &[]), requires, label: String::from("development lifecycle (image, boot, readiness, the development checks, teardown)"), command: item(lifecycle, variant).command, keys, note: Some(String::from("one self-contained step owns the development guest: the four development checks run against the instance it brought up and publish their own envelopes")), guests: 1, exclusive_guests: false });
 		}
 	}
 	// The catalog's prerequisite edges - a gate that reads an image requires the step that built
@@ -355,7 +401,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	let booting: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::gate_boots_a_guest(&gate_name(item)) && !crate::catalog::gate_is_profile_row(&gate_name(item)) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1).collect();
 	for item in booting.iter() {
 		let name = gate_name(item);
-		steps.push(Step { id: scoped_id("gate-guest", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate (boots a guest)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("this gate boots a guest of its own: its own step, its own key, its own measured cost and its own guest slot")), guests: 1, exclusive_guests: crate::catalog::EXCLUSIVE_GUEST_GATES.contains(&name.as_str()) });
+		steps.push(Step { id: scoped_id("gate-guest", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate (boots a guest)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("this gate boots a guest of its own: its own step, its own key, its own measured cost and its own guest slot")), guests: 1, exclusive_guests: crate::catalog::ALONE_GATES.contains(&name.as_str()) });
 	}
 	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str()) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1 && !crate::catalog::gate_is_profile_row(&gate_name(item)) && !crate::catalog::gate_boots_a_guest(&gate_name(item))).collect();
 	for item in profile_rows.iter() {
@@ -365,7 +411,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	for item in concurrent.iter() {
 		let name = gate_name(item);
 		let guests = crate::catalog::gate_concurrent_guests(&name);
-		steps.push(Step { id: scoped_id("gate-concurrent", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate ({guests} guests at once)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(format!("this gate's subject is overlap: it starts {guests} guests at the same time, so it needs that many of the runner's slots")), guests, exclusive_guests: crate::catalog::EXCLUSIVE_GUEST_GATES.contains(&name.as_str()) });
+		steps.push(Step { id: scoped_id("gate-concurrent", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate ({guests} guests at once)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(format!("this gate's subject is overlap: it starts {guests} guests at the same time, so it needs that many of the runner's slots")), guests, exclusive_guests: crate::catalog::ALONE_GATES.contains(&name.as_str()) });
 	}
 	// ONE STEP PER GATE, BECAUSE ONE GATE IS ONE SEPARATELY SCHEDULABLE UNIT (corrected 2026-09-03).
 	//
@@ -381,7 +427,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	// what was left was the assumption that the cheap ones are too cheap to be worth an id.
 	for item in before_guest.iter() {
 		let name = gate_name(item);
-		steps.push(Step { id: scoped_id("gate", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: None, guests: 0, exclusive_guests: false });
+		steps.push(Step { id: scoped_id("gate", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: None, guests: 0, exclusive_guests: crate::catalog::ALONE_GATES.contains(&name.as_str()) });
 	}
 	let gates_after_guest: Vec<&crate::plan::PlanItem> = after_guest;
 	let conformance_items: Vec<&crate::plan::PlanItem> = items.iter().filter(|item| item.kind == CheckKind::Conformance).collect();
@@ -456,7 +502,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	let mut previous_dev: Option<String> = None;
 	for item in items.iter().filter(|item| item.kind == CheckKind::DevCheck) {
 		let id = scoped_id("dev", &item.key.check, &[]);
-		steps.push(Step { id: id.clone(), requires: previous_dev.into_iter().collect(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 1, exclusive_guests: true });
+		steps.push(Step { id: id.clone(), requires: previous_dev.into_iter().collect(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 1, exclusive_guests: false });
 		previous_dev = Some(id);
 	}
 

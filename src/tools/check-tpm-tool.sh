@@ -52,8 +52,13 @@ esac
 command -v swtpm >/dev/null || fail "swtpm is not installed - setup.sh installs it, and this gate fails rather than skips without it"
 command -v openssl >/dev/null || fail "openssl is not installed"
 
-log="$repo/.build/boot/cold-$arch.log"
 work="$(mktemp -d "${TMPDIR:-/tmp}/liber-tpm-tool.XXXXXX")"
+# THE COLD RUN'S STATE IS THIS GATE'S: `lab.sh scenario-cold` keeps its sockets, its serial log and its scenario
+# record in the directory `LIBER_DEV_STATE` names, so a second cold run of the same target beside this one drives
+# and reads a guest of its own.
+export LIBER_DEV_STATE="$work/cold"
+mkdir -p "$LIBER_DEV_STATE"
+log="$LIBER_DEV_STATE/cold-$arch.log"
 tpm_pid=""
 cleanup() {
 	if [[ -n "$tpm_pid" ]]; then

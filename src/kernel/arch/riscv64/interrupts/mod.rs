@@ -212,6 +212,13 @@ fn bind_wired_inner(line: &abi::WiredLine, inactive: bool) -> Result<(Arc<Interr
 		// SAFETY: as above.
 		unsafe { super::aplic::unmask_source(base, source, true) };
 	}
+	// THE CONSOLE'S LINE, NOW ITS CLAIM'S, UNDER ANOTHER IDENTITY. The boot tail said which identity typed input
+	// raises - `WIRED_EID` - and a claim that took the UART arms the same source to an identity of its own window,
+	// which is the one an idle core's record counts the console's wakes under from here on. Said, so a reader
+	// counting them counts the identity that is raised and not the one that was.
+	if source == super::serial::console_source() {
+		crate::serial_println!("console: typed input raises interrupt {eid} now, through the claim that holds the UART");
+	}
 	Ok((intr, previous_target))
 }
 

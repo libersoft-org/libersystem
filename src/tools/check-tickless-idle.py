@@ -46,6 +46,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -77,6 +78,9 @@ COUNTER = re.compile(r'count (\d+) mono-ms (\d+) boot-ms (\d+)')
 PARKED = re.compile(r'cpu(\d+): woke (\d+) time\(s\) for the timer, (\d+) for an IPI, (\d+) for a device')
 
 ARMED = re.compile(rb'console: typed input raises interrupt (\d+)')
+# WHO HOLDS THE LINE NOW: a claim that took the UART and armed its source to an identity of its own (riscv64 says so),
+# or the kernel again, once the UART was handed back.
+HOLDER = re.compile(rb"console: typed input raises interrupt (\d+) now, through the claim that holds the UART|console: [^\r\n]* is the kernel's again")
 POLLED = re.compile(rb'console: typed input is polled - ([^\r\n]*)')
 # THE ROW'S WAKE FIELDS, which come first: the processor-power fields that follow them are not this gate's.
 CORE_ROW = re.compile(r'\{cpu=(\d+), idle-ns=(\d+), halts=(\d+), wakes-timer=(\d+), wakes-ipi=(\d+), wakes-housekeeping=(\d+), wakes-device=(\d+), sources=\[([^\]]*)\][,}]')
@@ -382,6 +386,17 @@ def wakes_on(rows, identity):
 	return sum(row['sources'].get(identity, 0) for row in rows.values())
 
 
+# THE IDENTITY TYPED INPUT RAISES NOW, which is not always the one the boot armed (corrected 2026-10-26). On riscv64
+# a claim that takes the console UART arms its APLIC source to an identity of the claim's own window, and every typed
+# byte from then on wakes the machine under that identity - so counting the boot's identity found none of them, and
+# the gate failed on a kernel that did exactly what it should. The last holder the console named is the line's.
+def console_identity(log, armed):
+	identity = armed
+	for event in HOLDER.finditer(log):
+		identity = int(event.group(1)) if event.group(1) else armed
+	return identity
+
+
 def woke(row):
 	return row['timer'] + row['ipi'] + row['housekeeping'] + row['device']
 
@@ -417,10 +432,39 @@ def qmp(path, command, arguments, timeout):
 	conn.close()
 
 
+# EVERY TARGET A GATE BOOTS IS ASKED BEFORE THE FIRST BOOT, under the runner: one whose staging is not current in the
+# development profile refuses the whole step with the commands that make all of them current (`staging-state.sh`),
+# which the runner runs before it runs the step again - so this gate builds nothing and only reads, as a cold run.
+def refuse_unless_current(gate, targets):
+	if os.environ.get('LIBER_STAGING_RUNNER') != '1':
+		return
+	env = dict(os.environ, LIBER_DEVELOPMENT='1')
+	stale = [line for target in targets for line in lab.staging_not_current(target, env)]
+	if stale:
+		for line in stale:
+			print(f'{gate}: REFUSED: {line}', file=sys.stderr, flush=True)
+		sys.exit(lab.STATE_REFUSED)
+
+
+# A RUN-PRIVATE STATE DIRECTORY for one guest, where the runner binds its channel, monitor and QMP sockets: under
+# the cold names a guest of this gate and a cold run of the same target took one set of sockets between them.
+def guest_state(name):
+	state = os.path.join(lab.BUILD_ROOT, 'tmp', f'{name}.{os.getpid()}')
+	os.makedirs(state, exist_ok=True)
+	return state
+
+
 def build(target):
 	# THE DEVELOPMENT PROFILE, and the ordinary strip: `STRIP=none` re-stages every library unstripped over
 	# a tree whose consumers recorded the stripped ones, and the build then refuses the mix.
 	env = dict(os.environ, LIBER_DEVELOPMENT='1')
+	# NOTHING IS BUILT WHEN WHAT THE GUEST BOOTS IS CURRENT, as for a cold run (`lab.staging_not_current`).
+	stale = lab.staging_not_current(target, env)
+	if not stale:
+		note(f'the {target} staging is current in the development profile; nothing is built')
+		return
+	for line in stale:
+		note(line)
 	note(f'building {target} with the development profile')
 	if subprocess.run(lab.build_command(target), cwd=SRC, env=env).returncode != 0:
 		raise GateError(f'the {target} system did not build')
@@ -435,7 +479,8 @@ def build(target):
 def drive(target):
 	scale = 1.0 if target == 'x86_64' else 10.0
 	serial_path = os.path.join(lab.BUILD, f'tickless-serial-{target}.sock')
-	qmp_path = os.path.join(lab.BUILD, f'qemu-qmp-cold-{target}.sock')
+	state = guest_state(f'tickless-{target}')
+	qmp_path = os.path.join(state, 'qemu-qmp.sock')
 	log_path = os.path.join(lab.BUILD, f'tickless-{target}.log')
 	runner_log = open(os.path.join(lab.BUILD, f'tickless-{target}-runner.log'), 'wb')
 	kernel = os.path.join(lab.BUILD_ROOT, 'cargo', 'kernel', TRIPLES[target], 'debug', 'kernel')
@@ -443,7 +488,9 @@ def drive(target):
 		os.unlink(serial_path)
 	# THE COLD SCENARIO RUNNER'S GUEST, with the serial line on a socket this gate holds rather than in a
 	# file: `server` without `nowait`, so QEMU waits for the connection and no boot byte is lost.
-	env = dict(os.environ, LIBER_DEVELOPMENT='1', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{serial_path},server', SMP=os.environ.get('SMP', '4'), LIBER_RUN_MODE='development')
+	env = dict(os.environ, LIBER_DEVELOPMENT='1', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{serial_path},server', SMP=os.environ.get('SMP', '4'), LIBER_RUN_MODE='development', LIBER_DEV_STATE=state)
+	if target == 'x86_64':
+		env['HOSTFWD_PORT'] = os.environ.get('HOSTFWD_PORT') or lab.free_port()
 	if target != 'x86_64':
 		env['UEFI'] = '1'
 		env['IDLE_FIXTURE'] = '1'
@@ -476,6 +523,7 @@ def drive(target):
 				pass
 			guest.wait()
 		runner_log.close()
+		shutil.rmtree(state, ignore_errors=True)
 
 
 def check(target, serial, qmp_path, scale):
@@ -502,6 +550,10 @@ def check(target, serial, qmp_path, scale):
 		note(f'{target}: every core installed the tree\'s {len(TREE_LATENCIES)} idle states, the one that loses the context held out')
 	# AN IDLE MACHINE, which is the claim: the boot's own output has stopped before anything is typed.
 	serial.settle(2.0 * scale, 120 * scale)
+	held = console_identity(bytes(serial.data), identity)
+	if held != identity:
+		note(f'{target}: the console UART was handed to its driver, whose claim raises interrupt {held} where the boot armed {identity}')
+		identity = held
 	# THE CONTROL: two reads with nothing typed between them but the second `graph`. Typing that command is
 	# typing too, and its own wakes are in every later read - so they are measured here and taken off.
 	first = cores(serial, 60 * scale)
@@ -591,6 +643,8 @@ def main():
 		if target not in TARGETS:
 			print(f'check-tickless-idle: unknown target {target!r}', file=sys.stderr)
 			return 2
+	if not skip_build:
+		refuse_unless_current('check-tickless-idle', targets)
 	failed = []
 	for target in targets:
 		try:

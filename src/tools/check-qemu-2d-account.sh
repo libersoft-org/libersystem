@@ -85,7 +85,9 @@ EOF
 	# THE CONDITIONS ARE PART OF EVERY NUMBER, the port rows' as the x86_64 ones: captured while the guest runs, off its
 	# own QEMU - the boot ESP and kernel the cold runner staged for it, the kernel cargo built, the manifest-selected
 	# artifacts, the running system volume, QEMU and the host CPU.
-	env -u GPU_SIZE LIBER_BOOT_PROFILE=development-trace "$REPO_ROOT/lab.sh" scenario-cold --serial-broker "$ARCH" "$RESULTS/scaled-$ARCH.toml" >"$RESULTS/boot-$ARCH.log" 2>&1 &
+	# THE COLD RUN'S STATE IS THIS GATE'S (`LIBER_DEV_STATE`), and its serial log is read from there.
+	cold_state="$(mktemp -d "${TMPDIR:-/tmp}/liber-2d-account.XXXXXX")"
+	env -u GPU_SIZE LIBER_BOOT_PROFILE=development-trace LIBER_DEV_STATE="$cold_state" "$REPO_ROOT/lab.sh" scenario-cold --serial-broker "$ARCH" "$RESULTS/scaled-$ARCH.toml" >"$RESULTS/boot-$ARCH.log" 2>&1 &
 	cold=$!
 	# A PROCESS'S COMM IS ITS NAME CUT TO FIFTEEN CHARACTERS - `qemu-system-aar`, `qemu-system-ris` - so it is matched
 	# whole against the name cut the same way; the whole name never appears there.
@@ -107,7 +109,8 @@ EOF
 		die "the $ARCH run's conditions could not be captured - see $RESULTS/conditions-$ARCH.log"
 	}
 	wait "$cold" || die "the $ARCH scaled run failed - see $RESULTS/boot-$ARCH.log"
-	cp "$BUILD_DIR/boot/cold-$ARCH.log" "$RESULTS/serial-$ARCH.log"
+	cp "$cold_state/cold-$ARCH.log" "$RESULTS/serial-$ARCH.log"
+	rm -rf "$cold_state"
 	# Both port entry points attach this buffer only under development-trace; the profile banner is
 	# x86-only. The collector below also requires the anchor, complete drain and matching armed report.
 	grep -a -F -q "perf: frame-account buffer attached - 262144 records of 32 bytes" "$RESULTS/serial-$ARCH.log" || die "the $ARCH guest did not attach its development-trace buffer - see $RESULTS/serial-$ARCH.log"

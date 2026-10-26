@@ -121,6 +121,10 @@ def stale_fixtures(target=None):
 	if record.get('target') != target:
 		return [f'{manifest_path} was built for {record.get("target")!r}, not {target!r}']
 	complaints = []
+	# AND BY THIS RECIPE: a cold run builds the set only when this list is not empty, so a changed recipe has to say
+	# so here or its fixtures are never made again.
+	if record.get('recipe') != file_digest(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scenarios', 'make-fixtures.py')):
+		complaints.append('the fixtures were made by another version of make-fixtures.py')
 	for name, digest in sorted((record.get('fixtures') or {}).items()):
 		path = os.path.join(fixtures_dir(target), name)
 		if file_digest(path) != digest:

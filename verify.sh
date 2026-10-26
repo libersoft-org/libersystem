@@ -60,7 +60,7 @@ Commit exactly the tested content, then complete verification with --merge FILE.
   --for-change     everything the working tree says was changed (the default)
   --for PATH       plan for these paths instead of asking git
   --for-range A..B plan for the paths a commit range touched
-  --merge FILE     complete an inner handoff at HEAD; no budget, two guest slots by default
+  --merge FILE     complete an inner handoff at HEAD; no budget, four guest slots by default
   --release        the release run: one sealed snapshot, every release-required key, one dossier
     --out-root DIR   where the run's evidence is published (default .build/runs, outside the snapshot)
     --required FILE  a narrowed required set - a REHEARSAL, and the dossier says so
@@ -73,7 +73,7 @@ Commit exactly the tested content, then complete verification with --merge FILE.
                    candidate's model hash. The run that happens is unchanged and still full; what
                    the candidate changes is which selection the comparison is graded against, which
                    is how a narrowing earns the evidence its activation demands.
-  --jobs N         guest slots (inner default 1, merge default 2; explicit values override either)
+  --jobs N         guest slots (inner default 1, merge and release default 4; explicit values override them)
   --budget N       estimated seconds the inner run may start, including prerequisites
                    work without a current measurement or conservative seed is skipped
   --plan           print the plan and run nothing
@@ -101,12 +101,16 @@ EOF
 }
 
 mode=for-change
-# Inner starts with one guest slot; merge uses two unless the caller supplies --jobs.
+# Inner starts with one guest slot; merge and release use four unless the caller supplies --jobs.
+#
+# FOUR, AND IT GROWS ONLY BY MEASUREMENT: load made three timing assertions fail on 2026-10-20/21, so the width is
+# raised only after five L2 runs in which the flake ledger (`docs/verification/FLAKES.md`) attributes no failure to
+# load, and the gates that measure time or the machine's processes run alone (`catalog::ALONE_GATES`).
 # Writable media and producer acquisitions remain private to each overlapping run.
 #
-# THIS IS THE ONLY SCHEDULER. `--release` and `--sweep` are flat by design - they consult no model
-# and read no plan, because they are what runs when the thing that makes choices is broken - so they
-# take no limiter and run one architecture at a time instead.
+# THIS IS THE ONLY SCHEDULER, and `--release` runs its plan through it. `--sweep` is flat by design - it
+# consults no model and reads no plan, because it is what runs when the thing that makes choices is
+# broken - so it takes no limiter and runs one architecture at a time instead.
 JOBS=1
 JOBS_EXPLICIT=0
 merge_file=""
@@ -258,7 +262,11 @@ done
 if [[ -n "$merge_file" ]]; then
 	[[ "$mode" == merge && -z "$paths" && -z "$range" ]] || die "--merge cannot be combined with another change or flat mode"
 	[[ "$action" == run && ${#candidate_arg[@]} == 0 ]] || die "--merge completes its handoff; display and shadow modes are separate entry points"
-	((JOBS_EXPLICIT == 1)) || JOBS=2
+	((JOBS_EXPLICIT == 1)) || JOBS=4
+fi
+# The release - L2 in place, L3 sealed - runs the release plan through the same scheduler, at the same width.
+if [[ "$mode" == release ]]; then
+	((JOBS_EXPLICIT == 1)) || JOBS=4
 fi
 
 # The canonical FULL path: build everything, check everything, boot every target.
@@ -379,6 +387,10 @@ release_prepare() {
 	fi
 	export LIBER_VERIFY_RUN="$release_run_dir"
 	export LIBER_RELEASE_REQUIRED="${release_required_file:-$release_snapshot/src/tools/verify-model/model/release-required.toml}"
+	# THE HISTORY IS THE TREE'S, read and written there: a sealed release recorded its steps' prices into the snapshot
+	# it deletes, so the next run started unpriced and sorted the cheap host suites last. Prices order and admit work;
+	# they are no evidence, so a release reading the tree's changes nothing it proves.
+	export LIBER_VERIFY_HISTORY="$release_main_root/.build/state/verify-history.json"
 	# THE EXECUTOR'S HOME IS THE SNAPSHOT from here on: every step, every producer, every model query.
 	cd "$release_snapshot"
 	REPO_ROOT="$release_snapshot"
@@ -412,10 +424,21 @@ case "$action" in
 run | shadow) logs_run_begin ;;
 esac
 
+# A RELEASE THAT ONLY ANSWERS A QUESTION BUILDS NOTHING (corrected 2026-10-26). The snapshot, the run and
+# its identity are what the release RUN needs, and `--plan`, `--catalog`, `--age`, `--trust` and
+# `--model-hash` made and sealed a worktree of the revision to print an answer - and `--plan` then
+# stopped on `changed: unbound variable`, because a release reads no change set. They are answered from
+# the tree's own model.
+release_answers=0
 if [[ "$mode" == release ]]; then
+	case "$action" in
+	plan | json | catalog | model-hash | age | trust) release_answers=1 ;;
+	esac
+fi
+if [[ "$mode" == release && "$release_answers" == 0 ]]; then
 	note "release: every optimisation in this script is ignored"
 	release_prepare
-elif [[ -n "$release_out_root" || -n "$release_required_file" || "$release_in_place" == 1 ]]; then
+elif [[ "$mode" != release && (-n "$release_out_root" || -n "$release_required_file" || "$release_in_place" == 1) ]]; then
 	die "--out-root, --required and --in-place belong to --release"
 fi
 
@@ -482,6 +505,10 @@ merge)
 	# The tier model reads the pinned commit delta after validating the handoff.
 	changed=""
 	;;
+release)
+	# A RELEASE READS NO CHANGE SET: its plan is every release-required key at its revision.
+	changed=""
+	;;
 for-change)
 	# A PREPARED PLAN IS ABOUT THE EXECUTOR AND NOT ABOUT THE TREE (2026-09-03).
 	#
@@ -504,7 +531,7 @@ for-range)
 	[[ -n "$changed" ]] || die "--for-range: '$range' touched no files (or is not a range git knows)"
 	;;
 esac
-note "$(printf '%s\n' "$changed" | wc -l) changed path(s)"
+[[ "$mode" == release ]] || note "$(printf '%s\n' "$changed" | wc -l) changed path(s)"
 
 # The display modes go through the same boundary as the run.
 #
@@ -518,7 +545,17 @@ if [[ "$action" == json || "$action" == plan ]]; then
 		rm -f "$rendered"
 	}
 	register_run_cleanup remove_rendered
-	if [[ "$action" == json ]]; then
+	if [[ "$mode" == release ]]; then
+		# THE PLAN THE RELEASE RUN WOULD EXECUTE, in the executor's own format - narrowed, as the run
+		# would be, by `--required`.
+		[[ "$action" == plan ]] || die "the release plan has no JSON form: --release --plan prints it in the executor's own format"
+		release_plan_args=()
+		if [[ -n "$release_required_file" ]]; then
+			[[ "$release_required_file" == /* ]] || release_required_file="$PWD/$release_required_file"
+			release_plan_args=(--required "$release_required_file")
+		fi
+		cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- release-plan "${release_plan_args[@]}" >"$rendered" || planner_failed "the release plan could not be produced"
+	elif [[ "$action" == json ]]; then
 		printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- plan --stdin --json >"$rendered" || planner_failed "the planner exited non-zero"
 	else
 		printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- plan --stdin "${planner_flags[@]}" >"$rendered" || planner_failed "the planner exited non-zero"
@@ -965,6 +1002,11 @@ step_unpriced=()
 # declares the count, this reserves it, and a `--jobs` that cannot hold it does not run the step.
 step_guests=()
 step_exclusive=()
+# WHAT A STEP USES, as the plan declares it: `RESOURCE=ACCESS:STATE` tokens (`verify-model`'s `resources`), ACCESS `r`,
+# `w` or `x` - one holder at a time - and STATE what a staging or a bootable volume has to be in for it. Two steps whose
+# tokens conflict never run at once, and a step whose staging is in another state waits until nothing uses it and has
+# it brought about. A step that declares nothing uses nothing this runner knows of.
+step_uses=()
 while IFS=$'\t' read -r marker index rest; do
 	case "$marker" in
 	STEPID) step_ids[$index]="$rest" ;;
@@ -973,6 +1015,7 @@ while IFS=$'\t' read -r marker index rest; do
 	STEPUNPRICED) step_unpriced[$index]=1 ;;
 	STEPGUESTS) step_guests[$index]="$rest" ;;
 	STEPEXCLUSIVE) step_exclusive[$index]="$rest" ;;
+	STEPUSES) step_uses[$index]="$rest" ;;
 	esac
 done <"$steps_file"
 for i in "${!step_ids[@]}"; do
@@ -982,6 +1025,7 @@ for i in "${!step_ids[@]}"; do
 	step_guests[$i]="${step_guests[$i]:-0}"
 	step_exclusive[$i]="${step_exclusive[$i]:-0}"
 	[[ "${step_exclusive[$i]}" == 0 || "${step_exclusive[$i]}" == 1 ]] || die "step $i has an invalid exclusive-guest declaration: ${step_exclusive[$i]}"
+	step_uses[$i]="${step_uses[$i]:-}"
 done
 
 BUDGET_TOTAL=0
@@ -996,6 +1040,13 @@ fi
 
 failed=()
 skipped=()
+# THE RUNNER OWNS THE STAGING'S STATE WHILE IT RUNS (`staging-state.sh`), and says so to every step: a
+# step that switches into the development profile leaves it there (`guest-gate.sh` puts it back only
+# when it is run by hand), a step that needs another state refuses and is run again once that state is
+# brought about, and the run ends with the staging it changed put back, once.
+export LIBER_STAGING_RUNNER=1
+declare -A state_retried=() step_commands=()
+state_queue=()
 # STEPS WHOSE PREREQUISITE FAILED, and the ids of the steps that failed.
 #
 # `step_reqs` was read only while computing a budget closure; the execution loop never looked at it.
@@ -1018,8 +1069,38 @@ declare -A failed_ids=()
 declare -A blocked_ids=()
 blocked=()
 step=0
-guest_pids=()
-guest_labels=()
+
+# THE STAGING'S STATE IN ONE STRING: the profile of every part of every target, and the bootable
+# volume's DMA mode - what a run compares at its end against its start.
+staging_fingerprint() {
+	local record
+	for record in "$BUILD_DIR"/state/built-*.profile "$BUILD_DIR"/boot/system-volume-bootable-*.dma-mode; do
+		[[ -f "$record" ]] && printf '%s=%s\n' "${record##*/}" "$(<"$record")"
+	done
+	return 0
+}
+
+# PUT BACK ONCE, WHEN THE RUN ENDS, what the run changed: every target a step left in another profile
+# goes back to the shipping one, and the x86_64 bootable volume is signed `enforcing-required` again.
+# A run that changed nothing leaves the staging as it found it, and a sealed snapshot's staging goes
+# with the snapshot.
+restore_staging() {
+	[[ -z "$release_snapshot" || "$release_snapshot" == "$release_main_root" ]] || return 0
+	[[ "$(staging_fingerprint)" != "$staging_at_start" ]] || return 0
+	local arch command
+	for arch in "${ARCHS_ALL[@]}"; do
+		grep -qvx shipping "$BUILD_DIR"/state/built-"$arch"-*.profile 2>/dev/null || continue
+		command="$(staging_build_command "$arch" shipping)"
+		note "staging: the run left the $arch staging in another profile; putting it back:  $command"
+		run_owned_shell "$command" || note "staging: the $arch staging could not be put back - run:  $command"
+	done
+	# THE VOLUME BY ITS PROFILE AND ITS MODE: a cold run leaves it `enforcing-required` in the development profile.
+	if [[ -f "$BUILD_DIR/boot/system-volume-bootable-x86_64.img" && "$(volume_state_of "$BUILD_DIR" x86_64)" != shipping/enforcing-required ]]; then
+		command="env -u LIBER_DEVELOPMENT ./build.sh --arch x86_64 --kernel-on-volume --dma-mode enforcing-required --part volume"
+		note "staging: the run left the x86_64 bootable volume in another state; building it again:  $command"
+		run_owned_shell "$command" || note "staging: the bootable volume could not be signed again - run:  $command"
+	fi
+}
 
 # ONE COMMAND, RUN AND RECORDED. Split out of the loop so it can be called in the foreground or in a
 # background job without the two drifting apart.
@@ -1035,11 +1116,11 @@ run_one_step() {
 		# publish its own. `pipefail` makes the pipeline's status the step's.
 		# Owned and waited for, so a signal to the executor stops the step it started rather than
 		# being answered when that step finishes on its own.
-		if ! run_owned_shell 'eval "$command" 2>&1 | tee "$LIBER_VERIFY_RUN/logs/.step-$index.log"'; then
-			status=1
-		fi
-	elif ! run_owned_shell 'eval "$command"'; then
-		status=1
+		# THE STEP'S OWN STATUS, not a flattened 1: a refusal (`STATE_REFUSED`) is told apart from a
+		# failure by it.
+		LIBER_STATE_REFUSAL="$outfile.refusal" run_owned_shell 'eval "$command" 2>&1 | tee "$LIBER_VERIFY_RUN/logs/.step-$index.log"' || status=$?
+	else
+		LIBER_STATE_REFUSAL="$outfile.refusal" run_owned_shell 'eval "$command"' || status=$?
 	fi
 	elapsed=$((SECONDS - started))
 	# The clock has whole-second resolution. Round an observed successful sub-second run up,
@@ -1061,6 +1142,28 @@ run_one_step() {
 record_one_step() {
 	local index="$1" label="$2" outfile="$3" status seconds outcome keys_file
 	IFS=$'\t' read -r status seconds <"$outfile"
+	# A REFUSED STEP RAN NOTHING (`staging-state.sh`): what it boots was not in the state it needs, and
+	# it said so before it tested anything. So it publishes no envelope and records no history - its
+	# outcome is that of its next run, in the state it needs. The first refusal of a step that named
+	# its fix is run again once that state is brought about - when nothing else runs, since other steps
+	# may still be booting the staging the fix rebuilds; a second refusal, or one with no fix, is a failure.
+	if [[ "$status" == "$STATE_REFUSED" ]]; then
+		if [[ -z "${state_retried[$index]:-}" && -s "$outfile.refusal" ]]; then
+			if [[ "${4:-}" == background ]]; then
+				state_queue+=("$index"$'\t'"$label"$'\t'"$outfile")
+			else
+				retry_refused_step "$index" "$label" "$outfile"
+			fi
+			return 0
+		fi
+		note "REFUSED: $label - it needs another state of the staging, named above; nothing is recorded for it"
+		failed+=("$label (refused)")
+		failed_ids["${step_ids[$index]:-}"]=1
+		[[ -z "${LIBER_VERIFY_RUN:-}" ]] || rm -f "$LIBER_VERIFY_RUN/logs/.step-$index.log"
+		rm -f "$outfile" "$outfile.refusal"
+		return 0
+	fi
+	rm -f "$outfile.refusal"
 	outcome=--passed
 	if [[ "$status" != 0 ]]; then
 		# Every step is run and every failure is reported, rather than stopping at the first.
@@ -1081,7 +1184,7 @@ record_one_step() {
 			# The handoff's evidence is recorded before the best-effort mutable history.
 			awk -v outcome="${outcome#--}" '{ print outcome "\t" $0 }' "$keys_file" >>"$tier_outcomes"
 		fi
-		(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- record --step-id "${step_ids[$index]:-}" --keys-file "$keys_file" "$outcome" --seconds "$seconds") || note "        (the run happened; recording it did not)"
+		(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- record --step-id "${step_ids[$index]:-}" --command "${step_commands[$index]:-}" --keys-file "$keys_file" "$outcome" --seconds "$seconds") || note "        (the run happened; recording it did not)"
 	fi
 	rm -f "$keys_file" "$outfile"
 }
@@ -1104,128 +1207,81 @@ release_publish_fallback() {
 	rm -f "$step_log"
 }
 
-# Wait for every guest in flight and record each one. A BARRIER, and everything that is not a guest
-# step is behind one: `--jobs` answers "how many QEMUs may run", and the answer has to be the same
-# number wherever it is asked.
-drain_guests() {
-	local i
-	for i in "${!guest_pids[@]}"; do
-		wait "${guest_pids[$i]}" || true
-		record_one_step "${guest_indexes[$i]}" "${guest_labels[$i]}" "${guest_outfiles[$i]}"
-	done
-	guest_pids=()
-	guest_labels=()
-	guest_indexes=()
-	guest_outfiles=()
-	guest_wants=()
-}
-
-# HOW MANY GUESTS THE BACKGROUNDED STEPS ARE HOLDING BETWEEN THEM.
+# THE STATE A REFUSED STEP NEEDS, BROUGHT ABOUT, AND THE STEP RUN AGAIN - ONCE (`staging-state.sh`).
 #
-# The capacity loop below counted ARRAY ENTRIES - one per background process - which is the same
-# number only while every step wants exactly one guest. `concurrent-selection` wants two and occupies
-# one entry, so under `--jobs 2` it left the count reading 1 and the next one-guest profile started
-# beside it: three guests on a machine whose one answer was two. The step-level refusal above catches
-# a step that cannot fit ALONE and says nothing about what is already running.
-guests_in_flight() {
-	local total=0 want
-	for want in "${guest_wants[@]}"; do
-		total=$((total + want))
-	done
-	echo "$total"
-}
-guest_indexes=()
-guest_outfiles=()
-guest_wants=()
-
-# The plan is read on fd 3, not on stdin.
-#
-# On stdin the first step that reads anything - and `./test.sh` boots QEMU, which does - swallows
-# the rest of the plan, and the run ends early reporting success over the steps it never took. That
-# is a false green produced by the runner itself, which is the one place this milestone cannot
-# afford one. A backgrounded guest gets fd 3 CLOSED for the same reason, from the other side.
-while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
-	[[ "$marker" == STEP ]] || continue
-	step=$((step + 1))
-	# EVERY SKIPPED STEP IS PRINTED. A selector that quietly trims its own scope is the defect
-	# P02M0156 is named after, and a budget is that defect with a flag on it unless it says what it
-	# did not run.
-	if ((BUDGET_SET == 1)) && [[ " $affordable " != *" $index "* ]]; then
-		note "[$step/$count] SKIPPED (budget): $label - $keys key(s)"
-		[[ "${step_unpriced[$index]}" == 1 ]] && note "        unpriced: no current measurement or conservative seed; an unbudgeted run can measure it"
-		skipped+=("$label")
-		continue
-	fi
-	# Capacity and isolation are separate. The model declares actual guest slots plus a barrier
-	# for shared gadget/lab/image scenarios; isolated suites and profiles can still overlap.
-	# Do not turn this into prerequisite edges: one failed gadget gate must not suppress an
-	# unrelated gate merely because both need exclusive access to the same host resources.
-	wants_guests="${step_guests[$index]:-0}"
-	exclusive_guest="${step_exclusive[$index]:-0}"
-	is_guest=0
-	((wants_guests >= 1)) && is_guest=1
-	# THE BARRIER COMES BEFORE THE BLOCKER CHECK, AND THAT ORDER IS WHAT MAKES THE CHECK SOUND.
-	#
-	# It used to come after, and under `--jobs > 1` that made prerequisite suppression unsound for
-	# every parallel guest. A guest step is BACKGROUNDED, and its verdict enters `failed_ids` only
-	# when `record_one_step` runs behind this barrier - so the following non-guest step evaluated its
-	# blockers against a guest nothing had waited for, saw no failure, and ran against a log the
-	# failed guest never wrote. The emitted plan has exactly that edge: the `gate-after-guest` step
-	# requires every guest step, and its whole reason to exist is that it reads what a guest run
-	# produced. Draining first costs nothing - a non-guest step is behind this barrier either way -
-	# and it is the only point at which "did my prerequisite fail" has an answer.
-	#
-	# A GUEST WHOSE OWN PREREQUISITE IS STILL IN FLIGHT waits too. The emitted plan has no guest that
-	# requires another guest today, so this is the rule rather than the current shape of the graph:
-	# a check that is only correct for the edges the planner happens to emit is a check that breaks
-	# silently when it emits one more.
-	if ((is_guest == 0 || exclusive_guest == 1)); then
-		drain_guests
-	else
-		for req in ${step_reqs[$index]}; do
-			for at in "${!guest_indexes[@]}"; do
-				if [[ "${step_ids[${guest_indexes[$at]}]:-}" == "$req" ]]; then
-					drain_guests
-					break 2
-				fi
-			done
-		done
-	fi
-	# A STEP WHOSE PREREQUISITE FAILED IS NOT RUN. Its result could only be the prerequisite's
-	# failure a second time, in a form that names the wrong thing.
-	blockers=""
-	for req in ${step_reqs[$index]}; do
-		if [[ -n "${failed_ids[$req]:-}" || -n "${blocked_ids[$req]:-}" ]]; then
-			blockers+=" $req"
+# The staging is switched when a step needs another state, not put back after every step that used
+# it: a step that switches into the development profile leaves it there, and the next one that needs
+# the shipping profile - or another DMA mode on the bootable volume - refuses, naming the commands that
+# fix it. They are run here, with nothing else running, and the step's second run is its outcome.
+# Until the catalog's steps declare what they read, the refusal is the declaration.
+retry_refused_step() {
+	local index="$1" label="$2" outfile="$3" fix fixed=1
+	state_retried[$index]=1
+	note "REFUSED: $label - bringing the staging to the state it needs, then running it once more"
+	while IFS= read -r fix; do
+		[[ -n "$fix" ]] || continue
+		note "        $fix"
+		if ! run_owned_shell "$fix"; then
+			fixed=0
+			break
 		fi
+	done < <(awk '!seen[$0]++' "$outfile.refusal")
+	rm -f "$outfile.refusal"
+	if ((fixed == 0)); then
+		note "        the state it needs could not be brought about"
+		printf '%s\t0\n' "$STATE_REFUSED" >"$outfile"
+	else
+		run_one_step "$index" "$label" "${step_commands[$index]}" "$outfile"
+	fi
+	record_one_step "$index" "$label" "$outfile"
+}
+
+# WHETHER TWO STEPS' DECLARATIONS CONFLICT: a resource both use, written or held by either, or needed by both in two
+# states - a staging is in one profile at a time, and a bootable volume is signed for one mode.
+uses_conflict() {
+	local mine theirs
+	for mine in $1; do
+		for theirs in $2; do
+			[[ "${mine%%=*}" == "${theirs%%=*}" ]] || continue
+			[[ "${mine#*=}" == r:* && "${mine#*=}" == "${theirs#*=}" ]] || return 0
+		done
 	done
-	if [[ -n "$blockers" ]]; then
-		note "[$step/$count] BLOCKED: $label - ${blockers# } did not produce what this step reads"
-		blocked+=("$label")
-		# THIS STEP IS NOW A BLOCKER ITSELF. Without this line the suppression stops one level down
-		# and a grandchild runs against an output nothing produced.
-		blocked_ids["${step_ids[$index]:-}"]=1
-		continue
-	fi
-	# A STEP THAT STARTS SEVERAL GUESTS AT ONCE TAKES THAT MANY SLOTS, AND IS NOT RUN WITHOUT THEM.
-	#
-	# It is behind the barrier above, so nothing else is running when it starts - but a barrier is
-	# not a budget. `concurrent-selection` starts two x86_64 suites simultaneously, and under
-	# `--jobs 1` that put two QEMUs on a machine whose one answer was one: an inner scheduler with a
-	# hardcoded width, which is exactly what this runner exists to be the only one of. Refused rather
-	# than trimmed, because a gate about overlap that runs one guest proves nothing and would report
-	# a pass for it. INCOMPLETE is the honest outcome and never reads as green.
-	if ((wants_guests > JOBS)); then
-		note "[$step/$count] SKIPPED (budget): $label - it starts $wants_guests guests at once and --jobs is $JOBS; run it with --jobs $wants_guests or more"
-		skipped+=("$label")
-		continue
-	fi
+	return 1
+}
+
+# THE STATE A STAGING OR A BOOTABLE VOLUME IS IN NOW, as a token names it - a staging's profile, a volume's
+# `PROFILE/MODE` - from the records the builds keep beside them (`staging-state.sh`); and the command that brings it
+# to another.
+resource_state() {
+	case "$1" in
+	stage:*) staging_profile_of "$BUILD_DIR" "${1#stage:}" ;;
+	volume:*) volume_state_of "$BUILD_DIR" "${1#volume:}" ;;
+	esac
+}
+resource_command() {
+	case "$1" in
+	stage:*) staging_build_command "${1#stage:}" "$2" ;;
+	volume:*) echo "$(profile_env "${2%%/*}") ./build.sh --arch ${1#volume:} --kernel-on-volume --dma-mode ${2#*/} --part volume" ;;
+	esac
+}
+
+# THE STEPS IN FLIGHT, and what they hold: the guest slots they take between them, the one host lane, and whether one
+# that runs alone is among them.
+running=()
+declare -A run_pid=() run_out=() decided=()
+guests_running=0
+host_busy=0
+alone_running=0
+
+start_step() {
+	local index="$1" command="${step_commands[$1]}" outfile
+	step=$((step + 1))
 	# AND THE STEP IS TOLD WHAT IT MAY START, so it refuses rather than exceeding a number it was
 	# never given. The runner cannot see inside a gate; the gate can be told the answer.
 	export LIBER_CONCURRENT_GUESTS="$JOBS"
 	echo
-	note "[$step/$count] $label - $keys key(s)"
-	[[ -n "$note_text" ]] && note "        $note_text"
+	note "[$step/$count] ${step_label[$index]} - ${step_keys[$index]} key(s)"
+	[[ -n "${step_note[$index]}" ]] && note "        ${step_note[$index]}"
 	# A selection of two hundred ids is a nine-kilobyte command line, and printing it whole buries
 	# the run it belongs to. The command that RUNS is untouched; only the echo is shortened.
 	if ((${#command} > 200)); then
@@ -1234,31 +1290,248 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 		note "        $command"
 	fi
 	outfile="$(mktemp)"
-	if ((is_guest == 1 && JOBS > 1 && exclusive_guest == 0)); then
-		# ROOM FOR WHAT THIS STEP WANTS, NOT ROOM FOR ONE MORE PROCESS. See `guests_in_flight`: a
-		# step declaring two slots must wait until two are free, and a one-slot step must not start
-		# beside it just because the array holds a single entry.
-		while (($(guests_in_flight) + wants_guests > JOBS)); do
-			wait "${guest_pids[0]}" || true
-			record_one_step "${guest_indexes[0]}" "${guest_labels[0]}" "${guest_outfiles[0]}"
-			guest_pids=("${guest_pids[@]:1}")
-			guest_labels=("${guest_labels[@]:1}")
-			guest_indexes=("${guest_indexes[@]:1}")
-			guest_outfiles=("${guest_outfiles[@]:1}")
-			guest_wants=("${guest_wants[@]:1}")
-		done
-		run_one_step "$index" "$label" "$command" "$outfile" 3<&- &
-		guest_pids+=("$!")
-		guest_labels+=("$label")
-		guest_indexes+=("$index")
-		guest_outfiles+=("$outfile")
-		guest_wants+=("$wants_guests")
+	run_one_step "$index" "${step_label[$index]}" "$command" "$outfile" &
+	run_pid[$index]=$!
+	run_out[$index]="$outfile"
+	running+=("$index")
+	if ((step_guests[index] > 0)); then
+		guests_running=$((guests_running + step_guests[index]))
 	else
-		run_one_step "$index" "$label" "$command" "$outfile"
-		record_one_step "$index" "$label" "$outfile"
+		host_busy=1
 	fi
-done 3<"$steps_file"
-drain_guests
+	[[ "${step_exclusive[$index]}" == 1 ]] && alone_running=1
+	return 0
+}
+
+# A FINISHED STEP, RECORDED BY THE PARENT - the one writer of the history. It is DECIDED, for the steps that require it,
+# once its outcome is: a refusal queued for its fix is decided by its second run.
+finish_step() {
+	local index="$1" at queued="${#state_queue[@]}" kept=()
+	record_one_step "$index" "${step_label[$index]}" "${run_out[$index]}" background
+	((${#state_queue[@]} > queued)) || decided["${step_ids[$index]:-}"]=1
+	for at in "${running[@]}"; do
+		[[ "$at" == "$index" ]] || kept+=("$at")
+	done
+	running=(${kept[@]+"${kept[@]}"})
+	if ((step_guests[index] > 0)); then
+		guests_running=$((guests_running - step_guests[index]))
+	else
+		host_busy=0
+	fi
+	[[ "${step_exclusive[$index]}" == 1 ]] && alone_running=0
+	unset 'run_pid[$index]' 'run_out[$index]'
+	return 0
+}
+
+wait_one() {
+	local done_pid="" index pids=()
+	for index in "${running[@]}"; do pids+=("${run_pid[$index]}"); done
+	wait -n -p done_pid "${pids[@]}" || true
+	for index in "${running[@]}"; do
+		if [[ "${run_pid[$index]}" == "$done_pid" ]]; then
+			finish_step "$index"
+			return 0
+		fi
+	done
+}
+
+# THE REFUSED STEPS, fixed and run again, with nothing else running: a fix rebuilds what other steps may be booting.
+retry_queued() {
+	local queued index label outfile
+	for queued in "${state_queue[@]}"; do
+		IFS=$'\t' read -r index label outfile <<<"$queued"
+		retry_refused_step "$index" "$label" "$outfile"
+		decided["${step_ids[$index]:-}"]=1
+	done
+	state_queue=()
+}
+
+# ONE PASS OVER THE STEPS NOT YET STARTED, in the plan's order, starting each that can start now.
+#
+# NOTHING IS DRAINED BUT WHAT CONFLICTS. This was a barrier before every step that boots no guest and before every
+# exclusive one, which drained every guest in flight - so the run was serial in practice, 22.3 hours of steps on a
+# host that stayed at a load of 1 to 3. A step starts once what it requires has run, a lane is free for it - a guest
+# slot for a guest step, the one host lane for the rest, so the host work runs beside the guests - its declaration
+# conflicts with nothing running, and its staging is in the state it needs; a step that runs alone starts when nothing
+# else runs, and nothing starts beside it.
+#
+# THE STATE IS SWITCHED ONCE PER GROUP. The plan puts the steps that need one state of a staging together (the profile,
+# then the bootable volume's mode); a step whose staging is in another state is held back while an earlier step still
+# needs the one it is in, and when none does and nothing is using it the runner brings it about, then starts the step.
+#
+# A STEP READY BUT FOR ITS LANE HOLDS ITS PLACE: a guest step waiting for slots keeps later guest steps from taking them,
+# and one that runs alone keeps everything later from starting, so neither waits for ever behind work that keeps coming.
+dispatch() {
+	local index req token resource state current waiting blockers conflict other reserve_guests=0 reserve_all=0 kept=() fix
+	local -A first_state=()
+	for index in ${pending[@]+"${pending[@]}"}; do
+		if ((reserve_all == 1)); then
+			kept+=("$index")
+			continue
+		fi
+		# EVERY SKIPPED STEP IS PRINTED. A selector that quietly trims its own scope is the defect
+		# P02M0156 is named after, and a budget is that defect with a flag on it unless it says what it
+		# did not run.
+		if ((BUDGET_SET == 1)) && [[ " $affordable " != *" $index "* ]]; then
+			step=$((step + 1))
+			note "[$step/$count] SKIPPED (budget): ${step_label[$index]} - ${step_keys[$index]} key(s)"
+			[[ "${step_unpriced[$index]}" == 1 ]] && note "        unpriced: no current measurement or conservative seed; an unbudgeted run can measure it"
+			skipped+=("${step_label[$index]}")
+			decided["${step_ids[$index]:-}"]=1
+			progress=1
+			continue
+		fi
+		# A STEP WHOSE PREREQUISITE FAILED IS NOT RUN, and one whose prerequisite has not run yet waits for it - ONLY
+		# PREREQUISITES IN THIS PLAN: a narrowed plan legitimately omits steps that other steps declare a requirement on.
+		waiting=0
+		blockers=""
+		for req in ${step_reqs[$index]}; do
+			[[ -n "${step_index_of[$req]:-}" ]] || continue
+			if [[ -n "${failed_ids[$req]:-}" || -n "${blocked_ids[$req]:-}" ]]; then
+				blockers+=" $req"
+			elif [[ -z "${decided[$req]:-}" ]]; then
+				waiting=1
+			fi
+		done
+		if [[ -n "$blockers" ]]; then
+			step=$((step + 1))
+			note "[$step/$count] BLOCKED: ${step_label[$index]} - ${blockers# } did not produce what this step reads"
+			blocked+=("${step_label[$index]}")
+			# THIS STEP IS NOW A BLOCKER ITSELF. Without this line the suppression stops one level down
+			# and a grandchild runs against an output nothing produced.
+			blocked_ids["${step_ids[$index]:-}"]=1
+			decided["${step_ids[$index]:-}"]=1
+			progress=1
+			continue
+		fi
+		# A STEP THAT STARTS SEVERAL GUESTS AT ONCE TAKES THAT MANY SLOTS, AND IS NOT RUN WITHOUT THEM.
+		# Refused rather than trimmed, because a gate about overlap that runs one guest proves nothing and would
+		# report a pass for it. INCOMPLETE is the honest outcome and never reads as green.
+		if ((step_guests[index] > JOBS)); then
+			step=$((step + 1))
+			note "[$step/$count] SKIPPED (budget): ${step_label[$index]} - it starts ${step_guests[$index]} guests at once and --jobs is $JOBS; run it with --jobs ${step_guests[$index]} or more"
+			skipped+=("${step_label[$index]}")
+			decided["${step_ids[$index]:-}"]=1
+			progress=1
+			continue
+		fi
+		# HELD BACK, in its place: for a prerequisite, an earlier step's state, a conflict or a lane.
+		conflict="$waiting"
+		if ((conflict == 0)); then
+			for token in ${step_uses[$index]}; do
+				resource="${token%%=*}"
+				[[ "$resource" == stage:* || "$resource" == volume:* ]] || continue
+				state="${token#*=}"
+				state="${state#*:}"
+				if [[ -n "${first_state[$resource]:-}" && "${first_state[$resource]}" != "$state" ]]; then
+					conflict=1
+					break
+				fi
+			done
+		fi
+		if ((conflict == 0)); then
+			for other in ${running[@]+"${running[@]}"}; do
+				if uses_conflict "${step_uses[$index]}" "${step_uses[$other]}"; then
+					conflict=1
+					break
+				fi
+			done
+		fi
+		if ((conflict == 0)) && [[ "${step_exclusive[$index]}" == 1 ]] && ((${#running[@]} > 0)); then
+			conflict=1
+			reserve_all=1
+		fi
+		if ((conflict == 0)); then
+			if ((step_guests[index] > 0)); then
+				if ((reserve_guests == 1 || guests_running + step_guests[index] > JOBS)); then
+					conflict=1
+					reserve_guests=1
+				fi
+			elif ((host_busy == 1)); then
+				conflict=1
+			fi
+		fi
+		if ((conflict == 0)); then
+			# ITS STAGING IN THE STATE IT NEEDS, brought about here when nothing running uses it.
+			for token in ${step_uses[$index]}; do
+				resource="${token%%=*}"
+				[[ "$token" == *=r:* && ("$resource" == stage:* || "$resource" == volume:*) ]] || continue
+				state="${token#*=r:}"
+				current="$(resource_state "$resource")"
+				[[ "$current" == "$state" ]] && continue
+				for other in ${running[@]+"${running[@]}"}; do
+					[[ " ${step_uses[$other]} " == *" $resource="* ]] && conflict=1
+				done
+				((conflict == 0)) || break
+				fix="$(resource_command "$resource" "$state")"
+				note "staging: ${step_label[$index]} needs $resource in '$state', and it is in '${current:-no recorded state}' - bringing it about:  $fix"
+				run_owned_shell "$fix" || true
+				progress=1
+				current="$(resource_state "$resource")"
+				if [[ "$current" != "$state" ]]; then
+					step=$((step + 1))
+					note "[$step/$count] REFUSED: ${step_label[$index]} - $resource could not be brought to '$state'; nothing is recorded for it"
+					failed+=("${step_label[$index]} (refused)")
+					failed_ids["${step_ids[$index]:-}"]=1
+					decided["${step_ids[$index]:-}"]=1
+					conflict=2
+					break
+				fi
+			done
+			((conflict == 2)) && continue
+		fi
+		if ((conflict != 0)); then
+			kept+=("$index")
+			for token in ${step_uses[$index]}; do
+				resource="${token%%=*}"
+				[[ "$resource" == stage:* || "$resource" == volume:* ]] || continue
+				state="${token#*=}"
+				[[ -n "${first_state[$resource]:-}" ]] || first_state[$resource]="${state#*:}"
+			done
+			continue
+		fi
+		start_step "$index"
+		progress=1
+		if [[ "${step_exclusive[$index]}" == 1 ]]; then
+			reserve_all=1
+		fi
+	done
+	pending=(${kept[@]+"${kept[@]}"})
+}
+
+# THE STEPS, in the plan's order - the order they are considered in - read whole before any runs. They were read on
+# fd 3, one at a time between steps, because the first step that read stdin swallowed the rest of the plan; read
+# whole, no step can.
+order=()
+declare -A step_label=() step_keys=() step_note=() step_index_of=()
+while IFS=$'\t' read -r marker index keys label command note_text; do
+	[[ "$marker" == STEP ]] || continue
+	order+=("$index")
+	step_label[$index]="$label"
+	step_keys[$index]="$keys"
+	step_note[$index]="$note_text"
+	step_commands[$index]="$command"
+done <"$steps_file"
+for index in ${order[@]+"${order[@]}"}; do
+	step_index_of["${step_ids[$index]:-}"]="$index"
+done
+pending=(${order[@]+"${order[@]}"})
+staging_at_start="$(staging_fingerprint)"
+while ((${#pending[@]} > 0 || ${#running[@]} > 0 || ${#state_queue[@]} > 0)); do
+	progress=0
+	if ((${#state_queue[@]} == 0 && alone_running == 0)); then
+		dispatch
+	fi
+	((progress == 1)) && continue
+	if ((${#running[@]} > 0)); then
+		wait_one
+	elif ((${#state_queue[@]} > 0)); then
+		retry_queued
+	else
+		die "the runner could start none of the ${#pending[@]} step(s) left, and nothing is running: ${pending[*]}"
+	fi
+done
+restore_staging
 
 # The runner's own arithmetic, checked. A loop that silently took fewer steps than the plan listed
 # would report a pass over work it never did.
