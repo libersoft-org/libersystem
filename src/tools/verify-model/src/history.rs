@@ -433,10 +433,22 @@ impl Default for CostModel {
 	}
 }
 
-// WHERE A PLAN'S TIME GOES, from what each step last measured (`verify-model account`). A step that boots no guest
-// waits behind the barrier that drains every guest and an exclusive guest step runs alone, so both are the SERIAL
-// REMAINDER; a guest step that is neither shares the slots. A price measured under an older model is used and counted:
-// a model hash binds evidence, and what a step costs is what it took.
+// ONE STEP OF A PLAN AS THE RUNNER SCHEDULES IT: its id and command (what its price is kept under), the guest slots it
+// takes, whether it runs alone, and what it uses (`resources::Declaration::tokens`).
+#[derive(Clone, Debug, Default)]
+pub struct PlannedStep {
+	pub id: String,
+	pub command: String,
+	pub guests: usize,
+	pub alone: bool,
+	pub tokens: Vec<String>,
+}
+
+// WHERE A PLAN'S TIME GOES, from what each step last measured (`verify-model account`), as the runner schedules it: a
+// step that runs alone has the machine to itself, the host steps share one lane beside the guests, the guest steps
+// share the slots, and the steps that hold one resource exclusively - a staging's writers, the gadget, the persistent
+// instance - run one after another. A step never measured is priced at its seed when it boots a guest and is named
+// unpriced otherwise; a price measured under an older model is used and counted.
 #[derive(Debug, Default)]
 pub struct Account {
 	// Every priced step, dearest first: its price, its id, whether it runs alone.
@@ -444,39 +456,64 @@ pub struct Account {
 	pub unpriced: Vec<String>,
 	pub older: usize,
 	pub alone: f64,
-	pub shared: f64,
+	pub host: f64,
+	// Guest-slot seconds: each guest step's price times the slots it takes.
+	pub guest: f64,
+	// The dearest chain of steps that hold one resource exclusively, and the resource.
+	pub chain: (f64, String),
 }
 
 impl Account {
-	pub fn of(steps: &[crate::commands::Step], history: &History, model_hash: &str) -> Account {
+	pub fn of(steps: &[PlannedStep], history: &History, cost: &CostModel, model_hash: &str) -> Account {
 		let mut account = Account::default();
+		let mut chains: BTreeMap<String, f64> = BTreeMap::new();
 		for step in steps {
-			let Some(record) = history.steps.get(&step.id).filter(|record| record.last_seconds > 0.0) else {
-				account.unpriced.push(step.id.clone());
-				continue;
+			let price = match history.step_seconds(&step.id, &step.command) {
+				Some(seconds) => {
+					account.older += usize::from(history.step_price_is_older(&step.id, model_hash));
+					seconds
+				}
+				None => match cost.seed_seconds(step.guests) {
+					Some(seed) => seed,
+					None => {
+						account.unpriced.push(step.id.clone());
+						continue;
+					}
+				},
 			};
-			account.older += usize::from(record.model_hash != model_hash);
-			let alone = step.guests == 0 || step.exclusive_guests;
-			if alone {
-				account.alone += record.last_seconds;
+			if step.alone {
+				account.alone += price;
+			} else if step.guests == 0 {
+				account.host += price;
 			} else {
-				account.shared += record.last_seconds;
+				account.guest += price * step.guests as f64;
 			}
-			account.priced.push((record.last_seconds, step.id.clone(), alone));
+			if !step.alone {
+				for token in &step.tokens {
+					let (resource, access) = token.split_once('=').unwrap_or((token, ""));
+					if access.starts_with('w') || access.starts_with('x') {
+						*chains.entry(resource.to_string()).or_default() += price;
+					}
+				}
+			}
+			account.priced.push((price, step.id.clone(), step.alone));
 		}
 		account.priced.sort_by(|left, right| right.0.total_cmp(&left.0));
+		if let Some((resource, seconds)) = chains.into_iter().max_by(|left, right| left.1.total_cmp(&right.1)) {
+			account.chain = (seconds, resource);
+		}
 		account
 	}
 
 	pub fn total(&self) -> f64 {
-		self.alone + self.shared
+		self.priced.iter().map(|(seconds, _, _)| seconds).sum()
 	}
 
-	// The wall clock no schedule over `jobs` slots can beat: the remainder, plus the shared work spread over the
-	// slots or its longest step, whichever is longer.
+	// The wall clock no schedule over `jobs` slots can beat: what runs alone, then the longest of the host lane, the
+	// guest work spread over the slots, the dearest exclusive chain and the longest single step that shares.
 	pub fn floor(&self, jobs: usize) -> f64 {
-		let longest_shared = self.priced.iter().filter(|(_, _, alone)| !alone).map(|(seconds, _, _)| *seconds).fold(0.0, f64::max);
-		self.alone + longest_shared.max(self.shared / jobs.max(1) as f64)
+		let longest = self.priced.iter().filter(|(_, _, alone)| !alone).map(|(seconds, _, _)| *seconds).fold(0.0, f64::max);
+		self.alone + self.host.max(self.guest / jobs.max(1) as f64).max(self.chain.0).max(longest)
 	}
 }
 

@@ -605,6 +605,23 @@ check "the step the earlier identical run passed is not started again" "absent p
 check "and the run says where its envelope came from" 1 "$(grep -c 'CONTINUED: the step the earlier run passed - passed in run the-earlier-run' "$out" || true)"
 check "and finishes" 0 "$rc"
 
+# 12. THE LEVELS' OWN REFUSALS: L1 starts from the revision the last passed L1 or L2 ran at and says how to give it when
+#     none has passed; L3 needs the room the last sealed build took and refuses before it builds anything.
+rc=0
+(cd "$release" && PATH="$release/bin:$PATH" CARGO_CALLS="$release/calls" ./verify.sh --level L1) >"$release/l1.log" 2>&1 || rc=$?
+check "an L1 with no base and no passed run before it is refused, naming --base" 1 "$(grep -c 'none has passed yet - give it this once:  --base REV' "$release/l1.log" || true)"
+mkdir -p "$release/.build/state"
+echo 1000000000000000000 >"$release/.build/state/release-build-size"
+: >"$release/calls"
+rc=0
+(cd "$release" && PATH="$release/bin:$PATH" CARGO_CALLS="$release/calls" ./verify.sh --level L3) >"$release/l3.log" 2>&1 || rc=$?
+check "an L3 with less room than the last sealed build took is refused" 1 "$(grep -c 'L3 refused: the last sealed build took 1000000000000000000 bytes' "$release/l3.log" || true)"
+check "before anything is built" 0 "$(grep -c 'run-start\|release-snapshot' "$release/calls" "$release/l3.log" 2>/dev/null | awk -F: '{s += $NF} END {print s}')"
+rm -f "$release/.build/state/release-build-size"
+rc=0
+(cd "$release" && ./verify.sh --level L4) >"$release/l4.log" 2>&1 || rc=$?
+check "a level that is not one is refused" 1 "$(grep -c "is L0, L1, L2 or L3, not 'L4'" "$release/l4.log" || true)"
+
 if ((failed != 0)); then
 	echo "verify-scheduler: the shell scheduler did not behave as the milestone requires" >&2
 	exit 1

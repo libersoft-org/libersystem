@@ -84,6 +84,7 @@ fn run() -> Result<ExitCode, String> {
 	// `continue-run`: the earlier run to continue (the newest identical L2 beside it when not named), and the plan.
 	let mut continue_from: Option<PathBuf> = None;
 	let mut steps_path: Option<PathBuf> = None;
+	let mut brief = false;
 	// A frozen narrowing to plan against, instead of the canonical model. See `Model::load_with_candidate`.
 	let mut candidate_path: Option<String> = None;
 	let mut scoped_log: Option<String> = None;
@@ -257,6 +258,7 @@ fn run() -> Result<ExitCode, String> {
 				index += 1;
 				steps_path = Some(PathBuf::from(arguments.get(index).ok_or("--steps needs the plan's file")?));
 			}
+			"--brief" => brief = true,
 			"--key" => {
 				index += 1;
 				evidence_key = Some(arguments.get(index).ok_or("--key needs a plan-item key")?.clone());
@@ -630,21 +632,39 @@ fn run() -> Result<ExitCode, String> {
 		// So: the remainder, the shareable work, the longest single step, the sum over the width and the floor
 		// they set together. A price measured under an older model is used and counted as such - a model hash
 		// binds evidence, and what a step costs is what it took.
+		// WHERE A PLAN'S TIME GOES, from what its steps last measured: the plan the runner is about to run (`--steps`,
+		// in its own format; `--brief` for the estimate a level prints before it starts), or the release plan.
 		"account" => {
-			let steps = release_plan_steps(&model, required_path.as_deref())?;
+			let planned: Vec<verify_model::history::PlannedStep> = match &steps_path {
+				Some(path) => planned_steps(&std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?),
+				None => release_plan_steps(&model, required_path.as_deref())?
+					.iter()
+					.map(|step| {
+						let declared = verify_model::resources::step_declaration(step);
+						verify_model::history::PlannedStep { id: step.id.clone(), command: step.command.clone(), guests: step.guests, alone: step.exclusive_guests || declared.is_none(), tokens: declared.map(|declared| declared.tokens()).unwrap_or_default() }
+					})
+					.collect(),
+			};
 			let history = verify_model::history::History::load(&repo_root)?;
-			let account = verify_model::history::Account::of(&steps, &history, &model.model_hash());
+			let cost = verify_model::history::CostModel { whole_suite_tests: model.kernel_tests.declared_ids, ..verify_model::history::CostModel::default() };
+			let account = verify_model::history::Account::of(&planned, &history, &cost, &model.model_hash());
 			let hours = |seconds: f64| seconds / 3600.0;
 			let total = account.total();
-			println!("account: {} step(s), {} priced, {} of those under an older model, {} never measured", steps.len(), account.priced.len(), account.older, account.unpriced.len());
+			if brief {
+				println!("estimate: {} step(s), {:.0} s of priced steps ({} priced under an older model, {} never measured); no schedule over {jobs} slot(s) finishes in under {:.0} s ({:.1} h)", planned.len(), total, account.older, account.unpriced.len(), account.floor(jobs), hours(account.floor(jobs)));
+				return Ok(ExitCode::SUCCESS);
+			}
+			println!("account: {} step(s), {} priced, {} of those under an older model, {} never measured", planned.len(), account.priced.len(), account.older, account.unpriced.len());
 			println!("account: the sum of the priced steps            {:>8.0} s  ({:.1} h)", total, hours(total));
-			println!("account: the serial remainder - runs alone       {:>8.0} s  ({:.1} h)", account.alone, hours(account.alone));
-			println!("account: guest work that shares {jobs} slot(s)        {:>8.0} s  ({:.1} h)", account.shared, hours(account.shared));
+			println!("account: what runs alone                         {:>8.0} s  ({:.1} h)", account.alone, hours(account.alone));
+			println!("account: the host lane                           {:>8.0} s  ({:.1} h)", account.host, hours(account.host));
+			println!("account: guest work over {jobs} slot(s)                {:>8.0} s  ({:.1} h)", account.guest / jobs as f64, hours(account.guest / jobs as f64));
+			println!("account: the dearest exclusive chain             {:>8.0} s  ({})", account.chain.0, if account.chain.1.is_empty() { "none" } else { account.chain.1.as_str() });
 			if let Some((seconds, id, _)) = account.priced.first() {
 				println!("account: the longest single step                 {:>8.0} s  ({id})", seconds);
 			}
 			println!("account: the sum over the width ({jobs})             {:>8.0} s  ({:.1} h)", total / jobs as f64, hours(total / jobs as f64));
-			println!("account: the floor - remainder + shared share    {:>8.0} s  ({:.1} h)", account.floor(jobs), hours(account.floor(jobs)));
+			println!("account: the floor - alone, then the longest lane {:>7.0} s  ({:.1} h)", account.floor(jobs), hours(account.floor(jobs)));
 			for (seconds, id, alone) in account.priced.iter().take(15) {
 				println!("    {:>7.0} s  {}  {id}", seconds, if *alone { "alone " } else { "shared" });
 			}
@@ -2027,6 +2047,27 @@ fn is_repo_root(directory: &Path) -> bool {
 // model is loaded so a snapshot of another revision - whose manifest this binary may not parse -
 // can still have its identity collected and its run started by the tree's own tooling.
 #[allow(clippy::too_many_arguments)]
+// A PLAN IN THE RUNNER'S FORMAT, as the steps the runner schedules: `STEP`, `STEPID`, `STEPGUESTS`, `STEPEXCLUSIVE` and
+// `STEPUSES` lines.
+fn planned_steps(text: &str) -> Vec<verify_model::history::PlannedStep> {
+	let mut steps: std::collections::BTreeMap<usize, verify_model::history::PlannedStep> = std::collections::BTreeMap::new();
+	for line in text.lines() {
+		let fields: Vec<&str> = line.split('\t').collect();
+		let (Some(marker), Some(Ok(index))) = (fields.first(), fields.get(1).map(|index| index.parse::<usize>())) else { continue };
+		let step = steps.entry(index).or_default();
+		let value = fields.get(2).copied().unwrap_or("");
+		match *marker {
+			"STEP" => step.command = fields.get(4).copied().unwrap_or("").to_string(),
+			"STEPID" => step.id = value.to_string(),
+			"STEPGUESTS" => step.guests = value.parse().unwrap_or(0),
+			"STEPEXCLUSIVE" => step.alone = value == "1",
+			"STEPUSES" => step.tokens = value.split_whitespace().map(str::to_string).collect(),
+			_ => {}
+		}
+	}
+	steps.into_values().collect()
+}
+
 // AN L2 CONTINUES WHAT AN IDENTICAL L2 LEFT (`evidence::Run::continue_from`). The run to continue is the one named,
 // or the newest earlier L2 beside this run - one `verify.sh` marked `level` L2 - whose identity is this run's; one whose
 // identity moved is refused and named, and the next older is tried. With the plan, every step all of whose keys were

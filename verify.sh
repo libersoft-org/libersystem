@@ -73,6 +73,10 @@ Commit exactly the tested content, then complete verification with --merge FILE.
                    candidate's model hash. The run that happens is unchanged and still full; what
                    the candidate changes is which selection the comparison is graded against, which
                    is how a narrowing earns the evidence its activation demands.
+  --level L0..L3   a preset: L0 the inner tier over the working tree's change; L1 the inner tier over BASE..HEAD
+                   on a clean tree, with the whole x86_64 suite and every port test added, then its merge at the
+                   same HEAD (BASE: --base REV, or the revision the last passed L1 or L2 ran at); L2 --release
+                   --in-place; L3 --release, refused when the disk has less room than the last sealed build took
   --jobs N         guest slots (inner default 1, merge and release default 4; explicit values override them)
   --budget N       estimated seconds the inner run may start, including prerequisites
                    work without a current measurement or conservative seed is skipped
@@ -137,7 +141,12 @@ release_in_place=0
 release_snapshot=""
 release_run_dir=""
 release_rehearsal=""
+release_clean_head=""
 release_main_root="$REPO_ROOT"
+level=""
+level_base=""
+inner_level=""
+level_arguments=("$@")
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-h | --help) help ;;
@@ -220,6 +229,22 @@ while [[ $# -gt 0 ]]; do
 		BUDGET_SET=1
 		shift 2
 		;;
+	--level)
+		[[ $# -ge 2 ]] || die "--level needs L0, L1, L2 or L3"
+		level="$2"
+		[[ "$level" =~ ^L[0-3]$ ]] || die "--level is L0, L1, L2 or L3, not '$level'"
+		shift 2
+		;;
+	--base)
+		[[ $# -ge 2 ]] || die "--base needs a revision"
+		level_base="$2"
+		shift 2
+		;;
+	--l1-suites)
+		# The inner half of the L1 preset: the whole x86_64 suite and every port test added to the range's plan.
+		inner_level=L1
+		shift
+		;;
 	--jobs)
 		JOBS="${2:?--jobs needs a number}"
 		[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "--jobs takes a positive whole number, not '$JOBS'"
@@ -258,6 +283,60 @@ while [[ $# -gt 0 ]]; do
 	*) die "unexpected argument '$1' (try --help)" ;;
 	esac
 done
+
+# THE LEVELS ARE PRESETS OF THE TIERS BELOW, each on a stated tree; what each runs, and over which tree, is what tells
+# them apart, and the time each took is measured and printed rather than judged against a number. The revision a
+# passed L1 or L2 ran at is recorded, and is the next L1's BASE, so no commit between two of them goes unverified.
+LAST_PASSED="$BUILD_DIR/state/verify-last-passed"
+RELEASE_BUILD_SIZE="$BUILD_DIR/state/release-build-size"
+case "$level" in
+"") ;;
+L0)
+	[[ "$mode" == for-change && -z "$merge_file" ]] || die "--level L0 is the inner tier over the working tree's change, and takes no other change mode"
+	;;
+L1)
+	[[ "$mode" == for-change && -z "$merge_file" ]] || die "--level L1 chooses its own range and its own merge"
+	[[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "L1 runs on a clean tree: it plans BASE..HEAD and merges at that HEAD, and a dirty tree is neither"
+	base="${level_base:-$(cat "$LAST_PASSED" 2>/dev/null || true)}"
+	[[ -n "$base" ]] || die "L1 needs BASE, the revision the last passed L1 or L2 ran at, and none has passed yet - give it this once:  --base REV"
+	head="$(git rev-parse HEAD)"
+	forward=()
+	((JOBS_EXPLICIT == 0)) || forward+=(--jobs "$JOBS")
+	[[ "${allow_shadow:-0}" != 1 ]] || forward+=(--allow-shadow)
+	note "L1: the inner tier over $base..$head, with the whole x86_64 suite and every test of the ports"
+	inner_log="$(mktemp)"
+	inner_status=0
+	"$0" --for-range "$base..$head" --l1-suites ${forward[@]+"${forward[@]}"} 2>&1 | tee "$inner_log" || inner_status=$?
+	handoff="$(sed -n 's/^verify.sh: inner handoff: //p' "$inner_log" | tail -1)"
+	rm -f "$inner_log"
+	((inner_status == 6)) && [[ -n "$handoff" ]] || die "L1: the inner tier did not end with a handoff (status $inner_status)"
+	note "L1: the merge of $handoff at the same HEAD"
+	"$0" --merge "$handoff" ${forward[@]+"${forward[@]}"} || die "L1: the merge did not pass"
+	echo "$head" >"$LAST_PASSED"
+	note "L1 passed at $head - the next L1 starts from it"
+	exit 0
+	;;
+L2)
+	[[ "$mode" == for-change && -z "$merge_file" ]] || die "--level L2 is the release plan in place, and takes no change mode"
+	mode=release
+	release_in_place=1
+	;;
+L3)
+	[[ "$mode" == for-change && -z "$merge_file" && "$release_in_place" == 0 ]] || die "--level L3 is the release over a sealed snapshot, and takes no change mode"
+	mode=release
+	# ROOM FOR A BUILD FROM NOTHING, checked before it starts: the snapshot's `.build` starts empty, and the size the
+	# last sealed build took is what this one needs.
+	if [[ -f "$RELEASE_BUILD_SIZE" ]]; then
+		needed="$(<"$RELEASE_BUILD_SIZE")"
+		mkdir -p "$BUILD_DIR"
+		available="$(df --output=avail -B1 "$BUILD_DIR" | tail -1 | tr -d ' ')"
+		((available >= needed)) || die "L3 refused: the last sealed build took $needed bytes and $BUILD_DIR has $available free"
+		note "L3: $available bytes free, and the last sealed build took $needed"
+	else
+		note "L3: no sealed build has been measured yet - this one starts with the room there is and records its size"
+	fi
+	;;
+esac
 
 if [[ -n "$merge_file" ]]; then
 	[[ "$mode" == merge && -z "$paths" && -z "$range" ]] || die "--merge cannot be combined with another change or flat mode"
@@ -389,6 +468,9 @@ release_prepare() {
 	# (`continue-run`, after the plan). A sealed release (L3) and a narrowed rehearsal continue nothing.
 	if ((release_in_place == 1)) && [[ -z "$release_required_file" ]]; then
 		echo L2 >"$release_run_dir/level"
+		if git rev-parse --verify -q HEAD >/dev/null 2>&1 && [[ -z "$(git status --porcelain 2>/dev/null)" ]]; then
+			release_clean_head="$(git rev-parse HEAD)"
+		fi
 	fi
 	export LIBER_VERIFY_RUN="$release_run_dir"
 	export LIBER_RELEASE_REQUIRED="${release_required_file:-$release_snapshot/src/tools/verify-model/model/release-required.toml}"
@@ -417,6 +499,11 @@ release_finish() {
 	# or incomplete run keeps its evidence with its state rather than losing it with the snapshot.
 	chmod -R a-w "$release_run_dir" 2>/dev/null || true
 	note "release: dossier $release_run_dir/dossier.md (state: ${state:-not rendered})"
+	# A SEALED BUILD'S SIZE, for the next L3's check: the snapshot's `.build`, built from nothing by this run.
+	if [[ "$release_snapshot" != "$release_main_root" && -d "$release_snapshot/.build" ]]; then
+		du -sb "$release_snapshot/.build" | cut -f1 >"$release_main_root/.build/state/release-build-size"
+		note "release: the sealed build from nothing took $(<"$release_main_root/.build/state/release-build-size") bytes"
+	fi
 	if ((failures > 0 || status != 0)); then
 		die "the release run is NOT complete: $failures failed step(s); dossier state: ${state:-not rendered}"
 	fi
@@ -425,6 +512,10 @@ release_finish() {
 		exit 6
 	fi
 	note "release run finished: ${state}"
+	# A PASSED L2 OVER A CLEAN TREE is where the next L1 starts.
+	if [[ -f "$release_run_dir/level" && -n "$release_clean_head" ]]; then
+		echo "$release_clean_head" >"$release_main_root/.build/state/verify-last-passed"
+	fi
 	exit 0
 }
 # The logs sweep and the logs lock, for a run that runs steps: before the release moves into its
@@ -880,7 +971,9 @@ else
 		cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-merge-commands --state "$tier_state" >"$steps_file" || planner_failed "merge could not reconcile its refreshed inventory"
 	else
 		tier_mode=inner
-		printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-inner --state "$tier_state" --stdin >"$steps_file" || planner_failed "the inner tier could not produce its partition"
+		inner_args=()
+		[[ -z "$inner_level" ]] || inner_args=(--level "$inner_level")
+		printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-inner --state "$tier_state" --stdin ${inner_args[@]+"${inner_args[@]}"} >"$steps_file" || planner_failed "the inner tier could not produce its partition"
 	fi
 fi
 [[ -s "$steps_file" ]] || planner_failed "the planner produced no output"
@@ -1049,6 +1142,7 @@ fi
 
 failed=()
 skipped=()
+steps_seconds=0
 # THE RUNNER OWNS THE STAGING'S STATE WHILE IT RUNS (`staging-state.sh`), and says so to every step: a
 # step that switches into the development profile leaves it there (`guest-gate.sh` puts it back only
 # when it is run by hand), a step that needs another state refuses and is run again once that state is
@@ -1173,6 +1267,7 @@ record_one_step() {
 		return 0
 	fi
 	rm -f "$outfile.refusal"
+	steps_seconds=$((steps_seconds + seconds))
 	outcome=--passed
 	if [[ "$status" != 0 ]]; then
 		# Every step is run and every failure is reported, rather than stopping at the first.
@@ -1550,6 +1645,11 @@ if [[ -s "$steps_file.covered" ]]; then
 	pending=(${kept_order[@]+"${kept_order[@]}"})
 fi
 staging_at_start="$(staging_fingerprint)"
+# THE ESTIMATE, BEFORE ANYTHING STARTS, from what the plan's steps last measured (`verify-model account`): a price
+# measured under an older model is used and counted, and a host step never measured is named, not priced.
+estimate="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- account --steps "$steps_file" --jobs "$JOBS" --brief 2>/dev/null || true)"
+[[ -z "$estimate" ]] || note "$estimate"
+run_started=$SECONDS
 while ((${#pending[@]} > 0 || ${#running[@]} > 0 || ${#state_queue[@]} > 0)); do
 	progress=0
 	if ((${#state_queue[@]} == 0 && alone_running == 0)); then
@@ -1565,6 +1665,9 @@ while ((${#pending[@]} > 0 || ${#running[@]} > 0 || ${#state_queue[@]} > 0)); do
 	fi
 done
 restore_staging
+
+# AND WHAT IT TOOK: the wall clock, and the steps' own time it held.
+note "measured: $((SECONDS - run_started)) s wall clock over $JOBS guest slot(s); the steps took $steps_seconds s between them"
 
 # The runner's own arithmetic, checked. A loop that silently took fewer steps than the plan listed
 # would report a pass over work it never did.

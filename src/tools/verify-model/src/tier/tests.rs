@@ -79,7 +79,7 @@ impl Fixture {
 		model.catalog = Catalog::build(&model.crates, &model.registry, &model.graph, &model.staged, &model.kernel_tests.tests);
 	}
 	fn inner(&self, model: &Model, paths: &[String]) -> Handoff {
-		let (mut handoff, steps) = begin_inner(model, effective_tree(&self.root).unwrap(), paths, BTreeMap::new()).unwrap();
+		let (mut handoff, steps) = begin_inner(model, effective_tree(&self.root).unwrap(), paths, BTreeMap::new(), false).unwrap();
 		let recorded: Keys = steps.iter().flat_map(|step| step.keys.iter().cloned()).collect();
 		assert_eq!(recorded, handoff.inner);
 		finish_inner(&self.root, &mut handoff, pass(&recorded)).unwrap();
@@ -271,7 +271,7 @@ fn both_tiers_refuse_an_ordinary_edit_that_leaves_the_source_model_hash_unchange
 	fixture.refresh(&mut model);
 	fixture.commit();
 	fixture.write("ordinary.rs", "tested\n");
-	let (mut pending, _) = begin_inner(&model, effective_tree(&fixture.root).unwrap(), &["docs/example.md".into()], BTreeMap::new()).unwrap();
+	let (mut pending, _) = begin_inner(&model, effective_tree(&fixture.root).unwrap(), &["docs/example.md".into()], BTreeMap::new(), false).unwrap();
 	let source_hash = model.source_model_hash().unwrap();
 	fixture.write("ordinary.rs", "edited during inner\n");
 	assert_eq!(source_hash, model.source_model_hash().unwrap());
@@ -482,7 +482,7 @@ fn live_history_crosses_the_escalation_threshold_both_ways_including_inner_step_
 			hot_cost(&model, &mut history, target, !expanding);
 		}
 		history.save(&fixture.root).unwrap();
-		let (mut handoff, steps) = begin_inner(&model, effective_tree(&fixture.root).unwrap(), &tool_paths(), BTreeMap::new()).unwrap();
+		let (mut handoff, steps) = begin_inner(&model, effective_tree(&fixture.root).unwrap(), &tool_paths(), BTreeMap::new(), false).unwrap();
 		assert!(!handoff.plan.full);
 		let cold_before = handoff.plan.items.iter().filter(|item| item.key.check.starts_with("kernel.cold_")).count();
 		assert_eq!(cold_before > 0, !expanding);
@@ -586,4 +586,50 @@ fn different_parent_with_no_extra_keys_is_accepted_and_root_or_merge_commits_are
 	let merge_revision = fixture.git(&["commit-tree", &tree, "-p", &older_parent, "-p", &root_revision, "-m", "unsupported merge"]);
 	fixture.git(&["update-ref", "HEAD", &merge_revision]);
 	assert!(prepare_merge(&model, handoff).unwrap_err().contains("exactly one parent; found 2"));
+}
+
+// THE L1 PRESET: an inner run over a range of two commits plans both commits' keys and adds the whole x86_64 suite, which
+// it owns, and every test of the ports, which it defers; the merge at the same HEAD runs the deferred ones, and the
+// added keys' outcomes are accepted.
+#[test]
+fn an_l1_over_two_commits_plans_both_and_its_merge_runs_the_deferred_suites_at_the_same_head() {
+	let fixture = Fixture::new();
+	let mut model = fixture.model(&[("old", "image-bench"), ("other", "image-bench")]);
+	for target in crate::registry::ARCHITECTURES {
+		fixture.inventory(target, &["old", "other"]);
+	}
+	fixture.refresh(&mut model);
+	let base = fixture.commit();
+	fixture.write(TOOL, "fn main() { let first = 1; }\n");
+	let first = fixture.commit();
+	fixture.write("src/tools/image-bench/src/second.rs", "pub fn second() {}\n");
+	let head = fixture.commit();
+	let per_commit = |from: &str, to: &str| crate::changes::paths(&crate::changes::range(&fixture.root, &format!("{from}..{to}")).unwrap());
+	let changed = per_commit(&base, &head);
+	let (mut handoff, steps) = begin_inner(&model, effective_tree(&fixture.root).unwrap(), &changed, BTreeMap::new(), true).unwrap();
+	let planned: Keys = handoff.inner.union(&handoff.deferred).cloned().collect();
+	for paths in [per_commit(&base, &first), per_commit(&first, &head)] {
+		for key in keys(&selection(&model, &paths)).into_iter().filter(|key| !(key.check.starts_with("kernel.") && key.architecture == "x86_64")) {
+			assert!(planned.contains(&key), "a key of one of the two commits is planned: {}", key.display());
+		}
+	}
+	assert!(handoff.inner.iter().any(|key| key.check == "suite.kernel" && key.architecture == "x86_64"), "the inner tier owns the whole x86_64 suite");
+	assert!(!planned.iter().any(|key| key.check.starts_with("kernel.") && key.architecture == "x86_64"), "and does not run its tests one by one beside it");
+	for target in ["aarch64", "riscv64"] {
+		for test in ["kernel.old", "kernel.other"] {
+			assert!(handoff.deferred.iter().any(|key| key.check == test && key.architecture == target), "{test} on {target} is the merge tier's");
+		}
+	}
+	let recorded: Keys = steps.iter().flat_map(|step| step.keys.iter().cloned()).collect();
+	finish_inner(&fixture.root, &mut handoff, pass(&recorded)).unwrap();
+	let mut state = prepare_merge(&model, handoff).unwrap();
+	for target in &state.inventory_targets {
+		fixture.inventory(target, &["old", "other"]);
+	}
+	fixture.refresh(&mut model);
+	let steps = merge_commands(&model, &mut state).unwrap();
+	let merged: Keys = steps.iter().flat_map(|step| step.keys.iter().cloned()).collect();
+	assert!(state.handoff.deferred.is_subset(&merged), "the merge at the same HEAD runs every deferred key");
+	finish_merge(&fixture.root, &mut state, &pass(&merged)).unwrap();
+	assert!(state.complete);
 }

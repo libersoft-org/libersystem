@@ -332,8 +332,11 @@ fn proposed_plan(model: &Model, parent: &str, revision: &str) -> Result<(Plan, B
 	Ok((selection(model, &crate::changes::paths(&changes)), kinds))
 }
 
-pub fn begin_inner(model: &Model, snapshot: String, paths: &[String], change_kinds: BTreeMap<String, String>) -> Result<(Handoff, Vec<Step>), String> {
-	let plan = selection(model, paths);
+pub fn begin_inner(model: &Model, snapshot: String, paths: &[String], change_kinds: BTreeMap<String, String>, level_one: bool) -> Result<(Handoff, Vec<Step>), String> {
+	let mut plan = selection(model, paths);
+	if level_one {
+		with_suites(model, &mut plan)?;
+	}
 	let original = keys(&plan);
 	let steps = commands::steps(&plan, &counts(model), &model.registry);
 	let (inner, deferred) = partition(&steps, &original)?;
@@ -341,6 +344,28 @@ pub fn begin_inner(model: &Model, snapshot: String, paths: &[String], change_kin
 	let handoff = Handoff { version: 1, effective_tree: snapshot, source_model_hash: model.source_model_hash()?, model_hash: model.model_hash(), original_plan_digest: plan_digest(&original), plan, change_kinds, inner, deferred, inner_outcomes: BTreeMap::new(), inner_complete: false };
 	handoff.validate(false)?;
 	Ok((handoff, selected))
+}
+
+// THE L1 PRESET'S SUITES, added to the range's plan before it is partitioned: `suite.kernel` on x86_64, which the inner
+// tier owns whole - it runs every x86_64 test, so the x86_64 tests the range selected one by one are not run a second
+// time - and every kernel test of the ports, which the merge tier owns and runs split across guests. A milestone's
+// end runs the whole suite of every target, whatever its range touched.
+pub fn with_suites(model: &Model, plan: &mut Plan) -> Result<(), String> {
+	plan.items.retain(|item| !(item.kind == CheckKind::KernelTest && item.key.architecture == "x86_64"));
+	let mut keys: Vec<PlanItemKey> = vec![PlanItemKey { check: String::from("suite.kernel"), architecture: String::from("x86_64"), environment: Environment::TestGuest, configuration: String::from("test") }];
+	for test in &model.kernel_tests.tests {
+		for architecture in test.architectures.iter().filter(|architecture| matches!(architecture.as_str(), "aarch64" | "riscv64")) {
+			keys.push(PlanItemKey { check: test.id.clone(), architecture: architecture.clone(), environment: Environment::TestGuest, configuration: String::from("test") });
+		}
+	}
+	for key in keys {
+		if plan.items.iter().any(|item| item.key == key) {
+			continue;
+		}
+		let item = catalog_item(model, &key)?.ok_or_else(|| format!("the L1 preset adds {}, which the catalog does not have", key.display()))?;
+		plan.items.push(PlanItem { reason: String::from("the L1 preset: the whole x86_64 suite and every test of the ports"), ..item });
+	}
+	Ok(())
 }
 
 pub fn finish_inner(root: &Path, handoff: &mut Handoff, outcomes: BTreeMap<String, bool>) -> Result<(), String> {
@@ -554,7 +579,7 @@ pub fn run(root: &Path, arguments: &[String], emit: fn(&Model, Vec<Step>) -> Res
 			index += 1;
 			continue;
 		}
-		if !matches!(name, "--state" | "--handoff" | "--outcomes" | "--paths-file" | "--revision") {
+		if !matches!(name, "--state" | "--handoff" | "--outcomes" | "--paths-file" | "--revision" | "--level") {
 			return Err(format!("unknown tier option {name}"));
 		}
 		index += 1;
@@ -589,7 +614,7 @@ pub fn run(root: &Path, arguments: &[String], emit: fn(&Model, Vec<Step>) -> Res
 					paths.push(line.into());
 				}
 			}
-			let (handoff, steps) = begin_inner(&model, snapshot, &paths, kinds)?;
+			let (handoff, steps) = begin_inner(&model, snapshot, &paths, kinds, options.get("--level").is_some_and(|level| *level == "L1"))?;
 			write_json(option("--state")?, &handoff)?;
 			println!("STATUS\tscoped\tinner partition: {} inner, {} deferred; merge is required", handoff.inner.len(), handoff.deferred.len());
 			emit(&model, steps)?;

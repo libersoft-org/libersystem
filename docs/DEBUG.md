@@ -247,11 +247,21 @@ it replaces them, so undoing a change recompiles rather than restoring an older 
 
 ### Cleaning up
 
-`./dev.sh clean [--dry-run]` prunes what the host accumulates: test logs, baseline samples,
-scratch directories from builds whose process is gone, and sockets no instance owns. It keeps
-the twenty newest runs and samples, reports what it removed, and leaves anything a running
-instance still refers to. It deliberately does not touch the artifact caches or the staged
-images: those are inputs to the next build, and `./clean.sh` is what discards them.
+`.build/logs` keeps what a person or a tool reads and nothing else, and its rules run on their own at
+the start of every top-level run - `./verify.sh`, or `./test.sh` or `./check.sh` started by hand - when
+no other run is alive (each holds `.build/state/logs.lock` while it runs). For each test target they
+keep the newest run, the newest x86_64 guest log carrying a capability trace, and a failed run - one
+whose logs carry no `test suite complete` line, or that had to resume after a failed test - until a
+later run of that target passes; for each gate, its newest kept set; and every file a tracked
+document cites by its path. Everything else in `.build/logs` goes. Experiments write under their
+run's scratch directory, not here.
+
+`./dev.sh clean [--dry-run]` applies those rules by hand - refusing while a run holds the lock, since
+its logs are still being written and read - and prunes the rest of what the host accumulates:
+baseline samples, scratch directories from builds whose process is gone or a day old, and sockets no
+instance owns. It reports what it removed and leaves anything a running instance still refers to. It
+does not touch the staged images or the current cache generations: those are inputs to the next
+build, and `./clean.sh` is what discards them.
 
 ## Timing inside the guest
 

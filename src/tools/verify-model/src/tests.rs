@@ -3238,24 +3238,38 @@ fn a_scoped_run_is_trusted_only_under_current_model_evidence_covering_its_change
 	assert_eq!(store.level("wire", "hash-current", Universe::TestGuest, &earned), Level::Shadow);
 }
 
-// WHERE A PLAN'S TIME GOES: a step that boots nothing and an exclusive guest step run alone, a shared guest step divides
-// over the slots, an unmeasured step is named and not priced at zero, and a price from an older model still counts.
+// WHERE A PLAN'S TIME GOES, as the runner schedules it: a step that runs alone has the machine, the host steps share a
+// lane, the guest steps the slots, and the steps that write one staging run one after another; a host step never
+// measured is named and not priced, a guest step never measured is priced at its seed, and a price from an older model
+// is used and counted.
 #[test]
-fn an_account_separates_the_serial_remainder_from_the_shared_guest_work() {
-	let step = |id: &str, guests: usize, exclusive_guests: bool| crate::commands::Step { id: id.to_string(), requires: Vec::new(), label: id.to_string(), command: String::from("true"), keys: Vec::new(), note: None, guests, exclusive_guests };
-	let steps = vec![step("host", 0, false), step("shared-guest", 1, false), step("exclusive-guest", 1, true), step("never-measured", 1, false)];
+fn an_account_separates_what_runs_alone_the_lanes_and_the_exclusive_chains() {
+	let step = |id: &str, guests: usize, alone: bool, tokens: &[&str]| crate::history::PlannedStep { id: id.to_string(), command: String::from("true"), guests, alone, tokens: tokens.iter().map(|token| token.to_string()).collect() };
+	let steps = vec![
+		step("host", 0, false, &[]),
+		step("shared-guest", 1, false, &["stage:x86_64=r:shipping"]),
+		step("alone-guest", 1, true, &[]),
+		step("writer-one", 0, false, &["stage:x86_64=w:shipping"]),
+		step("writer-two", 1, false, &["stage:x86_64=w:shipping"]),
+		step("never-measured", 0, false, &[]),
+	];
 	let mut history = crate::history::History::default();
-	for (id, seconds, hash) in [("host", 100.0, "current"), ("shared-guest", 50.0, "older"), ("exclusive-guest", 30.0, "current")] {
+	for (id, seconds, hash) in [("host", 100.0, "current"), ("shared-guest", 50.0, "older"), ("alone-guest", 30.0, "current"), ("writer-one", 40.0, "current"), ("writer-two", 45.0, "current")] {
 		history.steps.insert(id.to_string(), crate::history::StepRecord { last_seconds: seconds, model_hash: hash.to_string(), ..Default::default() });
 	}
-	let account = crate::history::Account::of(&steps, &history, "current");
-	assert_eq!(account.alone, 130.0, "the host step and the exclusive guest step run alone");
-	assert_eq!(account.shared, 50.0);
-	assert_eq!(account.unpriced, vec![String::from("never-measured")]);
+	let cost = crate::history::CostModel::default();
+	let account = crate::history::Account::of(&steps, &history, &cost, "current");
+	assert_eq!(account.alone, 30.0, "the step that runs alone");
+	assert_eq!(account.host, 140.0, "the host lane: the host step and the host writer");
+	assert_eq!(account.guest, 95.0, "the guest slots: the reader and the guest writer");
+	assert_eq!(account.chain, (85.0, String::from("stage:x86_64")), "the two writers of one staging run one after another");
+	assert_eq!(account.unpriced, vec![String::from("never-measured")], "a host step never measured is not priced");
 	assert_eq!(account.older, 1, "a price from an older model is used and counted");
 	assert_eq!(account.priced.first().map(|(seconds, id, _)| (*seconds, id.as_str())), Some((100.0, "host")));
-	assert_eq!(account.floor(2), 180.0, "the remainder plus the longest shared step, which is more than half the shared work");
-	assert_eq!(account.total() / 2.0, 90.0);
+	assert_eq!(account.floor(2), 170.0, "what runs alone, then the longest lane - here the host lane");
+	let seeded = crate::history::Account::of(&[step("unmeasured-guest", 1, false, &[])], &crate::history::History::default(), &cost, "current");
+	assert_eq!(seeded.unpriced, Vec::<String>::new(), "a guest step never measured is priced at its seed");
+	assert_eq!(seeded.guest, cost.seed_seconds(1).unwrap());
 }
 
 // WHAT A GATE USES, DECLARED AND HELD TO ITS SCRIPTS. Every gate check.sh runs has a declaration, and every
