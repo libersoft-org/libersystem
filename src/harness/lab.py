@@ -2681,7 +2681,9 @@ def suite_logs_kept(directory, alive):
 				ended.append(run)
 		# The newest ended run, and before it every run that failed since the last one that passed.
 		for newest, run in enumerate(reversed(ended)):
-			passed = any(SUITE_PASSED.search(read_bytes(path)) for path in runs[run] if path.endswith(('-run.log', '-guest.log')))
+			# A RUN THAT HAD TO RESUME FAILED, whatever its resumed boots printed (`test-kernel.sh`'s `-restartN` logs).
+			resumed = any('-restart' in os.path.basename(path) for path in runs[run])
+			passed = not resumed and any(SUITE_PASSED.search(read_bytes(path)) for path in runs[run] if path.endswith(('-run.log', '-guest.log')))
 			if newest == 0 or not passed:
 				kept.update(runs[run])
 			if passed:

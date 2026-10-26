@@ -33,6 +33,9 @@ REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 LOG_DIR="$REPO_ROOT/.build/logs/test"
 mkdir -p "$LOG_DIR"
 LOG_STEM="${ARCH}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+# A RESUMED BOOT'S LOGS BELONG TO ITS SUITE'S RUN (`resume_after`): named after the first boot's, so they are kept
+# and swept with it, and a run that had to resume reads as one that failed.
+[[ -z "${TEST_RESTART_STEM:-}" ]] || LOG_STEM="$TEST_RESTART_STEM-restart${TEST_RESTART_INDEX:?}"
 GUEST_LOG="$LOG_DIR/$LOG_STEM-guest.log"
 RUN_LOG="$LOG_DIR/$LOG_STEM-run.log"
 USB_MIC_PCAP=""
@@ -193,6 +196,7 @@ else
 	MODE="all tags"
 fi
 LIMIT="${TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
+[[ -z "${TEST_AFTER:-}" ]] || MODE="$MODE, resumed after $TEST_AFTER"
 echo "[test-$ARCH] $MODE (timeout $LIMIT)"
 START_SECONDS="$SECONDS"
 if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then
@@ -264,7 +268,7 @@ if [[ "$BUILD_ONLY" != "1" ]]; then
 				quiet=$((quiet + 30))
 			fi
 			if ((quiet >= STALL)); then
-				stuck="$(grep -h -E '^[[:alnum:]_]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | tail -1 | sed -E 's/\.\.\..*$//' || true)"
+				stuck="$(grep -ah -E '^[[:alnum:]_.]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | tail -1 | sed -E 's/\.\.\..*$//' || true)"
 				printf '%s\t%s\n' "${stuck:-unknown}" "$quiet" >"$STALL_MARK.hit"
 				# By pid, and only a guest this shell is an ancestor of - `pgrep` matches every QEMU on
 				# the machine, so ancestry is what makes the victim ours.
@@ -359,7 +363,7 @@ STAGED_TEST_KERNEL="$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.elf"
 	# THE BUILT BINARY'S PATH, ASKED FOR RATHER THAN GUESSED. `--message-format=json` names the
 	# executable cargo produced; the last `compiler-artifact` line carrying one for the `kernel`
 	# target is this selection's test binary.
-	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" USB_GADGET="${USB_GADGET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests --message-format=json >"$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" || exit 1
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" TEST_AFTER="${TEST_AFTER:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" USB_GADGET="${USB_GADGET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests --message-format=json >"$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" || exit 1
 	built="$(
 		python3 - "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" <<'PYEOF'
 import json, sys
@@ -442,15 +446,21 @@ publish_suite_evidence() {
 	evidence_active || return 0
 	# A REFUSED RUN TESTED NOTHING, so it claims nothing either way: its outcome is its next run's.
 	[[ "$SUITE_REFUSED" == 0 ]] || return 0
-	[[ "$BUILD_ONLY" != "1" && -z "$TAGS" && -z "${TEST_SELECTION:-}" && -z "${LIBER_NO_DT_PROFILE:-}" && -z "${USB_GADGET:-}" && -z "${I2C_FIXTURE:-}" ]] || return 0
-	local discharges medium
+	[[ "$BUILD_ONLY" != "1" && -z "$TAGS" && -z "${TEST_SELECTION:-}" && -z "${TEST_AFTER:-}" && -z "${LIBER_NO_DT_PROFILE:-}" && -z "${USB_GADGET:-}" && -z "${I2C_FIXTURE:-}" ]] || return 0
+	local discharges medium log
+	# AND THE BOOTS THAT RESUMED IT: every test any of them reported `[ok]` ran, in a boot of this suite's.
+	local -a logs=("$RUN_LOG" "$GUEST_LOG") log_args=()
+	for log in "$LOG_DIR/$LOG_STEM"-restart*-run.log "$LOG_DIR/$LOG_STEM"-restart*-guest.log; do
+		[[ -f "$log" ]] && logs+=("$log")
+	done
+	for log in "${logs[@]}"; do log_args+=(--log "$log"); done
 	discharges="$(mktemp)"
-	grep -ahoE '^kernel\.[a-z_.0-9]+\.\.\.[[:space:]]*\[ok\]' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | sed -E 's/\.\.\..*$//' | sort -u | sed "s| *\$| / $ARCH / test-guest / test|" >"$discharges" || true
+	grep -ahoE '^kernel\.[a-z_.0-9]+\.\.\.[[:space:]]*\[ok\]' "${logs[@]}" 2>/dev/null | sed -E 's/\.\.\..*$//' | sort -u | sed "s| *\$| / $ARCH / test-guest / test|" >"$discharges" || true
 	local -a inputs=(--input "$STAGED_TEST_KERNEL")
 	# The medium the runner bound, from the line it printed for exactly this.
 	medium="$(sed -n 's/^qemu-run: medium sha256=[0-9a-f]* (\(.*\), held as descriptor [0-9]*).*$/\1/p' "$RUN_LOG" 2>/dev/null | tail -1)"
 	[[ -n "$medium" && -f "$medium" ]] && inputs+=(--input "$medium")
-	evidence_publish "suite.kernel / $ARCH / test-guest / test" "test-kernel.sh" "$SUITE_OUTCOME" "$((SECONDS - START_SECONDS))" "${inputs[@]}" --log "$RUN_LOG" --log "$GUEST_LOG" --discharges-file "$discharges"
+	evidence_publish "suite.kernel / $ARCH / test-guest / test" "test-kernel.sh" "$SUITE_OUTCOME" "$((SECONDS - START_SECONDS))" "${inputs[@]}" "${log_args[@]}" --discharges-file "$discharges"
 	rm -f "$discharges"
 }
 # The staged copy is this run's, and it goes when the run does - read-only, so its own directory's
@@ -720,6 +730,36 @@ if [[ -n "${I2C_FIXTURE:-}" ]]; then
 	fi
 fi
 
+# A FAILURE DOES NOT HIDE THE REST. A failed test ends its boot - the panic handler reports it and exits - and so do
+# a test that stops making progress and one that resets the guest, so one flaky test hid every test after it: the
+# riscv64 suite stopped twice, and 28 and then 11 tests had to be run again by hand. After each, this boots again
+# with the tests after it (`TEST_AFTER`, compile-time like a selection, so one more compile), of whatever this run
+# selected, until the suite has run to its end; every failure is reported, and the verdict stays failed. The resumed
+# boots' logs are named after this run's (`-restartN`), and each failed test is said as it is found.
+TEST_FAILED_LIST="${TEST_FAILED_LIST:-}"
+failed_test() {
+	# The test a failure ended this boot in: the last test the suite opened before `[failed]`, or before the end.
+	cat "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | awk '/^[[:alnum:]_.]+\.\.\./ { id = $0; sub(/\.\.\..*$/, "", id); last = id } /\[failed\]/ && last != "" { print last; found = 1; exit } END { if (!found && last != "") print last }' | tr -d '\r'
+}
+resume_after() {
+	local failed="$1" top=0
+	[[ -n "$failed" && "$failed" != unknown ]] || return 0
+	# A boot that did not run its tests - an unknown id, a selection that named nothing - is not resumed, and nor is
+	# one whose suite ran to its end and failed on something after it.
+	! grep -ahqE '^test (selection|resume|filter) error|^test suite complete: ' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null || return 0
+	if [[ -z "$TEST_FAILED_LIST" ]]; then
+		TEST_FAILED_LIST="$(mktemp)"
+		top=1
+	fi
+	printf '%s\n' "$failed" >>"$TEST_FAILED_LIST"
+	echo "[test-$ARCH] FAILED: $failed - the tests after it run in a boot of their own" >&2
+	TEST_AFTER="$failed" TEST_FAILED_LIST="$TEST_FAILED_LIST" TEST_RESTART_STEM="${TEST_RESTART_STEM:-$LOG_STEM}" TEST_RESTART_INDEX="$((${TEST_RESTART_INDEX:-0} + 1))" bash "$ROOT/harness/test-kernel.sh" "$ARCH" ${TAGS:+"$TAGS"} || true
+	if ((top == 1)); then
+		echo "[test-$ARCH] $(wc -l <"$TEST_FAILED_LIST") test(s) of this suite failed: $(tr '\n' ' ' <"$TEST_FAILED_LIST")- every test after each ran" >&2
+		rm -f "$TEST_FAILED_LIST"
+	fi
+}
+
 set +e
 (
 	cd "$ROOT/kernel"
@@ -779,6 +819,7 @@ if [[ -f "$STALL_MARK.hit" ]]; then
 	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
 	echo "[test-$ARCH] NO PROGRESS in $stuck - no test completed for ${quiet}s, so the guest was stopped" >&2
 	echo "[test-$ARCH] What this knows is that nothing FINISHED in that window, not that anything is wedged - it cannot tell those apart and neither can a person reading the log. Two ways to find out: the [ok] (N s) figures above say what this target's slow tests actually cost, and TEST_STALL=<seconds> raises the window if one of them legitimately exceeds it." >&2
+	resume_after "$stuck"
 	exit 125
 fi
 if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\ttest_driver\tend\n' "$(date +%s%N)" >>"$LIBER_TIMING_LOG"; fi
@@ -811,7 +852,7 @@ wrong_kernel_diagnosis() {
 
 if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
-	last="$(grep -h -E '^[[:alnum:]_]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" | tail -1 | sed -E 's/\.\.\..*$//' || true)"
+	last="$(grep -ah -E '^[[:alnum:]_.]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" | tail -1 | sed -E 's/\.\.\..*$//' || true)"
 	[[ -n "$last" ]] || last="unknown"
 	echo "[test-$ARCH] TIMEOUT after $LIMIT; last test: $last" >&2
 	# NO TEST AT ALL RAN, AND THE LOADER SAYS WHY.
@@ -823,6 +864,7 @@ if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 	# the only thing said about it is "last test: unknown". Three minutes of nothing, twice, before
 	# the guest log was read closely enough to notice which kernel had booted.
 	if [[ "$last" == "unknown" ]]; then wrong_kernel_diagnosis; fi
+	resume_after "$last"
 	exit 124
 fi
 if [[ "$status" -eq 0 ]] && ! grep -hEq '^test suite complete: [0-9]+ passed' "$RUN_LOG" "$GUEST_LOG"; then
@@ -843,7 +885,8 @@ if [[ "$status" -eq 0 ]] && ! grep -hEq '^test suite complete: [0-9]+ passed' "$
 		exit 1
 	fi
 	echo "[test-$ARCH] GUEST RESET: QEMU ended without the debug-exit signal, so the guest reset or powered off" >&2
-	echo "[test-$ARCH] the last line of the guest log names the test it happened in; every test after it never ran" >&2
+	echo "[test-$ARCH] the last line of the guest log names the test it happened in" >&2
+	resume_after "$(failed_test)"
 	exit 1
 fi
 # WHICH FILES CARRY THIS RUN'S RESULT, SAID BY THE RUN THAT MADE THEM.
@@ -879,5 +922,6 @@ if [[ "$status" -eq 0 ]]; then
 else
 	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
 	echo "[test-$ARCH] FAIL (exit $status, ${elapsed}s); logs: $RUN_LOG $GUEST_LOG" >&2
+	resume_after "$(failed_test)"
 fi
 exit "$status"

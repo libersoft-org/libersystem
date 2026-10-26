@@ -177,6 +177,150 @@ pub fn order_for_slots(mut pending: Vec<Step>, cost: impl Fn(&Step) -> Option<f6
 	Ok(ordered)
 }
 
+// A KERNEL SUITE SPLIT ACROSS GUESTS, on the emulated targets.
+//
+// Each guest's work runs on one host core under TCG, and the ports' suites took 4270 s and about 4300 s while a boot
+// costs 25 to 40 s - half of aarch64's time in six tests. So a port's selected tests are dealt into parts by their
+// measured durations (`measured_test_durations`), the six heaviest each in a part of its own and the rest dealt
+// dearest-first onto the lightest part, and each part runs as an exact selection in a guest of its own. A part
+// discharges the kernel-test keys of the tests it runs and never `suite.kernel`, which only a whole run discharges:
+// a step whose key is `suite.kernel` - the release's - is never split. `TEST_SELECTION` is compile-time and the
+// compile takes the architecture's build lock, so every part is one more compile; the number of parts is chosen
+// with that: each part is charged `overhead` (its compile and its boot) and the count is the one whose estimate over
+// `width` slots - the work spread over them, or the dearest part, whichever is longer - is least.
+//
+// x86_64 is not split: under KVM its whole suite runs in minutes, and the inner tier owns it whole.
+pub const SPLIT_TARGETS: [&str; 2] = ["aarch64", "riscv64"];
+pub const HEAVIEST_ALONE: usize = 6;
+
+pub fn split_suites(steps: Vec<Step>, durations: &BTreeMap<String, BTreeMap<String, f64>>, overhead: impl Fn(&str) -> f64, width: usize) -> Vec<Step> {
+	let mut out = Vec::with_capacity(steps.len());
+	let mut replaced: BTreeMap<String, Vec<String>> = BTreeMap::new();
+	for step in steps {
+		let architecture = step.id.strip_prefix("guest:").and_then(|rest| rest.split(':').next()).unwrap_or("").to_string();
+		let tests_only = !step.keys.is_empty() && step.keys.iter().all(|key| key.check.starts_with("kernel.") && key.architecture == architecture && key.environment == Environment::TestGuest);
+		if !SPLIT_TARGETS.contains(&architecture.as_str()) || !tests_only || step.keys.len() <= HEAVIEST_ALONE + 1 {
+			out.push(step);
+			continue;
+		}
+		let measured = durations.get(&architecture);
+		let cost = |key: &crate::plan::PlanItemKey| measured.and_then(|map| map.get(&key.check)).copied().unwrap_or(0.5);
+		let mut keys = step.keys.clone();
+		keys.sort_by(|left, right| cost(right).total_cmp(&cost(left)).then(left.check.cmp(&right.check)));
+		let heavy: Vec<crate::plan::PlanItemKey> = keys.drain(..HEAVIEST_ALONE).collect();
+		let total: f64 = heavy.iter().chain(&keys).map(&cost).sum();
+		let heaviest = heavy.iter().map(&cost).fold(0.0, f64::max);
+		let per_part = overhead(&architecture);
+		let deal = |count: usize| {
+			let mut parts: Vec<(f64, Vec<crate::plan::PlanItemKey>)> = vec![(0.0, Vec::new()); count];
+			for key in &keys {
+				let lightest = parts.iter_mut().min_by(|left, right| left.0.total_cmp(&right.0)).expect("at least one part");
+				lightest.0 += cost(key);
+				lightest.1.push(key.clone());
+			}
+			parts.retain(|part| !part.1.is_empty());
+			parts
+		};
+		let estimate = |parts: &[(f64, Vec<crate::plan::PlanItemKey>)]| {
+			let count = (HEAVIEST_ALONE + parts.len()) as f64;
+			let dearest = parts.iter().map(|part| part.0).fold(heaviest, f64::max);
+			((count * per_part + total) / width.max(1) as f64).max(per_part + dearest)
+		};
+		let mut best = deal(1);
+		for count in 2..=keys.len().min(2 * width.max(1)) {
+			let candidate = deal(count);
+			if estimate(&candidate) < estimate(&best) {
+				best = candidate;
+			}
+		}
+		let mut parts: Vec<Vec<crate::plan::PlanItemKey>> = heavy.into_iter().map(|key| vec![key]).collect();
+		parts.extend(best.into_iter().map(|part| part.1));
+		let count = parts.len();
+		let mut ids = Vec::new();
+		for (index, mut part) in parts.into_iter().enumerate() {
+			part.sort_by(|left, right| left.check.cmp(&right.check));
+			let selection: Vec<String> = part.iter().map(|key| key.check.clone()).collect();
+			let id = scoped_id("guest", &architecture, &selection);
+			ids.push(id.clone());
+			out.push(Step { id, requires: step.requires.clone(), label: format!("kernel suite {architecture} part {}/{count}", index + 1), command: format!("TEST_SELECTION={} ./test.sh --arch {architecture}", selection.join(",")), keys: part, note: Some(format!("{} of the suite's {} selected tests, dealt by their measured durations into {count} guests", selection.len(), step.keys.len())), guests: 1, exclusive_guests: false });
+		}
+		replaced.insert(step.id.clone(), ids);
+	}
+	// What required the whole step requires every part of it.
+	for step in &mut out {
+		let mut requires = Vec::new();
+		for required in &step.requires {
+			match replaced.get(required) {
+				Some(parts) => requires.extend(parts.iter().cloned()),
+				None => requires.push(required.clone()),
+			}
+		}
+		requires.sort();
+		requires.dedup();
+		step.requires = requires;
+	}
+	out
+}
+
+// WHAT EACH KERNEL TEST TOOK, per target, from the newest run of that target's suite the logs keep (`.build/logs/test`,
+// where `./lab.sh dev-clean` keeps each target's newest run): the `[ok] (N s)` the runner prints after a test of a
+// second or more, and half a second for one it prints `[ok]` after alone. A whole run is preferred to a selection,
+// since it measured every test.
+pub fn measured_test_durations(repo_root: &std::path::Path) -> BTreeMap<String, BTreeMap<String, f64>> {
+	let directory = repo_root.join(".build/logs/test");
+	let mut runs: BTreeMap<(String, String), Vec<std::path::PathBuf>> = BTreeMap::new();
+	for entry in std::fs::read_dir(&directory).into_iter().flatten().flatten() {
+		let name = entry.file_name().to_string_lossy().to_string();
+		let Some((architecture, rest)) = name.split_once('-') else { continue };
+		if !crate::registry::ARCHITECTURES.contains(&architecture) || !(name.ends_with("-guest.log") || name.ends_with("-run.log")) {
+			continue;
+		}
+		let stem: String = rest.splitn(3, '-').take(2).collect::<Vec<_>>().join("-");
+		runs.entry((architecture.to_string(), stem)).or_default().push(entry.path());
+	}
+	let mut durations: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+	for architecture in crate::registry::ARCHITECTURES {
+		let mut chosen: Option<(bool, String, BTreeMap<String, f64>)> = None;
+		for ((arch, stem), paths) in &runs {
+			if arch != architecture {
+				continue;
+			}
+			let mut whole = false;
+			let mut measured = BTreeMap::new();
+			for path in paths {
+				let Ok(bytes) = std::fs::read(path) else { continue };
+				let text = String::from_utf8_lossy(&bytes);
+				let mut current: Option<String> = None;
+				for line in text.lines() {
+					whole |= line.contains("tests (all tags)");
+					if let Some(at) = line.find("...")
+						&& line.starts_with("kernel.")
+						&& line[..at].bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+					{
+						current = Some(line[..at].to_string());
+					}
+					if let (Some(id), Some(at)) = (&current, line.find("[ok]")) {
+						let seconds = line[at + 4..].trim().strip_prefix('(').and_then(|rest| rest.strip_suffix(" s)")).and_then(|number| number.parse::<f64>().ok()).unwrap_or(0.5);
+						measured.insert(id.clone(), seconds);
+						current = None;
+					}
+				}
+			}
+			let better = match &chosen {
+				None => true,
+				Some((chosen_whole, chosen_stem, _)) => (whole, stem.as_str()) > (*chosen_whole, chosen_stem.as_str()),
+			};
+			if better && !measured.is_empty() {
+				chosen = Some((whole, stem.clone(), measured));
+			}
+		}
+		if let Some((_, _, measured)) = chosen {
+			durations.insert(architecture.to_string(), measured);
+		}
+	}
+	durations
+}
+
 // A long list is digested rather than spelled. Two hundred selected ids make a nine-kilobyte name,
 // and an identity has to be stable and distinct, not readable.
 fn scoped_id(kind: &str, scope: &str, parts: &[String]) -> String {

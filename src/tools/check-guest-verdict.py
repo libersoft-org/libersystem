@@ -1130,6 +1130,91 @@ print(json.dumps({'reason':'compiler-artifact','executable':str(out),'target':{'
         self.assertTrue(started)
 
 
+class KernelSuiteResumes(unittest.TestCase):
+    """A FAILURE DOES NOT HIDE THE REST: the real test-kernel.sh, over a stand-in compiler that records the resume
+    point it is given and a stand-in runner that plays a six-test suite from there, failing where it is told to.
+    Watched failing against the runner as it stood: the suite ended at its first failure and the tests after it
+    never ran."""
+
+    TESTS = [f"kernel.fixture.t{n}" for n in range(1, 7)]
+    RUNNER = """#!/usr/bin/env python3
+import os, pathlib, sys
+root = pathlib.Path(os.environ["FIXTURE_ROOT"])
+after = (root / "after").read_text().strip()
+tests = [f"kernel.fixture.t{n}" for n in range(1, 7)]
+if after:
+    tests = tests[tests.index(after) + 1:]
+fail = os.environ.get("FAIL_AT", "").split()
+with open(os.environ["SERIAL"].removeprefix("file:"), "w") as log:
+    log.write(f"running {len(tests)} tests (all tags)\\n")
+    for test in tests:
+        with open(root / "ran", "a") as ran:
+            ran.write(test + "\\n")
+        if test in fail:
+            log.write(f"{test}...\\t[failed]\\npanicked at the planted failure\\n")
+            sys.exit(1)
+        log.write(f"{test}...\\t[ok]\\n")
+    log.write(f"test suite complete: {len(tests)} passed\\n")
+"""
+    CARGO = """#!/usr/bin/env python3
+import json, os, pathlib, subprocess
+root = pathlib.Path(os.environ["FIXTURE_ROOT"])
+out = root / ".build/fixture-kernel"
+subprocess.run(["cc", "-x", "c", "-", "-o", str(out)], input="int main(void) { return 0; }", text=True, check=True)
+(root / "after").write_text(os.environ.get("TEST_AFTER", ""))
+with open(root / "compiles", "a") as handle:
+    handle.write((os.environ.get("TEST_AFTER") or "-") + "\\n")
+print(json.dumps({"reason": "compiler-artifact", "executable": str(out), "target": {"name": "kernel"}}))
+"""
+
+    def run_suite(self, fail_at, source=None):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            harness = root / "src/harness"
+            harness.mkdir(parents=True)
+            (root / "src/kernel").mkdir()
+            (root / "bin").mkdir()
+            tools = root / "src/tools"
+            tools.mkdir(parents=True)
+            (tools / "evidence.sh").write_text((HERE / "evidence.sh").read_text())
+            (tools / "staging-state.sh").write_text((HERE / "staging-state.sh").read_text())
+            (harness / "test-kernel.sh").write_text(source or (ROOT / "src/harness/test-kernel.sh").read_text())
+            for path, text in ((harness / "qemu-run.sh", self.RUNNER), (root / "bin/cargo", self.CARGO)):
+                path.write_text(text)
+                path.chmod(0o755)
+            env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}", FIXTURE_ROOT=str(root), FAIL_AT=" ".join(fail_at), TEST_STALL="600")
+            for name in ("TEST_SELECTION", "TEST_AFTER", "TEST_FAILED_LIST", "TEST_RESTART_STEM", "TEST_RESTART_INDEX", "LIBER_VERIFY_RUN"):
+                env.pop(name, None)
+            result = subprocess.run(["bash", str(harness / "test-kernel.sh"), "x86_64"], env=env, capture_output=True, text=True, timeout=120)
+            ran = (root / "ran").read_text().split() if (root / "ran").exists() else []
+            compiles = (root / "compiles").read_text().split()
+            logs = sorted(path.name for path in (root / ".build/logs/test").iterdir())
+            return result, ran, compiles, logs
+
+    def test_one_planted_failure_is_reported_and_every_later_test_runs(self):
+        result, ran, compiles, logs = self.run_suite(["kernel.fixture.t3"])
+        self.assertNotEqual(result.returncode, 0, "the verdict stays failed")
+        self.assertEqual(ran, self.TESTS, "every test ran exactly once, in the suite's order")
+        self.assertIn("FAILED: kernel.fixture.t3", result.stderr)
+        self.assertIn("1 test(s) of this suite failed: kernel.fixture.t3", result.stderr)
+        self.assertEqual(compiles, ["-", "kernel.fixture.t3"], "one more compile for the resumed boot")
+        self.assertEqual(len([name for name in logs if "-restart1-" in name]), 2, "the resumed boot's run and guest logs, named after the suite's run")
+
+    def test_every_failure_of_the_suite_is_reported(self):
+        result, ran, compiles, _ = self.run_suite(["kernel.fixture.t2", "kernel.fixture.t5"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(ran, self.TESTS)
+        self.assertIn("2 test(s) of this suite failed: kernel.fixture.t2 kernel.fixture.t5", result.stderr)
+        self.assertEqual(compiles, ["-", "kernel.fixture.t2", "kernel.fixture.t5"])
+
+    def test_a_passing_suite_boots_once(self):
+        result, ran, compiles, logs = self.run_suite([])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(ran, self.TESTS)
+        self.assertEqual(compiles, ["-"])
+        self.assertFalse([name for name in logs if "-restart" in name])
+
+
 class ThreeDimensionalGatePhases(unittest.TestCase):
     """Execute the real report/verdict loop; the guest command alone is a bounded stand-in."""
 

@@ -3541,7 +3541,24 @@ fn report_retirement() {
 	serial_println!("memory: {} page(s) retired for good, {} page(s) lost in all, {} free(s) refused", crate::mem::frame::retired_pages(), crate::mem::frame::lost_pages(), crate::mem::frame::refused_frees());
 }
 
-pub(crate) fn test_runner(tests: &[&dyn Testable]) {
+pub(crate) fn test_runner(all: &[&dyn Testable]) {
+	// A RESUMED RUN: the tests after the one that failed, in a boot of their own (`TEST_AFTER`). A failed
+	// test stops the suite - the panic handler reports it and exits - so a flaky test hid every test
+	// after it, and the harness boots again with the ones after it, of whatever this run selected. The
+	// order is the suite's own. An id this kernel does not have is a hard failure, as a selection's is.
+	let tests: &[&dyn Testable] = match option_env!("TEST_AFTER").map(str::trim).filter(|value| !value.is_empty()) {
+		Some(after) => match all.iter().position(|test| test.id() == after) {
+			Some(at) => {
+				serial_println!("resuming after {after}: the {} test(s) up to it ran in an earlier boot", at + 1);
+				&all[at + 1..]
+			}
+			None => {
+				serial_println!("test resume error: no test with id '{after}'");
+				arch::exit_qemu(false);
+			}
+		},
+		None => all,
+	};
 	// Exact selection first: a list of stable IDs, which is the machine's execution interface.
 	//
 	// Tags are the human one and they answer a different question - "everything to do with audio" -
@@ -3553,13 +3570,15 @@ pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 	// false green this whole mechanism exists against, and a renamed test is exactly how a selection
 	// comes to name something that no longer exists.
 	if let Some(list) = option_env!("TEST_SELECTION").filter(|value| !value.trim().is_empty()) {
-		let wanted: Vec<&str> = list.split(',').map(str::trim).filter(|value| !value.is_empty()).collect();
-		for name in &wanted {
-			if !tests.iter().any(|test| test.id() == *name) {
+		let named: Vec<&str> = list.split(',').map(str::trim).filter(|value| !value.is_empty()).collect();
+		for name in &named {
+			if !all.iter().any(|test| test.id() == *name) {
 				serial_println!("test selection error: no test with id '{name}'");
 				arch::exit_qemu(false);
 			}
 		}
+		// The selected tests still to run: on a resumed run, the ones after the test that failed.
+		let wanted: Vec<&str> = named.into_iter().filter(|name| tests.iter().any(|test| test.id() == *name)).collect();
 		let mut ran = 0usize;
 		serial_println!("running {} selected tests ({} total)", wanted.len(), tests.len());
 		for test in tests {

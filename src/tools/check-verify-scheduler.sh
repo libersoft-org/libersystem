@@ -537,6 +537,41 @@ rc=0
 run_staging "$plan" 1 || rc=$?
 check "a host step and a guest step run at once" "start-guest start-host" "$(trace_of | cut -d' ' -f1-2 | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ *$//')"
 
+# 10. A RELEASE WRITES ITS DOSSIER EVEN WHEN A STEP WAS SKIPPED. At `--jobs 1` the two-guest gate is not started, and
+#     the run used to end INCOMPLETE with no dossier at all - the dossier is what names the keys it lacks. A private
+#     in-place release whose `cargo` answers `run-start` and `dossier` and records what it is asked.
+release="$work/release"
+mkdir -p "$release/src/tools/verify-model" "$release/bin"
+cp "$repo/verify.sh" "$repo/lib.sh" "$release/"
+cp "$repo/src/tools/result-logs.sh" "$repo/src/tools/evidence.sh" "$repo/src/tools/staging-state.sh" "$release/src/tools/"
+: >"$release/src/tools/verify-model/Cargo.toml"
+cat >"$release/bin/cargo" <<'RECORDER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CARGO_CALLS"
+case " $* " in
+*" run-start "*)
+	mkdir -p "$RELEASE_RUN/logs"
+	echo "$RELEASE_RUN"
+	;;
+*" dossier "*) printf '# Release dossier - run fixture (INCOMPLETE)\n' >"$RELEASE_RUN/dossier.md" ;;
+esac
+exit 0
+RECORDER
+chmod +x "$release/bin/cargo"
+plan="$release/plan"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	printf 'STEP\t0\t0\tthe two-guest gate\ttrue\t\n'
+	printf 'STEPID\t0\tid-0\nSTEPCOST\t0\t1\nSTEPGUESTS\t0\t2\n'
+} >"$plan"
+out="$release/out.log"
+rc=0
+(cd "$release" && PATH="$release/bin:$PATH" CARGO_CALLS="$release/calls" RELEASE_RUN="$release/run" LIBER_VERIFY_STEPS="$plan" ./verify.sh --release --in-place --jobs 1) >"$out" 2>&1 || rc=$?
+touch "$release/calls"
+check "a release with a step skipped for the slots is INCOMPLETE" 6 "$rc"
+check "and its dossier is collected all the same" 1 "$(grep -c ' dossier ' "$release/calls" || true)"
+check "and said" 1 "$(grep -c 'the release run is INCOMPLETE' "$out" || true)"
+
 if ((failed != 0)); then
 	echo "verify-scheduler: the shell scheduler did not behave as the milestone requires" >&2
 	exit 1

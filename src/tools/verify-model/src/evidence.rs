@@ -56,6 +56,10 @@ pub struct Envelope {
 	#[serde(default)]
 	pub discharges: Vec<String>,
 	pub published_at: String,
+	// THE RUN THAT PRODUCED IT, for an envelope a continued run took over from an earlier one (`continue_from`); the
+	// dossier names it, and the collector holds that run's identity to this one's.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub continued_from: Option<String>,
 }
 
 pub fn sha256_file(path: &Path) -> Result<String, String> {
@@ -172,6 +176,60 @@ impl Run {
 		Ok(out)
 	}
 
+	pub fn identity_block(&self) -> Result<serde_json::Value, String> {
+		let path = self.root.join("identity.json");
+		serde_json::from_str(&std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?).map_err(|error| format!("{}: {error}", path.display()))
+	}
+
+	// A RUN CONTINUES WHAT AN IDENTICAL ONE LEFT: every PASSED envelope of `earlier` this run has none for is taken
+	// over - its logs copied into this run under the same names and digests, the envelope republished as this run's
+	// and marked with the run that produced it - when the two identity blocks agree on the tree, every tool's and
+	// firmware image's digest, the configurations and the environment (`identity::continuation_differences`). What
+	// failed or never ran is left for this run. Refused, naming what moved, when they do not agree.
+	pub fn continue_from(&self, earlier: &Run) -> Result<Vec<String>, String> {
+		let differences = crate::identity::continuation_differences(&self.identity_block()?, &earlier.identity_block()?);
+		if !differences.is_empty() {
+			return Err(format!("run {} cannot be continued: {} moved since it ran", earlier.id()?, differences.join(", ")));
+		}
+		let (run, identity) = (self.id()?, self.identity_digest()?);
+		let mut taken = Vec::new();
+		for (_, envelope) in earlier.envelopes()? {
+			if envelope.outcome != "passed" || self.root.join("evidence").join(key_file_name(&envelope.key)).exists() {
+				continue;
+			}
+			for log in &envelope.logs {
+				let (from, to) = (earlier.root.join(&log.path), self.root.join(&log.path));
+				if sha256_file(&from)? != log.sha256 {
+					return Err(format!("run {}'s log {} is not the one its envelope recorded", earlier.id()?, log.path));
+				}
+				if let Some(parent) = to.parent() {
+					std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+				}
+				std::fs::copy(&from, &to).map_err(|error| format!("{}: {error}", to.display()))?;
+			}
+			let producer_run = envelope.continued_from.clone().unwrap_or_else(|| envelope.run.clone());
+			let key = envelope.key.clone();
+			self.publish(&Envelope { run: run.clone(), identity: identity.clone(), continued_from: Some(producer_run), ..envelope })?;
+			taken.push(key);
+		}
+		write_atomically(&self.root.join("continued-from"), format!("{}\n", earlier.root.display()).as_bytes())?;
+		Ok(taken)
+	}
+
+	// Withdraw a taken-over envelope this run is going to produce again, and the logs it named.
+	pub fn withdraw(&self, key: &str) -> Result<(), String> {
+		let path = self.root.join("evidence").join(key_file_name(key));
+		let Ok(text) = std::fs::read_to_string(&path) else { return Ok(()) };
+		let envelope: Envelope = serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+		if envelope.continued_from.is_none() {
+			return Ok(());
+		}
+		for log in &envelope.logs {
+			let _ = std::fs::remove_file(self.root.join(&log.path));
+		}
+		std::fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))
+	}
+
 	pub fn envelopes(&self) -> Result<Vec<(PathBuf, Envelope)>, String> {
 		let dir = self.root.join("evidence");
 		let mut out = Vec::new();
@@ -206,6 +264,9 @@ pub enum Refusal {
 	// they all still match each other - which is exactly why the collector has to look at the tree
 	// itself rather than at the envelopes.
 	SourceChanged { recorded: String, current: String },
+	// An envelope taken over from a run whose identity is not this one's - a QEMU, a firmware image, the tree - or
+	// from a run that is not there to be compared.
+	ContinuedChanged { key: String, run: String, moved: String },
 }
 
 impl Refusal {
@@ -222,6 +283,7 @@ impl Refusal {
 			Refusal::Unparsable { path, error } => format!("{path} is not an envelope: {error}"),
 			Refusal::Schema { path, schema } => format!("{path} carries schema `{schema}`, not {ENVELOPE_SCHEMA}"),
 			Refusal::SourceChanged { recorded, current } => format!("the tree changed while the run was in progress: the run started at source identity {recorded} and the tree now reads {current}"),
+			Refusal::ContinuedChanged { key, run, moved } => format!("the envelope for `{key}` was taken over from run {run}, and {moved}"),
 		}
 	}
 }
@@ -237,6 +299,8 @@ pub struct DossierRow {
 	pub outputs: Vec<Artifact>,
 	pub logs: Vec<Artifact>,
 	pub discharges: usize,
+	// The run that produced it, when this run took it over from an earlier one.
+	pub from_run: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -314,6 +378,20 @@ pub fn collect(run: &Run, required: &BTreeSet<String>, known: &BTreeSet<String>,
 			refusals.push(Refusal::Stale { key: key.clone(), identity: envelope.identity.clone(), expected: identity.clone() });
 			continue;
 		}
+		// TAKEN OVER FROM AN EARLIER RUN: that run, beside this one, still has to be this run's identity.
+		if let Some(producer) = &envelope.continued_from {
+			let moved = match Run::new(&run.root.with_file_name(producer)).identity_block() {
+				Ok(block) => {
+					let differences = crate::identity::continuation_differences(&identity_block, &block);
+					if differences.is_empty() { String::new() } else { format!("{} moved since it ran", differences.join(", ")) }
+				}
+				Err(_) => String::from("that run is not there to be compared"),
+			};
+			if !moved.is_empty() {
+				refusals.push(Refusal::ContinuedChanged { key: key.clone(), run: producer.clone(), moved });
+				continue;
+			}
+		}
 		for log in &envelope.logs {
 			let full = run.root.join(&log.path);
 			match sha256_file(&full) {
@@ -326,7 +404,7 @@ pub fn collect(run: &Run, required: &BTreeSet<String>, known: &BTreeSet<String>,
 		if required_key && envelope.outcome != "passed" {
 			refusals.push(Refusal::FailedRequired { key: key.clone(), outcome: envelope.outcome.clone() });
 		}
-		rows.push(DossierRow { key: key.clone(), required: required_key, outcome: envelope.outcome.clone(), duration_seconds: envelope.duration_seconds, producer: envelope.producer.clone(), inputs: envelope.inputs.clone(), outputs: envelope.outputs.clone(), logs: envelope.logs.clone(), discharges: envelope.discharges.len() });
+		rows.push(DossierRow { key: key.clone(), required: required_key, outcome: envelope.outcome.clone(), duration_seconds: envelope.duration_seconds, producer: envelope.producer.clone(), inputs: envelope.inputs.clone(), outputs: envelope.outputs.clone(), logs: envelope.logs.clone(), discharges: envelope.discharges.len(), from_run: envelope.continued_from.clone() });
 	}
 	// A required key may also be discharged by another envelope (a whole-suite run discharges its
 	// kernel tests); a key with neither its own envelope nor a discharger is MISSING.
@@ -361,10 +439,16 @@ pub fn render(dossier: &Dossier, rendered_at: &str) -> String {
 		}
 		out.push('\n');
 	}
-	out.push_str("## Rows\n\n| key | required | outcome | seconds | producer | inputs | outputs | logs | discharges |\n| --- | --- | --- | ---: | --- | --- | --- | --- | ---: |\n");
+	// A CONTINUED RUN SAYS SO, and names the run each taken-over envelope came from.
+	let taken: Vec<&str> = dossier.rows.iter().filter_map(|row| row.from_run.as_deref()).collect();
+	if !taken.is_empty() {
+		let runs: BTreeSet<&str> = taken.iter().copied().collect();
+		out.push_str(&format!("Continued: {} envelope(s) taken over from run(s) {}, whose identity is this run's; the rest ran here.\n\n", taken.len(), runs.into_iter().collect::<Vec<_>>().join(", ")));
+	}
+	out.push_str("## Rows\n\n| key | required | outcome | seconds | producer | from run | inputs | outputs | logs | discharges |\n| --- | --- | --- | ---: | --- | --- | --- | --- | --- | ---: |\n");
 	for row in &dossier.rows {
 		let fmt = |a: &[Artifact]| a.iter().map(|x| format!("`{}` {}", x.path, &x.sha256[..12])).collect::<Vec<_>>().join("<br>");
-		out.push_str(&format!("| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n", row.key, if row.required { "yes" } else { "no" }, row.outcome, row.duration_seconds, row.producer, fmt(&row.inputs), fmt(&row.outputs), fmt(&row.logs), row.discharges));
+		out.push_str(&format!("| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n", row.key, if row.required { "yes" } else { "no" }, row.outcome, row.duration_seconds, row.producer, row.from_run.as_deref().unwrap_or("this run"), fmt(&row.inputs), fmt(&row.outputs), fmt(&row.logs), row.discharges));
 	}
 	out.push_str(&format!("\nrendered-at: {rendered_at}\n"));
 	out

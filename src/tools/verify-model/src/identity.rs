@@ -136,6 +136,46 @@ pub const PERMITTED_ENVIRONMENT: [&str; 29] = [
 	"TEST_TAGS",
 	"TEST_SELECTION",
 ];
+// THE RUN'S OWN BOOKKEEPING among the permitted variables: which run, which logs holder, which step's refusal file.
+// Two runs of one tree differ in these and in nothing that changes what a step proves.
+pub const PER_RUN_ENVIRONMENT: [&str; 8] = [
+	"LIBER_VERIFY_RUN",
+	"LIBER_PUBLISH_LOCK",
+	"LIBER_LOGS_RUN",
+	"LIBER_STAGING_RUNNER",
+	"LIBER_STATE_REFUSAL",
+	"LIBER_INJECTION_TRACE",
+	"LIBER_GATE_KEY",
+	"LIBER_VERIFY_HISTORY",
+];
+
+// WHERE TWO RUNS' IDENTITY BLOCKS DIFFER in what a run's evidence depends on: the tree, each tool's digest (QEMU, the
+// toolchain, the image tools), each firmware image, each configuration file, and the environment but for the run's
+// own bookkeeping. Empty when a run may continue what the other left (`evidence::Run::continue_from`).
+pub fn continuation_differences(one: &serde_json::Value, two: &serde_json::Value) -> Vec<String> {
+	let mut differences = Vec::new();
+	if one.pointer("/source/value") != two.pointer("/source/value") {
+		differences.push(String::from("the source tree"));
+	}
+	let tools = |block: &serde_json::Value| -> BTreeMap<String, String> { block.get("tools").and_then(|tools| tools.as_array()).into_iter().flatten().filter_map(|tool| Some((tool.get("name")?.as_str()?.to_string(), tool.get("sha256")?.as_str()?.to_string()))).collect() };
+	let (left, right) = (tools(one), tools(two));
+	for name in left.keys().chain(right.keys()).collect::<std::collections::BTreeSet<_>>() {
+		if left.get(name) != right.get(name) {
+			differences.push(format!("the tool {name}"));
+		}
+	}
+	for block in ["firmware", "configurations"] {
+		if one.get(block) != two.get(block) {
+			differences.push(format!("the {block}"));
+		}
+	}
+	let environment = |block: &serde_json::Value| -> BTreeMap<String, String> { block.get("environment").and_then(|environment| environment.as_object()).into_iter().flatten().filter(|(name, _)| !PER_RUN_ENVIRONMENT.contains(&name.as_str())).map(|(name, value)| (name.clone(), value.to_string())).collect() };
+	if environment(one) != environment(two) {
+		differences.push(String::from("the environment"));
+	}
+	differences
+}
+
 pub const GUARDED_PREFIXES: [&str; 5] = ["LIBER_", "OVMF_", "AAVMF_", "QEMU_", "TEST_"];
 
 fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {

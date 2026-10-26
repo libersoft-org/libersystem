@@ -419,13 +419,14 @@ pub fn step_declaration(step: &crate::commands::Step) -> Option<Declaration> {
 
 // THE GATES WHOSE SCRIPTS NAME A RUNNER OR A BUILD THEY DO NOT RUN, and why: each is held to its declaration
 // on the other half only. `(gate, "guest" | "staging" | "both", reason)`.
-pub const NAMES_WHAT_IT_DOES_NOT_RUN: [(&str, &str, &str); 6] = [
+pub const NAMES_WHAT_IT_DOES_NOT_RUN: [(&str, &str, &str); 7] = [
 	("boot-harness", "both", "host tests of lab.py and the scenario runner, against fakes and copies in temporary trees"),
 	("guest-verdict", "both", "host tests of the guest runners, with stand-in QEMU, runners and builds in temporary trees"),
 	("run-verdict", "guest", "copies of the entry scripts in private trees, with stub runners; its one real build is declared"),
 	("test-tags", "guest", "asks test.sh for the tags it accepts, which boots nothing"),
 	("dma-mode-carrier", "both", "reads the runners' sources for the run-mode carrier, and runs none of them"),
 	("gate-result-logs", "both", "reads the gate scripts' sources for how they find their logs, and runs none of them"),
+	("verify-scheduler", "staging", "drives the runner over prepared plans in a private tree, with a `build.sh` stand-in it writes there"),
 ];
 
 // WHAT A GATE'S SCRIPTS WERE SEEN TO CALL: a runner, which boots a guest, and a build, which writes a staging.

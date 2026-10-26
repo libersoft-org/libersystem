@@ -385,6 +385,11 @@ release_prepare() {
 	if ((release_in_place == 0)); then
 		src/tools/release-snapshot.sh seal "$release_snapshot" || die "the snapshot could not be sealed"
 	fi
+	# AN L2 - IN PLACE, OVER THE WHOLE REQUIRED SET - IS MARKED, so a later identical one can continue what it left
+	# (`continue-run`, after the plan). A sealed release (L3) and a narrowed rehearsal continue nothing.
+	if ((release_in_place == 1)) && [[ -z "$release_required_file" ]]; then
+		echo L2 >"$release_run_dir/level"
+	fi
 	export LIBER_VERIFY_RUN="$release_run_dir"
 	export LIBER_RELEASE_REQUIRED="${release_required_file:-$release_snapshot/src/tools/verify-model/model/release-required.toml}"
 	# THE HISTORY IS THE TREE'S, read and written there: a sealed release recorded its steps' prices into the snapshot
@@ -401,7 +406,7 @@ release_prepare() {
 	source "$SRC_DIR/tools/evidence.sh"
 }
 release_finish() {
-	local failures="$1" status=0 state
+	local failures="$1" incomplete="${2:-}" status=0 state
 	local -a rehearsal=()
 	[[ -z "$release_rehearsal" ]] || rehearsal=(--rehearsal "$release_rehearsal")
 	echo
@@ -414,6 +419,10 @@ release_finish() {
 	note "release: dossier $release_run_dir/dossier.md (state: ${state:-not rendered})"
 	if ((failures > 0 || status != 0)); then
 		die "the release run is NOT complete: $failures failed step(s); dossier state: ${state:-not rendered}"
+	fi
+	if [[ -n "$incomplete" ]]; then
+		note "the release run is INCOMPLETE: $incomplete; dossier state: ${state:-not rendered}"
+		exit 6
 	fi
 	note "release run finished: ${state}"
 	exit 0
@@ -818,7 +827,7 @@ fi
 # Ask for the commands, and treat every way of not getting them as the same answer.
 steps_file="$(mktemp)"
 remove_steps_file() {
-	rm -f "$steps_file"
+	rm -f "$steps_file" "$steps_file.covered"
 }
 register_run_cleanup remove_steps_file
 # AND THE RELEASE CLEANUP AGAIN, because this path is reached by a release run too - registration is
@@ -849,6 +858,11 @@ elif [[ "$mode" == release ]]; then
 	release_plan_args=()
 	[[ -z "$release_required_file" ]] || release_plan_args=(--required "$LIBER_RELEASE_REQUIRED")
 	cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- release-plan "${release_plan_args[@]}" >"$steps_file" || planner_failed "the release plan could not be produced"
+	# A RUN CONTINUES WHAT AN IDENTICAL ONE LEFT: an L2 takes over the passed envelopes of the newest earlier L2 whose
+	# tree, tools, firmware and configuration are this one's, and runs only what failed or never ran.
+	if [[ -f "$release_run_dir/level" ]]; then
+		cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- continue-run --run "$release_run_dir" --steps "$steps_file" >"$steps_file.covered" || planner_failed "the earlier run could not be continued"
+	fi
 else
 	mkdir -p "$BUILD_DIR/state/verify-tiers"
 	tier_run="$(mktemp -d "$BUILD_DIR/state/verify-tiers/run.XXXXXX")"
@@ -1516,6 +1530,24 @@ for index in ${order[@]+"${order[@]}"}; do
 	step_index_of["${step_ids[$index]:-}"]="$index"
 done
 pending=(${order[@]+"${order[@]}"})
+# THE STEPS AN EARLIER IDENTICAL RUN ALREADY PASSED (`continue-run`): decided, and their envelopes are its.
+if [[ -s "$steps_file.covered" ]]; then
+	kept_order=()
+	declare -A covered=()
+	while IFS=$'\t' read -r marker index source; do
+		[[ "$marker" == COVERED ]] && covered[$index]="$source"
+	done <"$steps_file.covered"
+	for index in ${pending[@]+"${pending[@]}"}; do
+		if [[ -n "${covered[$index]:-}" ]]; then
+			step=$((step + 1))
+			note "[$step/$count] CONTINUED: ${step_label[$index]} - passed in run ${covered[$index]}, whose identity is this run's"
+			decided["${step_ids[$index]:-}"]=1
+		else
+			kept_order+=("$index")
+		fi
+	done
+	pending=(${kept_order[@]+"${kept_order[@]}"})
+fi
 staging_at_start="$(staging_fingerprint)"
 while ((${#pending[@]} > 0 || ${#running[@]} > 0 || ${#state_queue[@]} > 0)); do
 	progress=0
@@ -1558,6 +1590,9 @@ if ((${#skipped[@]} > 0)); then
 	# ITS OWN STATUS, NEVER A GREEN. A caller writing `if ./verify.sh; then publish; fi` must not
 	# read a partial run as a verification, and nothing in exit 0 would say otherwise.
 	note "INCOMPLETE: this run verified part of what the change needs"
+	# AND A RELEASE COLLECTS ITS DOSSIER ALL THE SAME: a step skipped for the slots - the two-guest gate at
+	# `--jobs 1` - left a run with no dossier at all, where the dossier is what says which keys it lacks.
+	[[ -z "$release_run_dir" ]] || release_finish 0 "${#skipped[@]} step(s) were not started"
 	exit 6
 fi
 note "all $count step(s) passed"

@@ -81,6 +81,9 @@ fn run() -> Result<ExitCode, String> {
 	let mut step_id: Option<String> = None;
 	// And the command it ran, which its price is kept under with its id.
 	let mut step_command: Option<String> = None;
+	// `continue-run`: the earlier run to continue (the newest identical L2 beside it when not named), and the plan.
+	let mut continue_from: Option<PathBuf> = None;
+	let mut steps_path: Option<PathBuf> = None;
 	// A frozen narrowing to plan against, instead of the canonical model. See `Model::load_with_candidate`.
 	let mut candidate_path: Option<String> = None;
 	let mut scoped_log: Option<String> = None;
@@ -246,6 +249,14 @@ fn run() -> Result<ExitCode, String> {
 				index += 1;
 				run_dir = Some(PathBuf::from(arguments.get(index).ok_or("--run needs a directory")?));
 			}
+			"--from" => {
+				index += 1;
+				continue_from = Some(PathBuf::from(arguments.get(index).ok_or("--from needs a run directory")?));
+			}
+			"--steps" => {
+				index += 1;
+				steps_path = Some(PathBuf::from(arguments.get(index).ok_or("--steps needs the plan's file")?));
+			}
 			"--key" => {
 				index += 1;
 				evidence_key = Some(arguments.get(index).ok_or("--key needs a plan-item key")?.clone());
@@ -315,7 +326,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "shadow-publish" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash" | "discard-divided-costs" | "candidate-activate" | "identity" | "run-start" | "envelope" | "keep-log" | "dossier" | "release-required" | "release-plan" | "kernel-tests" | "account")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "shadow-publish" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash" | "discard-divided-costs" | "candidate-activate" | "identity" | "run-start" | "envelope" | "keep-log" | "dossier" | "release-required" | "release-plan" | "kernel-tests" | "account" | "continue-run")
 	{
 		command = positional.remove(0);
 	}
@@ -346,6 +357,9 @@ fn run() -> Result<ExitCode, String> {
 	}
 
 	let repo_root = find_repo_root()?;
+	if command == "continue-run" {
+		return continue_run(run_dir.ok_or("continue-run needs --run DIR")?, continue_from, steps_path);
+	}
 	if matches!(command.as_str(), "identity" | "run-start" | "envelope" | "keep-log") {
 		return evidence_command(&command, &repo_root, run_dir, evidence_key, outcome, producer, &inputs, &outputs, &logs, discharges_file, seconds, out_path, out_root, if_absent);
 	}
@@ -1312,10 +1326,18 @@ fn run() -> Result<ExitCode, String> {
 	}
 }
 
+// The guest slots the merge and release levels run with (`verify.sh`'s default width): what a split suite's parts are
+// counted against.
+const SPLIT_WIDTH: usize = 4;
+
 fn emit_steps(model: &Model, steps: Vec<verify_model::commands::Step>) -> Result<(), String> {
 	let cost = verify_model::history::CostModel { whole_suite_tests: model.kernel_tests.declared_ids, ..verify_model::history::CostModel::default() };
 	let history = verify_model::history::History::load(&model.repo_root).unwrap_or_default();
 	let model_hash = model.model_hash();
+	// THE PORTS' SUITES SPLIT ACROSS GUESTS (`split_suites`), at the runner's width for the levels that run them, each part
+	// charged the target's measured fixed cost of a run: its compile and its boot.
+	let durations = verify_model::commands::measured_test_durations(&model.repo_root);
+	let steps = verify_model::commands::split_suites(steps, &durations, |architecture| cost.fixed_seconds.get(&(architecture.to_string(), String::from("test-guest"))).copied().unwrap_or(0.0), SPLIT_WIDTH);
 	// Use the same measured cost or conservative seed that STEPCOST reports, and the state each step needs. Validate
 	// before walking the graph, and choose from the ready steps again after every prerequisite (`order_for_slots`).
 	let ordered = verify_model::commands::order_for_slots(steps, |step| cost.scheduled_seconds(&history, step, &model_hash), |step| verify_model::resources::step_declaration(step).map_or(0, |declared| declared.state_rank())).map_err(|faults| {
@@ -2005,6 +2027,65 @@ fn is_repo_root(directory: &Path) -> bool {
 // model is loaded so a snapshot of another revision - whose manifest this binary may not parse -
 // can still have its identity collected and its run started by the tree's own tooling.
 #[allow(clippy::too_many_arguments)]
+// AN L2 CONTINUES WHAT AN IDENTICAL L2 LEFT (`evidence::Run::continue_from`). The run to continue is the one named,
+// or the newest earlier L2 beside this run - one `verify.sh` marked `level` L2 - whose identity is this run's; one whose
+// identity moved is refused and named, and the next older is tried. With the plan, every step all of whose keys were
+// taken over is printed (`COVERED <index> <run>`), so the runner starts it no more; a step only part of whose keys
+// were is run whole, and the envelopes it will publish again are withdrawn first.
+fn continue_run(run_dir: PathBuf, from: Option<PathBuf>, steps: Option<PathBuf>) -> Result<ExitCode, String> {
+	let run = verify_model::evidence::Run::new(&run_dir);
+	let candidates: Vec<PathBuf> = match from {
+		Some(path) => vec![path],
+		None => {
+			let parent = run_dir.parent().ok_or("the run has no directory beside it")?;
+			let mut earlier: Vec<PathBuf> = std::fs::read_dir(parent).map_err(|error| format!("{}: {error}", parent.display()))?.flatten().map(|entry| entry.path()).filter(|path| path != &run_dir && std::fs::read_to_string(path.join("level")).is_ok_and(|level| level.trim() == "L2")).collect();
+			earlier.sort();
+			earlier.reverse();
+			earlier
+		}
+	};
+	let mut taken: Option<(String, Vec<String>)> = None;
+	for candidate in candidates {
+		let earlier = verify_model::evidence::Run::new(&candidate);
+		match run.continue_from(&earlier) {
+			Ok(keys) => {
+				taken = Some((earlier.id()?, keys));
+				break;
+			}
+			Err(error) => eprintln!("verify-model: {error}"),
+		}
+	}
+	let Some((source, keys)) = taken else {
+		eprintln!("verify-model: no earlier identical L2 to continue - every step runs");
+		return Ok(ExitCode::SUCCESS);
+	};
+	eprintln!("verify-model: continued run {source}: {} passed envelope(s) taken over", keys.len());
+	let Some(steps) = steps else { return Ok(ExitCode::SUCCESS) };
+	let text = std::fs::read_to_string(&steps).map_err(|error| format!("{}: {error}", steps.display()))?;
+	let taken: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
+	let mut step_keys: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+	for line in text.lines() {
+		let fields: Vec<&str> = line.split('\t').collect();
+		match fields.as_slice() {
+			["STEP", index, ..] => {
+				step_keys.entry((*index).to_string()).or_default();
+			}
+			["KEY", index, key, ..] => step_keys.entry((*index).to_string()).or_default().push((*key).to_string()),
+			_ => {}
+		}
+	}
+	for (index, keys) in &step_keys {
+		if !keys.is_empty() && keys.iter().all(|key| taken.contains(key.as_str())) {
+			println!("COVERED\t{index}\t{source}");
+		} else {
+			for key in keys.iter().filter(|key| taken.contains(key.as_str())) {
+				run.withdraw(key)?;
+			}
+		}
+	}
+	Ok(ExitCode::SUCCESS)
+}
+
 fn evidence_command(command: &str, repo_root: &Path, run_dir: Option<PathBuf>, evidence_key: Option<String>, outcome: Option<String>, producer: Option<String>, inputs: &[String], outputs: &[String], logs: &[String], discharges_file: Option<PathBuf>, seconds: f64, out_path: Option<PathBuf>, out_root: Option<PathBuf>, if_absent: bool) -> Result<ExitCode, String> {
 	match command {
 		// THE ONE SOURCE IDENTITY AND THE INFLUENCING-INPUT MANIFEST, collected here and written
@@ -2046,7 +2127,7 @@ fn evidence_command(command: &str, repo_root: &Path, run_dir: Option<PathBuf>, e
 				let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
 				discharges = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
 			}
-			let envelope = verify_model::evidence::Envelope { schema: String::from(verify_model::evidence::ENVELOPE_SCHEMA), run: run.id()?, key: key.clone(), identity: run.identity_digest()?, producer: producer.unwrap_or_else(|| String::from("unnamed")), outcome, duration_seconds: seconds.round() as u64, inputs, outputs, logs: kept, discharges, published_at: verify_model::evidence::now_utc() };
+			let envelope = verify_model::evidence::Envelope { schema: String::from(verify_model::evidence::ENVELOPE_SCHEMA), run: run.id()?, key: key.clone(), identity: run.identity_digest()?, producer: producer.unwrap_or_else(|| String::from("unnamed")), outcome, duration_seconds: seconds.round() as u64, inputs, outputs, logs: kept, discharges, published_at: verify_model::evidence::now_utc(), continued_from: None };
 			if if_absent {
 				match run.publish_if_absent(&envelope)? {
 					Some(path) => eprintln!("verify-model: published {}", path.display()),

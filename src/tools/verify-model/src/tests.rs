@@ -3058,7 +3058,7 @@ fn the_dossier_refuses_missing_substituted_foreign_stale_duplicate_and_corrupt_e
 	let kept = run.keep_log("k.one / host / host / default", &log_source).unwrap();
 	std::fs::remove_file(&log_source).unwrap();
 	assert!(dir.join(&kept.path).exists(), "the log bytes were copied into the run before the producer's cleanup");
-	let envelope = |key: &str, run_id: &str, identity: &str, outcome: &str, logs: Vec<Artifact>| Envelope { schema: String::from(ENVELOPE_SCHEMA), run: run_id.to_string(), key: key.to_string(), identity: identity.to_string(), producer: String::from("test"), outcome: outcome.to_string(), duration_seconds: 1, inputs: vec![], outputs: vec![], logs, discharges: vec![], published_at: String::from("2026-09-09T00:00:00Z") };
+	let envelope = |key: &str, run_id: &str, identity: &str, outcome: &str, logs: Vec<Artifact>| Envelope { schema: String::from(ENVELOPE_SCHEMA), run: run_id.to_string(), key: key.to_string(), identity: identity.to_string(), producer: String::from("test"), outcome: outcome.to_string(), duration_seconds: 1, inputs: vec![], outputs: vec![], logs, discharges: vec![], published_at: String::from("2026-09-09T00:00:00Z"), continued_from: None };
 	run.publish(&envelope("k.one / host / host / default", "run-A", &identity, "passed", vec![kept.clone()])).unwrap();
 	// missing required
 	let dossier = crate::evidence::collect(&run, &required, &known, "test", None, None).unwrap();
@@ -3193,7 +3193,7 @@ fn kept_logs_are_named_by_the_envelope_and_the_fallback_defers_to_the_producer()
 	let listed = run.kept_logs(key).unwrap();
 	assert_eq!(listed, vec![kept.clone()], "the kept log is listed under its key after the producer's file is gone");
 	let identity = run.identity_digest().unwrap();
-	let envelope = |producer: &str| Envelope { schema: String::from(ENVELOPE_SCHEMA), run: String::from("run-K"), key: key.to_string(), identity: identity.clone(), producer: producer.to_string(), outcome: String::from("passed"), duration_seconds: 2, inputs: vec![], outputs: vec![], logs: listed.clone(), discharges: vec![], published_at: String::from("2026-09-09T00:00:00Z") };
+	let envelope = |producer: &str| Envelope { schema: String::from(ENVELOPE_SCHEMA), run: String::from("run-K"), key: key.to_string(), identity: identity.clone(), producer: producer.to_string(), outcome: String::from("passed"), duration_seconds: 2, inputs: vec![], outputs: vec![], logs: listed.clone(), discharges: vec![], published_at: String::from("2026-09-09T00:00:00Z"), continued_from: None };
 	assert!(run.publish_if_absent(&envelope("the producer")).unwrap().is_some());
 	assert!(run.publish_if_absent(&envelope("the runner")).unwrap().is_none(), "the runner's fallback writes nothing over the producer's envelope");
 	let (_, published) = &run.envelopes().unwrap()[0];
@@ -3339,4 +3339,68 @@ fn declarations_conflict_on_a_shared_write_or_state_and_not_on_shared_reads() {
 	assert!(gadget.conflicts_with(&parse("host gadget")), "the gadget has one holder");
 	assert!(crate::resources::parse("guest stage:x86_64:r").is_err(), "a staging use names its profile");
 	assert!(crate::resources::parse("lab:cold-x86_64").is_err(), "a declaration starts with guest or host");
+}
+
+// A PORT'S SUITE SPLIT ACROSS GUESTS: every selected test in exactly one part, the six heaviest each alone, the rest
+// dealt by their measured durations, each part an exact selection that discharges its own tests' keys; what required
+// the suite requires every part; and a step that discharges `suite.kernel` - the release's whole run - and x86_64's
+// suite are never split.
+#[test]
+fn a_ports_suite_is_split_by_measured_durations_and_every_test_runs_once() {
+	let key = |architecture: &str, id: &str| crate::plan::PlanItemKey { check: id.to_string(), architecture: architecture.to_string(), environment: crate::catalog::Environment::TestGuest, configuration: String::from("test") };
+	let ids: Vec<String> = (0..20).map(|n| format!("kernel.fixture.t{n:02}")).collect();
+	let mut measured: std::collections::BTreeMap<String, f64> = ids.iter().map(|id| (id.clone(), 10.0)).collect();
+	for (id, seconds) in [
+		("kernel.fixture.t03", 600.0),
+		("kernel.fixture.t07", 400.0),
+		("kernel.fixture.t11", 390.0),
+		("kernel.fixture.t13", 240.0),
+		("kernel.fixture.t17", 230.0),
+		("kernel.fixture.t19", 210.0),
+	] {
+		measured.insert(id.to_string(), seconds);
+	}
+	let durations: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>> = [(String::from("aarch64"), measured)].into_iter().collect();
+	let suite = crate::commands::Step { keys: ids.iter().map(|id| key("aarch64", id)).collect(), guests: 1, command: String::from("./test.sh --arch aarch64"), ..step_for_test("guest:aarch64:all", &["build:aarch64:volume"]) };
+	let reader = step_for_test("gate-after-guest:host:capability-trace", &["guest:aarch64:all"]);
+	let steps = crate::commands::split_suites(vec![suite, reader], &durations, |_| 30.0, 4);
+	let parts: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.id.starts_with("guest:aarch64:")).collect();
+	assert!(parts.len() > crate::commands::HEAVIEST_ALONE, "the six heaviest alone and at least one part beside them: {}", parts.len());
+	let mut seen: Vec<String> = parts.iter().flat_map(|part| part.keys.iter().map(|key| key.check.clone())).collect();
+	seen.sort();
+	assert_eq!(seen, ids, "every selected test in exactly one part");
+	for heavy in ["kernel.fixture.t03", "kernel.fixture.t07", "kernel.fixture.t11", "kernel.fixture.t13", "kernel.fixture.t17", "kernel.fixture.t19"] {
+		let part = parts.iter().find(|part| part.keys.iter().any(|key| key.check == heavy)).unwrap();
+		assert_eq!(part.keys.len(), 1, "{heavy} is in a part of its own");
+	}
+	for part in &parts {
+		let selection: Vec<&str> = part.keys.iter().map(|key| key.check.as_str()).collect();
+		assert_eq!(part.command, format!("TEST_SELECTION={} ./test.sh --arch aarch64", selection.join(",")), "each part is an exact selection");
+		assert_eq!(part.requires, vec![String::from("build:aarch64:volume")]);
+		assert_eq!(part.guests, 1);
+	}
+	let reader = steps.iter().find(|step| step.id.starts_with("gate-after-guest")).unwrap();
+	assert_eq!(reader.requires.len(), parts.len(), "what required the suite requires every part");
+
+	// Never split: the release's whole run, which discharges `suite.kernel`, and x86_64's suite.
+	let whole = crate::commands::Step { keys: vec![crate::plan::PlanItemKey { check: String::from("suite.kernel"), ..key("aarch64", "") }], guests: 1, ..step_for_test("guest:aarch64:all", &[]) };
+	let native = crate::commands::Step { keys: ids.iter().map(|id| key("x86_64", id)).collect(), guests: 1, ..step_for_test("guest:x86_64:all", &[]) };
+	let kept = crate::commands::split_suites(vec![whole, native], &durations, |_| 30.0, 4);
+	assert_eq!(kept.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(), vec!["guest:aarch64:all", "guest:x86_64:all"]);
+}
+
+// WHAT A TEST TOOK, read from the newest whole run a target's logs keep: `[ok] (N s)` on the test's line or after the
+// output it printed, and half a second for a bare `[ok]`.
+#[test]
+fn a_tests_measured_duration_is_read_from_its_targets_newest_whole_run() {
+	let fixture = Fixture::new("test-durations");
+	let logs = fixture.dir.join(".build/logs/test");
+	std::fs::create_dir_all(&logs).unwrap();
+	std::fs::write(logs.join("aarch64-20261001T000000Z-101-guest.log"), "running 3 tests (all tags)\nkernel.a.one...\t[ok] (12 s)\nkernel.a.two...\tsome output\n[ok] (40 s)\nkernel.a.three...\t[ok]\n").unwrap();
+	std::fs::write(logs.join("aarch64-20261002T000000Z-102-guest.log"), "running 1 selected tests (3 total)\nkernel.a.one...\t[ok] (99 s)\n").unwrap();
+	let durations = crate::commands::measured_test_durations(&fixture.dir);
+	let aarch64 = &durations["aarch64"];
+	assert_eq!(aarch64.get("kernel.a.one"), Some(&12.0), "the whole run, not the newer selection");
+	assert_eq!(aarch64.get("kernel.a.two"), Some(&40.0));
+	assert_eq!(aarch64.get("kernel.a.three"), Some(&0.5));
 }

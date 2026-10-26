@@ -420,3 +420,190 @@ B5 - one development ISO for all gates (implemented, host-verified; real runs be
   - Gates run after B4 and B5: `./check.sh --gate
     guest-verdict,verify-scheduler,run-verdict,boot-harness,source-hygiene,verify-model,verify-model-tests` ->
     RESULT ok (388 s).
+
+The x86_64 batch of real runs (2026-10-26, 03:56-04:47Z), three phases on one tree
+  - Phase A, B7 reverted (HEAD's guest-gate.sh copied in for this phase only, restored after - `cmp` confirmed):
+    `LIBER_VERIFY_STEPS` plan of build x86_64, usb-release, bluetooth-le.
+    - build 62 s; usb-release PASS 452 s; bluetooth-le PASS 409 s; the run's end restore rebuilt the staging in the
+      shipping profile (122 s) and re-signed the bootable volume `enforcing-required` (60 s). Run 1106 s.
+  - Phase B, the tree as implemented: usb-release, bluetooth-le, the whole x86_64 suite, the numa tag,
+    capability-trace, the shipping image, signed-boot, perf-anchor.
+    - B7: usb-release PASS 322 s (452 before), bluetooth-le PASS 238 s (409 before), the same verdict lines.
+    - B5: both gates booted the one keyed medium phase A had built
+      (`libersystem-dev.5e407b87….iso`, no second medium written).
+    - B4(a): the profile changed twice - into development at usb-release's image, back to shipping when the suite
+      refused (`test.sh: REFUSED: the x86_64 staging's 'libs' was built in the development profile ... exit=75
+      seconds=1`, then `verify.sh: REFUSED: ... bringing the staging to the state it needs`, the fix 120 s, the
+      suite's second run PASS: 585 passed, 456 s). No restore at the end: the fingerprint equalled the start's.
+    - G1: `capability-trace` passed after a later `./test.sh --tags numa` (16 passed, 34 s) - it found its trace in
+      the suite's guest log, not in the newer numa one.
+    - B6: signed-boot - every x86_64 case passed, each refused for its own reason (product, architecture, source
+      kind, pairing, mixed releases, the downgrades). The aarch64 half FAILED: `signed-port-clean: guest exited
+      without its case's final verdict`. The aarch64 bootable volume in the tree is from 2026-10-13 and the aarch64
+      kernel from 2026-10-21; rebuilding it is a port build, which belongs to the end-of-job runs (not performed).
+      perf-anchor PASS 54 s, after the image producer it now declares.
+  - Phase C: the cold scenario failed at once - my batch script gave lab.sh a path relative to the repository and
+    lab.sh resolves it from `src/` - so B4(c) was NOT exercised by this batch; the suite by hand after it passed
+    (451 s) because the staging was still shipping. Restore build 57 s. B4(c) is re-run below with C7's oracle.
+
+B2 - a gate's own completion line (implemented, host-verified; real runs pending)
+  - `src/harness/guest-console.py`: `--done LINE` and `--settle SECONDS`. After the last command is typed, the
+    driver watches whole output lines (colour codes and carriage returns removed, the unterminated tail excluded,
+    so the shell's echo of the command never counts); once LINE is printed and the settle window has passed it
+    ends the recording, writing `# guest-console: the completion line came, and the settle window after it has
+    passed` into the log.
+  - `src/tools/guest-gate.sh`: `GUEST_GATE_DONE` / `GUEST_GATE_SETTLE` are passed to the driver; B7 then stops the
+    guest with it.
+  - Five gates name their line and state their window: firmware-tree (both ports) `tree-fixture: event 2: GPIO
+    line 2 high, acknowledged`, 20 s (it types no poweroff; first, as the plan asks); usb-release
+    `usb-release-done`, 10 s; usb-legacy `usb-legacy-done`, 10 s; i2c-hid `hidcheck: PASS malformed`, 10 s (30 s on
+    an emulated target); bluetooth-le `btclassic: PASS ctkd`, 5 s. Each line is printed by the last command the gate
+    types, and each gate's oracle has negative checks, so each keeps a window.
+  - Test `CompletionLineTest` (harness-test.py): each gate's script names its line and window; for each, a
+    stand-in console prints the line, then a failure line the gate's oracle refuses half-way through the window -
+    the driver ends within settle+20 s and the late line is in the log; with no window the same late line is
+    missed (why a gate with negative checks keeps one). Watched failing with the completion handling disabled:
+    every driver ran to its 90 s deadline.
+  - Not yet measured on real gates (the "gates with the most idle after B1 and B7" ranking): pending the next
+    real batch.
+
+C1 - steps declare their resources (implemented, host-verified)
+  - New `src/tools/verify-model/src/resources.rs`: the declaration language (`guest|host`, `stage:ARCH:r|w`,
+    `profile:shipping|development`, `volume:ARCH:MODE:r|w`, `media`, `gadget`, `port:N`, `lab:NAME`, `marks:r|w`,
+    `traces`), `parse`, `Declaration::conflicts_with` (a shared write, a one-holder resource, or one staging needed
+    in two profiles / one volume in two modes), `GATE_RESOURCES` (one declaration for each of check.sh's 198
+    gates), and `declaration_failures` - the host check:
+    - follows each gate's command in check.sh to the scripts it runs (shell: a script named after a `/`; Python: a
+      script named in a string, and `import lab`), skipping comments, heredoc bodies and messages;
+    - requires a guest wherever they call guest_gate_run, run.sh, qemu-run.sh, test.sh, test-kernel.sh,
+      guest-verdict.py, lab.sh, lab.py or dev.sh, and a staging write wherever they call build.sh or image.sh - in
+      both directions, as the plan states it. A runner's own image build is not a staging write: under the runner
+      the staging is brought to the declared state before the step (C2), so it finds it current.
+    - `NAMES_WHAT_IT_DOES_NOT_RUN`: six gates whose scripts name runners they only read or test with stand-ins
+      (boot-harness, guest-verdict, run-verdict, test-tags, dma-mode-carrier, gate-result-logs), each with a reason.
+    - and requires the guest half to agree with how the catalog schedules the gate (`gate_schedules_a_guest`).
+  - Wired into `verify-model check` (`self_check_failures`).
+  - Watch-fail, the plan's own: with the catalogue as it stood the check named exactly icd-selection, lifecycle,
+    foreign-loader-guest, foreign-facilities-guest and ipv6-peer as booting a guest and catalogued as host gates.
+    They are in `GATES_THAT_BOOT_A_GUEST` now (96 -> 101), and `docs/verification/P02M0177-guest-cases.md` names
+    them (the guest-verdict inventory test requires every listed gate there).
+  - Under the plan's rule 64 of my first declarations were wrong ("declared to write a staging, and none of its
+    scripts builds" - I had counted the runners as builds); they read now. Eleven gates write: bluetooth-independent,
+    build-order, dma-mode-x86_64, hibernate, ipv6-peer, qemu-3d-demo, qemu-3d-extended, qemu-virtio-iommu-x86_64,
+    rollback-floor-x86_64, run-verdict, targeted-cache.
+  - Tests (verify-model): every gate declares and agrees; a gate added without a declaration is refused; a host
+    gate whose script calls guest_gate_run is refused, and a guest gate whose scripts call no runner; a staging
+    write is held in both directions; the conflict rules.
+
+C8 - hibernate-ports is one gate per port (implemented; each half's real run pending - port runs)
+  - check.sh: `hibernate-ports-aarch64` and `hibernate-ports-riscv64` (`check-hibernate-ports.py <port>`, which
+    already took targets); the pair stays a command and becomes an umbrella in the catalog (`UMBRELLA_GATES`).
+  - catalog: GATES 195 -> 197, both halves in GATES_THAT_BOOT_A_GUEST; `release-required.toml` carries the two keys
+    in place of the one (hand-edited, as the end-of-job regeneration rule says).
+  - `verify-model check`: consistent with the two keys.
+
+C3 - a gate's temporary files and marks are its own (implemented, host-verified; real conflict runs pending)
+  - check.sh `run_gate`: the injection trace's path is named per gate (`LIBER_INJECTION_TRACE`, mktemp -u) and
+    `check-static-injection.sh` writes there; a failure prints and removes only that trace (the glob over every
+    `liber-injection-trace.*.log` is gone). `LIBER_INJECTION_TRACE` is on the identity's permitted list.
+  - build.sh sweeps step marks whose build pid is gone; `check-run-verdict.sh` runs its builds through
+    `own_build` and judges only their marks.
+  - A gate guest's monitor and QMP sockets are in its work directory (`GUEST_GATE_MONITOR`, `GUEST_GATE_QMP`,
+    passed as `QEMU_MONITOR_SOCKET` / `QEMU_QMP_SOCKET`, which qemu-run.sh honours on every target) and its host
+    port is a free one unless HOSTFWD_PORT is given. usb-release, usb-legacy, bluetooth-service and i2c-hid read
+    them from there.
+  - `staged-consistency`'s failure beside the host lane: not yet reproduced (a run of it beside each host gate is
+    pending; if it does not reproduce it goes to F2's ledger).
+  - The plan's three conflict reproductions (run-verdict beside a concurrent build, two failing injection gates,
+    two x86_64 guests at once) are pending as real runs.
+
+C7 - the lab's and the cold runs' names are private to a run (implemented, host-verified; real oracle pending)
+  - lab.py: the `lab boot` guest's serial and control sockets, its two logs and its capture are in DEV_STATE (the
+    run's `LIBER_DEV_STATE`, `.build/boot` otherwise); a run with a state directory forwards a free host port.
+  - `cmd_scenario_cold`: every name - channel, serial broker, monitor, QMP, both logs, the scenario record, the
+    guest's pgid record - is in a state directory: the caller's LIBER_DEV_STATE, or `.build/tmp/cold-TARGET.PID`
+    for a run by hand (dev-clean removes day-old `.build/tmp`). The runner is handed that directory; x86_64 gets a
+    free host port.
+  - It builds nothing when the staging and the bootable volume are current: `staging_current_refusal`
+    (staging-state.sh) reads every part's source stamp, the kernel and loader stamps, the profile records, and on
+    x86_64 the bootable volume's stamp, profile and mode record. Under `LIBER_STAGING_RUNNER` a stale staging is
+    REFUSED with status 75 and the commands that fix it (the runner runs them as a step of its own); by hand it is
+    built as before. Scenario fixtures are built only when `stale_fixtures` reports them stale, and that check now
+    includes the recipe's own digest (scenario.py), which it skipped before - without it a changed recipe would
+    never be rebuilt.
+  - Minimal adjacent changes this needed:
+    - `KERNEL_SOURCES` in lib.sh, derived and gated in `verify-model check` like VOLUME_SOURCES (the kernel crate's
+      closure). The kernel part's stamp hashed VOLUME_SOURCES, which the kernel directory is not in, so a kernel
+      edit left it "current".
+    - The bootable volume's stamp (`built-ARCH-volume`, kernel on the volume) covers VOLUME_SOURCES and
+      KERNEL_SOURCES. build-order compares that stamp by mtime, so it is unaffected.
+  - qemu-run.sh: COLD=1 with LIBER_DEV_STATE binds the channel, monitor and QMP in that directory and keeps the cold
+    image set (its fixture media are content-keyed templates with private per-run copies; a set per directory would
+    rebuild every medium).
+  - The Python cold gates (tickless-idle, hibernate-ports, system-suspend-riscv64) give their guests a private state
+    directory, read QMP there, and check every target they boot before the first boot: under the runner a stale
+    one refuses the step with every fix; by hand `build()` builds only what is stale.
+  - The gates that read a cold run's log set LIBER_DEV_STATE and read it there: dfu-tool, ipmi-admin, admin-path,
+    tpm-tool, shell-large-output (keeps a failed run's log in `.build/logs/shell-large-output`), qemu-2d-account's
+    port half. The lab-boot gates (audio-routing, qemu-2d-demo, qemu-pcie-aer, qemu-pcie-hotplug) boot their own
+    guest in a private directory instead of reusing a person's.
+  - `lab:cold-ARCH` left the declarations (17 tokens).
+  - Test `ColdRunPrivacyTest` (harness-test.py): two runs of one target get two directories and every name the guest
+    is handed is in its own; a current staging starts no build; under the runner a stale one exits 75 with nothing
+    built or started; by hand a stale one builds the staging and the volume. Watched failing against HEAD's lab.py
+    in a private copy: builds (and make-fixtures) on a current staging, `.build/boot` names, exit 1 instead of 75.
+  - The real oracle (two cold scenarios of one target started together on a current staging) is pending.
+
+C2 - the scheduler overlaps only what does not conflict (implemented, host-verified)
+  - verify-model emits `STEPUSES` for every step (`resources::step_declaration`: a gate's declaration, or the union
+    of a merged step's gates, read from its command; builds write their staging in the shipping profile; kernel
+    suites read it and boot the media; image producers write the staging and the volume they sign; host and
+    conformance suites share nothing; the lifecycle is a gate; development checks hold `lab:dev-instance`) as
+    `RESOURCE=ACCESS:STATE` tokens (`Declaration::tokens`). A step without a declaration runs alone.
+  - The planner orders by `order_for_slots` (C6 below), whose first key is `Declaration::state_rank`: the shipping
+    profile's steps, then the development profile's, each volume mode's together.
+  - verify.sh: the barrier scheduler (drain every guest before every host step and every exclusive one) is
+    replaced by `dispatch`: one pass over the steps not yet started, in plan order, starting each whose
+    prerequisites in this plan are decided, whose lane is free (guest slots, and one host lane beside them), whose
+    tokens conflict with nothing running, and whose staging is in the needed state - switched by the runner
+    (`resource_command`, run_owned_shell) once nothing running uses it and no earlier pending step still needs the
+    state it is in. A guest step waiting only for slots, and a step that runs alone, keep later steps from taking
+    their place. Refusals queue and are fixed with nothing running, as before. The end restore now checks the
+    bootable volume's profile as well as its mode (a cold run leaves it `enforcing-required` in development).
+  - staging-state.sh: `staging_profile_of`, `volume_state_of`.
+  - Tests (check-verify-scheduler.sh, a private tree whose `./build.sh` records what it is asked and writes the
+    records a build writes): two writers never overlap and a reader waits for a writer; two readers overlap; a
+    grouped plan switches to the development profile once, after the shipping group ended, and each volume mode
+    once, each mode's steps overlapping and the next mode switched after them; another architecture's step is not
+    held back; the end puts back the staging and the volume once; a host step and a guest step run at once at one
+    slot. All earlier cases still pass. Watched failing against HEAD's verify.sh: the writers overlapped, nothing
+    was switched, the host step waited.
+
+C6 - prices survive a model change; the order serves the wall clock (implemented, host-verified)
+  - history.rs: a step's price is its last measured duration under its id and its command (`StepRecord.command`,
+    recorded through `verify-model record --command`), whatever model it was measured under; a failure under a new
+    model no longer erases it. `step_price_is_older` marks one measured under an older model (for A2).
+  - A release's history is the tree's: verify.sh exports `LIBER_VERIFY_HISTORY` (the main tree's
+    `.build/state/verify-history.json`) after `run-start`, and `History::path` honours it; it is permitted in the
+    identity and cleared for verify-evidence's nested fixture runs.
+  - Never-measured: guest steps keep the seed, host steps stay unpriced for `--budget` (unchanged).
+  - `order_for_slots`: within a state group the builds first, then the host steps (host suites first, the cheap
+    before the dear, the unmeasured last), then the guest steps dearest first; never before a prerequisite.
+  - Tests: a price survives a catalog edit and is marked older, and another command under the same id is
+    unpriced; a host step never measured has no price; with guest steps of 100, 10, 10 and 10 s the 100-s one comes
+    first, the host suites first, the development step after the shipping ones. The three history tests that
+    encoded the old rule were rewritten to the new one.
+
+C5 - the width grows by measurement (implemented)
+  - `EXCLUSIVE_GUEST_GATES` (65 gates, behind the barrier) is replaced by `ALONE_GATES` (8): qemu-2d-account,
+    qemu-3d-demo, qemu-3d-extended, soft2d-performance (measurements of time), bluetooth-transfer and
+    typec-tcpci-riscv64 (failed under load on 2026-10-20/21), concurrent-selection and virtio-multiport (oracles of
+    the machine's processes). Every other gate overlaps what its declaration allows. A host gate on the list runs
+    alone as well.
+  - Merge and release default to four guest slots; inner stays at one. The rule for raising it (five L2 runs with
+    no load flake in the ledger) is stated where the width is set and beside `ALONE_GATES`; the ledger is F2.
+  - The release plan now: 374 steps, every one with a declaration, 8 alone.
+
+Verification after the C group: `cargo test` in verify-model - 167 passed; `verify-model check` - consistent;
+check-verify-scheduler.sh - all cases pass; harness-test.py CompletionLineTest, GuestConsoleTest,
+ColdRunPrivacyTest - pass; check-guest-verdict.py inventory test - pass.

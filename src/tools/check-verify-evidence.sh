@@ -20,6 +20,9 @@
 #      keys: the run starts, the plan is narrowed to them, the executor publishes the fallback
 #      envelope for the host suite, the gate runner publishes the gates', the dossier renders in a
 #      `rehearsal` state and never `complete`.
+#   5. A RUN CONTINUES WHAT AN IDENTICAL ONE LEFT. An L2's passed envelope is taken over by a later run of the same
+#      identity, which runs only what failed, and its dossier names the run each envelope came from; a run whose QEMU
+#      digest moved is refused, at the takeover and in the dossier.
 #
 # Minutes: one short x86_64 boot to the loader's marker, one worktree, one rehearsal.
 set -euo pipefail
@@ -277,4 +280,58 @@ grep -q '"producer": "check.sh gate volume-layout"' "$rehearsal_run/evidence/gat
 grep -q "release run finished: rehearsal" "$work/rehearsal.out" || fail "the rehearsal did not report its state: $(tail -2 "$work/rehearsal.out")"
 echo "verify-evidence:   run $(basename "$rehearsal_run"): three envelopes, two producers, dossier in a rehearsal state, run sealed"
 
-echo "verify-evidence: a kept log outlives its producer, a replaced tool or firmware image is not what boots, a sealed snapshot refuses a write, a moved tree fails its dossier, and the release path renders a rehearsal"
+# 5. A RUN CONTINUES WHAT AN IDENTICAL ONE LEFT, AND NOTHING WHOSE QEMU MOVED. An earlier L2 that passed one key and
+#    failed another; a run of the same identity continues it - taking over the passed envelope with its log, the
+#    plan's step for it covered and the failed one's left to run - and its dossier names the run each envelope came
+#    from. A run whose QEMU is another binary is refused, and so is a dossier whose source run's QEMU moved after.
+echo "verify-evidence: 5. a run continues what an identical one left, and refuses one whose QEMU digest moved"
+passed_key="gate.volume-layout / host / host / default"
+failed_key="gate.dma-mode-carrier / host / host / default"
+earlier="$(model run-start --out-root "$work/continued")" || fail "run-start refused the earlier run"
+echo L2 >"$earlier/level"
+echo "the earlier run's own log" >"$work/earlier.log"
+LIBER_VERIFY_RUN="$earlier" evidence_publish "$passed_key" "check.sh gate volume-layout" passed 4 --log "$work/earlier.log"
+LIBER_VERIFY_RUN="$earlier" evidence_publish "$failed_key" "check.sh gate dma-mode-carrier" failed 2
+printf 'STATUS\tfull\tprepared\nSTEP\t0\t1\tvolume-layout gate\ttrue\t\nKEY\t0\t%s\nSTEP\t1\t1\tdma-mode-carrier gate\ttrue\t\nKEY\t1\t%s\n' "$passed_key" "$failed_key" >"$work/continued-plan"
+later="$(model run-start --out-root "$work/continued")" || fail "run-start refused the later run"
+echo L2 >"$later/level"
+model continue-run --run "$later" --steps "$work/continued-plan" >"$work/covered" 2>"$work/continue.err" || fail "the identical run could not be continued: $(tail -2 "$work/continue.err")"
+[[ "$(cat "$work/covered")" == "COVERED	0	$(<"$earlier/run-id")" ]] || fail "the passed key's step was not reported covered by the earlier run: $(cat "$work/covered")"
+taken="$later/evidence/gate.volume-layout+host+host+default.json"
+[[ -f "$taken" ]] || fail "the passed envelope was not taken over"
+grep -q "\"continued_from\": \"$(<"$earlier/run-id")\"" "$taken" || fail "the taken-over envelope does not name the run that produced it"
+[[ ! -f "$later/evidence/gate.dma-mode-carrier+host+host+default.json" ]] || fail "a failed envelope was taken over"
+LIBER_VERIFY_RUN="$later" evidence_publish "$failed_key" "check.sh gate dma-mode-carrier" passed 2
+printf 'schema = 1\nkeys = ["%s", "%s"]\n' "$passed_key" "$failed_key" >"$work/required-continued.toml"
+model dossier --run "$later" --required "$work/required-continued.toml" >"$work/dossier-5.out" 2>&1 || fail "the continued run's dossier was refused: $(tail -3 "$work/dossier-5.out")"
+grep -q "^Continued: 1 envelope(s) taken over from run(s) $(<"$earlier/run-id")" "$later/dossier.md" || fail "the dossier does not say what it continued"
+grep -q "| \`$passed_key\` | yes | passed | 4 | check.sh gate volume-layout | $(<"$earlier/run-id") |" "$later/dossier.md" || fail "the dossier does not name the run the taken-over envelope came from"
+grep -q "| \`$failed_key\` | yes | passed | 2 | check.sh gate dma-mode-carrier | this run |" "$later/dossier.md" || fail "the dossier does not name this run for what ran here"
+echo "verify-evidence:   continued: the passed key taken over with its log and named by its run, the failed one run here"
+# Another QEMU on PATH: another identity, which may not continue the earlier run.
+mkdir -p "$work/moved-bin"
+cp "$(command -v qemu-system-x86_64)" "$work/moved-bin/qemu-system-x86_64"
+printf 'moved' >>"$work/moved-bin/qemu-system-x86_64"
+moved="$(PATH="$work/moved-bin:$PATH" model run-start --out-root "$work/continued")" || fail "run-start refused the moved run"
+if model continue-run --run "$moved" --from "$earlier" >"$work/moved.out" 2>&1; then
+	grep -q "cannot be continued: the tool qemu-system-x86_64 moved since it ran" "$work/moved.out" || fail "a run whose QEMU moved was not refused by name: $(tail -2 "$work/moved.out")"
+fi
+[[ -z "$(ls "$moved/evidence")" ]] || fail "a run whose QEMU moved took envelopes over"
+# And the collector holds a taken-over envelope's run to this one's identity after the fact.
+chmod u+w "$earlier/identity.json"
+python3 - "$earlier/identity.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+block = json.load(open(path))
+for tool in block["tools"]:
+    if tool["name"] == "qemu-system-x86_64":
+        tool["sha256"] = "0" * 64
+json.dump(block, open(path, "w"), indent=2)
+PY
+if model dossier --run "$later" --required "$work/required-continued.toml" >"$work/dossier-5b.out" 2>&1; then
+	fail "a dossier whose taken-over envelope came from a run with another QEMU was rendered"
+fi
+grep -qx "continued-changed" <(refusals "$later/dossier.json") || fail "the moved source run was not refused as continued-changed: $(tail -2 "$work/dossier-5b.out")"
+echo "verify-evidence:   a run with another QEMU is not continued, and a dossier over a source run whose QEMU moved is refused"
+
+echo "verify-evidence: a kept log outlives its producer, a replaced tool or firmware image is not what boots, a sealed snapshot refuses a write, a moved tree fails its dossier, the release path renders a rehearsal, and a run continues only an identical one"

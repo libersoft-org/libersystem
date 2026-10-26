@@ -1173,7 +1173,7 @@ class FixtureSetTest(unittest.TestCase):
 		self.manifest = {
 			'format': 'liber-scenario-fixtures-v1',
 			'target': 'x86_64',
-			'recipe': 'x' * 64,
+			'recipe': scenario.file_digest(os.path.join(HERE, 'scenarios', 'make-fixtures.py')),
 			'sources': {'bin/uname': hashlib.sha256(b'STAGED-UNAME').hexdigest()},
 			'fixtures': {'uname-shadow': hashlib.sha256(b'SHADOW-UNAME').hexdigest()},
 		}
@@ -1200,6 +1200,13 @@ class FixtureSetTest(unittest.TestCase):
 	def test_an_altered_fixture_is_refused(self):
 		self.write(os.path.join(self.fixtures, 'uname-shadow'), b'TAMPERED-XXX')
 		self.assertTrue(any('does not match the set' in complaint for complaint in scenario.stale_fixtures('x86_64')))
+
+	# AND A SET MADE BY ANOTHER RECIPE: a cold run builds the set only when this check names something, so a changed
+	# recipe has to be named here or its fixtures are never made again.
+	def test_a_set_made_by_another_recipe_is_stale(self):
+		self.manifest['recipe'] = 'x' * 64
+		self.write_manifest()
+		self.assertTrue(any('another version of make-fixtures.py' in complaint for complaint in scenario.stale_fixtures('x86_64')))
 
 	def test_a_missing_fixture_is_refused(self):
 		os.unlink(os.path.join(self.fixtures, 'uname-shadow'))
@@ -1608,7 +1615,7 @@ COMPLETION_LINES = (
 
 
 class CompletionLineTest(unittest.TestCase):
-	def drive(self, done, settle, late):
+	def drive(self, done, settle, late, delay):
 		directory = tempfile.mkdtemp()
 		self.addCleanup(shutil.rmtree, directory, True)
 		path = os.path.join(directory, 'console')
@@ -1634,7 +1641,7 @@ class CompletionLineTest(unittest.TestCase):
 				typed += connection.recv(64)
 			# The shell echoes what was typed, which carries no completion line of its own.
 			connection.sendall(b'probe\r\n\x1b[32m' + done.encode() + b'\x1b[0m\r\n')
-			time.sleep(settle / 2)
+			time.sleep(delay)
 			connection.sendall(late.encode() + b'\r\n')
 			stop.wait(120)
 			connection.close()
@@ -1659,7 +1666,8 @@ class CompletionLineTest(unittest.TestCase):
 
 		def one(case):
 			_, done, settle, late = case
-			results[case] = (self.drive(done, settle, late), self.drive(done, 0, late))
+			# The late line half-way through the gate's window, with the window and without it.
+			results[case] = (self.drive(done, settle, late, settle / 2), self.drive(done, 0, late, settle / 2))
 
 		threads = [threading.Thread(target=one, args=(case,)) for case in COMPLETION_LINES]
 		for thread in threads:
@@ -1736,6 +1744,20 @@ class LogsRulesTest(unittest.TestCase):
 		self.assertEqual(self.removed(), passed)
 		self.suite('aarch64', '20261004T000000Z', 104)
 		self.assertEqual(self.removed(), passed | failed)
+
+	# A RUN THAT HAD TO RESUME FAILED, though its last resumed boot printed the pass line: it is kept like any failed
+	# run, with its resumed boots' logs, until a later run of its target passes.
+	def test_a_resumed_run_is_a_failed_run(self):
+		resumed = self.suite('x86_64', '20261002T000000Z', 102, passed=False)
+		for half in ('run', 'guest'):
+			name = f'test/x86_64-20261002T000000Z-102-restart1-{half}.log'
+			with open(os.path.join(self.root, name), 'w') as handle:
+				handle.write('test suite complete: 5 passed\n')
+			resumed.add(name)
+		self.suite('x86_64', '20261003T000000Z', 103, passed=False)
+		self.assertEqual(self.removed(), set(), 'a resumed run is kept as a failed one, its resumed boots with it')
+		self.suite('x86_64', '20261004T000000Z', 104)
+		self.assertTrue(resumed <= self.removed(), 'and goes, whole, once a later run of its target passes')
 
 	def test_a_live_runs_logs_are_left_alone(self):
 		live = self.suite('riscv64', '20261001T000000Z', 101)
