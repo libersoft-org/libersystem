@@ -3031,6 +3031,9 @@ fn the_dossier_refuses_missing_substituted_foreign_stale_duplicate_and_corrupt_e
 fn undeclared_environment_overrides_are_refused_and_permitted_ones_are_recorded() {
 	let overrides = crate::identity::undeclared_overrides(&[
 		(String::from("LIBER_RUN_MODE"), String::from("gate")),
+		// The marker every top-level run exports for the runs it starts (`logs_run_begin` in
+		// lib.sh): a release's own `verify.sh` sets it before `run-start`, which must not refuse it.
+		(String::from("LIBER_LOGS_RUN"), String::from("4242")),
 		(String::from("LIBER_SECRET_KNOB"), String::from("1")),
 		(String::from("QEMU_EXTRA"), String::from("")),
 		(String::from("PATH"), String::from("/bin")),

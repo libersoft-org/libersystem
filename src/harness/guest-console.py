@@ -91,6 +91,15 @@ def main():
 				chunk = b""
 			except OSError:
 				break
+			else:
+				# A CLOSED CONSOLE IS AN END, NOT AN EMPTY READ. `recv` answers b"" once QEMU has gone, and
+				# the timeout above answers b"" too, so this spun on a dead socket until `--seconds` ran
+				# out - 1200 s for a port gate whose guest had powered off in about 400. A guest that is
+				# gone can say nothing more, so there is nothing left to record.
+				if not chunk:
+					log.write(b"\n# guest-console: the console closed\n")
+					log.flush()
+					break
 			if chunk:
 				log.write(chunk)
 				log.flush()

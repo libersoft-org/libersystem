@@ -14,6 +14,7 @@ GUEST_LINES=""
 GUEST_LOG=""
 guest_gate_work=""
 guest_gate_driver=""
+guest_gate_guest=""
 
 guest_gate_fail() {
 	echo "${GUEST_GATE_NAME:-guest-gate}: $*" >&2
@@ -22,6 +23,7 @@ guest_gate_fail() {
 
 guest_gate_cleanup() {
 	[[ -n "$guest_gate_driver" ]] && kill "$guest_gate_driver" 2>/dev/null
+	[[ -n "$guest_gate_guest" ]] && kill "$guest_gate_guest" 2>/dev/null
 	[[ -n "$guest_gate_work" ]] && rm -rf "$guest_gate_work"
 	guest_gate_restore_shipping
 	return 0
@@ -173,9 +175,21 @@ guest_gate_run() {
 	fi
 	python3 src/harness/guest-console.py --socket "$socket" --log "$GUEST_LOG" --script "$script" --seconds "$console" >"$guest_gate_work/driver" 2>&1 &
 	guest_gate_driver=$!
-	SERIAL="unix:$socket,server=on,wait=off" timeout "$deadline" ./run.sh --arch "$GUEST_ARCH" --smp 2 "${guest_gate_image_args[@]}" >"$guest_gate_work/run" 2>&1 || true
+	SERIAL="unix:$socket,server=on,wait=off" timeout "$deadline" ./run.sh --arch "$GUEST_ARCH" --smp 2 "${guest_gate_image_args[@]}" >"$guest_gate_work/run" 2>&1 &
+	guest_gate_guest=$!
 	wait "$guest_gate_driver" 2>/dev/null || true
 	guest_gate_driver=""
+	# THE GUEST STOPS WHEN ITS CONSOLE DRIVER DOES. Nothing records the console after the driver has
+	# exited, so nothing the console log holds can change after it: the guest ran on to the deadline
+	# for nothing - 120 to 300 s past every recording of the 23 gates that type no `poweroff`. `timeout`
+	# signals its whole process group, so the runner and its QEMU end together. QEMU's own output
+	# (`run`) is only ever copied for diagnosis. A gate whose verdict also reads a simulator's log on
+	# the host, which keeps growing until QEMU stops, keeps its window with `GUEST_GATE_WINDOW=keep`.
+	if [[ "${GUEST_GATE_WINDOW:-}" != keep ]]; then
+		kill -TERM "$guest_gate_guest" 2>/dev/null || true
+	fi
+	wait "$guest_gate_guest" 2>/dev/null || true
+	guest_gate_guest=""
 	[[ -s "$GUEST_LOG" ]] || guest_gate_fail "the guest produced no console output"
 	# AN EMPTY PREFIX KEEPS THE WHOLE LOG. A probe whose lines do not all begin with one word - the
 	# ICD one prints `icd lowest ...` and `icd lookup ...` - is read from the log itself, and the

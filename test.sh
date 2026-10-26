@@ -146,6 +146,7 @@ done
 # own use of the harness. The mode decides which DMA-mode value the harness writes for the boot;
 # `TEST=1`, which selects the test kernel and medium, is a different question and stays what it is.
 export LIBER_RUN_MODE="${LIBER_RUN_MODE:-test}"
+logs_run_begin
 
 # THIS SCRIPT BUILDS NOTHING. It checks that what the suite boots is there, and says what to run
 # if it is not.

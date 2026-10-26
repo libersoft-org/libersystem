@@ -815,6 +815,7 @@ if [[ ${#formats[@]} -eq 0 && $want_conformance -eq 1 ]]; then
 	formats=("${FORMATS[@]}")
 fi
 
+logs_run_begin
 for gate in "${gates[@]:-}"; do
 	[[ -n "$gate" ]] && run_gate "$gate"
 done

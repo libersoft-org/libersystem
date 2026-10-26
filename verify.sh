@@ -406,6 +406,12 @@ release_finish() {
 	note "release run finished: ${state}"
 	exit 0
 }
+# The logs sweep and the logs lock, for a run that runs steps: before the release moves into its
+# snapshot, so the lock is the tree's own.
+case "$action" in
+run | shadow) logs_run_begin ;;
+esac
+
 if [[ "$mode" == release ]]; then
 	note "release: every optimisation in this script is ignored"
 	release_prepare

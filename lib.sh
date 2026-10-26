@@ -234,6 +234,22 @@ run_owned_shell() {
 	return "$status"
 }
 
+# THE LOGS ARE SWEPT WHEN A TOP-LEVEL RUN STARTS, AND ONLY WHEN IT IS ALONE.
+#
+# `.build/logs` keeps what a person or a tool reads (the logs rules in `lab.py`), and nothing else
+# removes anything from it - so a run that only ever adds logs is how it reached 62 GB. Called by
+# `verify.sh`, and by `test.sh` and `check.sh`, once their arguments are read: the first of them in a
+# process tree sweeps, if no other run is alive, and then holds `.build/state/logs.lock` shared until
+# it ends; every run it starts inherits `LIBER_LOGS_RUN` and takes no lock and sweeps nothing. A
+# marker whose run has ended is no marker, so a process a run left behind is not held back by it.
+logs_run_begin() {
+	if [[ -n "${LIBER_LOGS_RUN:-}" ]] && kill -0 "$LIBER_LOGS_RUN" 2>/dev/null; then
+		return 0
+	fi
+	export LIBER_LOGS_RUN="$$"
+	python3 "$SRC_DIR/harness/lab.py" dev-clean --run "$$" || note "the logs sweep did not finish, and this run goes on without holding the logs lock"
+}
+
 # Take the requested terminal destination ONCE, resolve it, and decide whether it is usable.
 #
 # THE REQUEST IS UNEXPORTED IMMEDIATELY, which is what stops a descendant from publishing into its

@@ -87,7 +87,8 @@ Persistent development instance (one owner at a time):
   dev-launch <program> [args...]  launch a program through PermissionManager, print output
   dev-stop              end the program launched through the control channel
   dev-loop <artifact> <scenario.toml>...  build, publish and run; stops at the failing phase
-  dev-clean [--dry-run]  prune host-side leftovers against documented limits
+  dev-clean [--dry-run]  prune host-side leftovers against documented limits, and the logs nothing reads
+  dev-clean --run PID   the logs rules alone, as a top-level run starts; then holds the logs lock until PID ends
   dev-down              stop it gracefully and release the lock"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2522,8 +2523,299 @@ def report_loop(phases, started, detail):
 # left to judgement, so what a clean removes is knowable before running it and arguable
 # afterwards. Nothing here is a source or a build input: every one of these is either output
 # that can be produced again or scratch from a run that has ended.
-KEEP_TEST_RUNS = 20
 KEEP_BASELINE_SAMPLES = 20
+
+
+# WHAT `.build/logs` KEEPS: what a person or a tool reads, and nothing else.
+#
+# It held 62 GB on 2026-10-22 that nobody read, neither a person nor a tool: every suite run added a
+# timestamped guest and run log, gates kept a folder per run, and nothing removed any of it unless
+# someone ran this clean by hand - which then kept the newest twenty test runs, whatever they were.
+# The rules, from what each reader needs:
+#
+#   test/            per target, the newest ended run's logs; a failed run's - no `test suite
+#                    complete: N passed`, the line `test-kernel.sh` itself requires - until a later run
+#                    of that target passes; the newest x86_64 guest log carrying a capability trace,
+#                    which `check-capability-trace.sh` selects by content among all of them, because
+#                    the newest run may be a selection without one; and every log of a run that is
+#                    still alive, which its name says by its runner's pid
+#   a gate's folder  its newest set. A gate that writes one fixed folder replaces it itself and is kept
+#                    whole; one that makes a folder per run - `NAME.XXXXXX`, or a start time inside its
+#                    own folder - keeps the newest
+#   anything else    goes. A folder no gate and no harness script names is an experiment's, and an
+#                    experiment writes under its own run's scratch directory, not here
+#   a cited file     is PINNED, wherever it is: a `.build/logs/...` path a tracked document names is
+#                    kept, and its unpinned siblings are not. A whole top-level folder or a naming
+#                    pattern is a pointer, not a pin; a pin is released when no document names it
+#
+# Kept logs stay as they are, under their own names, so every reader still finds them. The rules run
+# on their own when a top-level run starts and once more when it ends, and only while that run is
+# the one alive (`LOGS_LOCK`).
+LOGS_ROOT = os.path.join(BUILD_ROOT, 'logs')
+LOG_ARCHITECTURES = ('x86_64', 'aarch64', 'riscv64')
+SUITE_LOG = re.compile(r'^(x86_64|aarch64|riscv64)-([0-9]{8}T[0-9]{6}Z)-([0-9]+)-.')
+SUITE_PASSED = re.compile(rb'^test suite complete: [0-9]+ passed', re.M)
+CAPABILITY_TRACE = b'captrace: begin'
+# `mktemp -d NAME.XXXXXX`: `check-qemu-2d-demo.sh`, `check-qemu-3d-demo.sh`, `verify.sh`'s shadow.
+PER_RUN_FOLDER = re.compile(r'^(.+)\.[A-Za-z0-9]{6,8}$')
+# The writers that keep a folder per run inside their own, named by when the run started.
+PER_RUN_INSIDE = {
+	'bluetooth-independent': re.compile(r'^[0-9]{8}-[0-9]{6}$'),  # check-bluetooth-independent.py
+	'qemu-2d-account': re.compile(r'^[0-9]{8}T[0-9]{6}Z(-opt[0-9]+)?$'),  # check-qemu-2d-account.sh
+}
+CITED_LOG = re.compile(r'\.build/logs/([A-Za-z0-9._/{},*?<>$+-]+)')
+
+# THE LOGS LOCK. Every top-level run - `verify.sh`, or `test.sh` or `check.sh` started by hand -
+# holds it shared while it lives, through the holder `dev-clean --run` leaves behind, and the logs
+# rules run only under it exclusively: so only while no other run is alive, and no log they remove
+# can still be written or read by one. A run another run started takes none (`logs_run_begin` in
+# lib.sh). Gates read their own run's logs by `RESULT-LOGS`, and every one of them runs after its
+# run's sweep.
+LOGS_LOCK = os.path.join(BUILD_ROOT, 'state', 'logs.lock')
+
+
+def pid_alive(pid):
+	try:
+		os.kill(pid, 0)
+	except ProcessLookupError:
+		return False
+	except PermissionError:
+		return True
+	return True
+
+
+def read_bytes(path):
+	try:
+		with open(path, 'rb') as handle:
+			return handle.read()
+	except OSError:
+		return b''
+
+
+# Who may own a folder here: a gate `check.sh` names, or a harness script by its stem without
+# `check-` - which is how the writers outside the table name theirs (`check-ipmi-admin.sh`,
+# `audio-driver-recovery.py`). None when the table cannot be read: a sweep that does not know the
+# gates would take every gate's folder for an orphan.
+def logs_writers(repo):
+	try:
+		with open(os.path.join(repo, 'check.sh')) as handle:
+			gates = re.findall(r'^\t\["([a-z0-9_-]+)"\]=', handle.read(), re.M)
+	except OSError:
+		return None
+	if not gates:
+		return None
+	writers = set(gates)
+	for directory in ('', 'src/tools', 'src/harness'):
+		for path in glob.glob(os.path.join(repo, directory, '*.sh')) + glob.glob(os.path.join(repo, directory, '*.py')):
+			stem = os.path.basename(path).rsplit('.', 1)[0]
+			writers.add(stem[len('check-') :] if stem.startswith('check-') else stem)
+	return writers
+
+
+def log_owner(name, writers):
+	return name in writers or re.sub(r'-(x86_64|aarch64|riscv64)$', '', name) in writers
+
+
+# The tracked documents: every tracked Markdown file and everything tracked under `docs/` and `AI/`.
+# None when git cannot list them: a sweep that cannot read the pins would remove what they pin.
+def logs_documents(repo):
+	try:
+		listed = subprocess.run(['git', '-C', repo, 'ls-files', '-z', '--', 'docs', 'AI', '*.md'], capture_output=True, timeout=120)
+	except (OSError, subprocess.TimeoutExpired):
+		return None
+	if listed.returncode != 0:
+		return None
+	return [os.path.join(repo, name) for name in listed.stdout.decode('utf-8', 'replace').split('\0') if name]
+
+
+def brace_expansions(text):
+	match = re.search(r'\{([^{}]*)\}', text)
+	if not match:
+		return [text]
+	return [whole for choice in match.group(1).split(',') for whole in brace_expansions(text[: match.start()] + choice + text[match.end() :])]
+
+
+# The paths under `.build/logs` the documents pin, relative to it. `{a,b}` names two files. A path
+# with no folder in it is a whole top-level folder, a pointer and not a pin; and pins are matched
+# literally, so a naming pattern (`<arch>-*-guest.log`) names no file and pins nothing.
+def logs_pins(documents):
+	pins = set()
+	for document in documents:
+		try:
+			with open(document, encoding='utf-8', errors='replace') as handle:
+				text = handle.read()
+		except OSError:
+			continue
+		for cited in CITED_LOG.findall(text):
+			for path in brace_expansions(cited.rstrip('.,;:')):
+				path = os.path.normpath(path.strip('/'))
+				if '/' in path and not path.startswith('..'):
+					pins.add(path)
+	return pins
+
+
+# A pin names a file, or a folder below the top level and with it everything inside.
+def logs_pinned(relative, pins):
+	while relative:
+		if relative in pins:
+			return True
+		relative = os.path.dirname(relative)
+	return False
+
+
+def suite_logs_kept(directory, alive):
+	runs = {}
+	for name in os.listdir(directory):
+		match = SUITE_LOG.match(name)
+		if match:
+			runs.setdefault((match.group(1), match.group(2), int(match.group(3))), []).append(os.path.join(directory, name))
+	kept = set()
+	for arch in LOG_ARCHITECTURES:
+		ended = []
+		for run in sorted(run for run in runs if run[0] == arch):
+			if alive(run[2]):
+				kept.update(runs[run])
+			else:
+				ended.append(run)
+		# The newest ended run, and before it every run that failed since the last one that passed.
+		for newest, run in enumerate(reversed(ended)):
+			passed = any(SUITE_PASSED.search(read_bytes(path)) for path in runs[run] if path.endswith(('-run.log', '-guest.log')))
+			if newest == 0 or not passed:
+				kept.update(runs[run])
+			if passed:
+				break
+	# The capability trace's log, chosen as its reader chooses: the last sorted name that carries one.
+	for guest in sorted((path for run, paths in runs.items() if run[0] == 'x86_64' for path in paths if path.endswith('-guest.log')), reverse=True):
+		if CAPABILITY_TRACE in read_bytes(guest):
+			kept.add(guest)
+			break
+	return kept
+
+
+def tree_mtime(path):
+	stamps = []
+	for parent, _, names in os.walk(path):
+		for entry in [parent] + [os.path.join(parent, name) for name in names]:
+			try:
+				stamps.append(os.lstat(entry).st_mtime)
+			except OSError:
+				pass
+	return max(stamps, default=0.0)
+
+
+# What the logs rules remove under `root`: the files no rule keeps, and the folders that go with them
+# once they are empty - a folder holding a pinned file stays, with only that file in it.
+def logs_removals(root, writers, pins, alive):
+	files, folders = [], []
+
+	def drop(path):
+		if os.path.isdir(path) and not os.path.islink(path):
+			for parent, directories, names in os.walk(path, topdown=False):
+				for name in names + [entry for entry in directories if os.path.islink(os.path.join(parent, entry))]:
+					drop(os.path.join(parent, name))
+				folders.append(parent)
+		elif not logs_pinned(os.path.relpath(path, root), pins):
+			files.append(path)
+
+	if not os.path.isdir(root):
+		return files, folders
+	per_run = {}
+	for name in sorted(os.listdir(root)):
+		path = os.path.join(root, name)
+		run = PER_RUN_FOLDER.match(name)
+		if not os.path.isdir(path) or os.path.islink(path):
+			drop(path)
+		elif name == 'test':
+			kept = suite_logs_kept(path, alive)
+			for entry in sorted(os.listdir(path)):
+				if os.path.join(path, entry) not in kept:
+					drop(os.path.join(path, entry))
+		elif run and log_owner(run.group(1), writers):
+			per_run.setdefault(run.group(1), []).append(path)
+		elif not log_owner(name, writers):
+			drop(path)
+		elif name in PER_RUN_INSIDE:
+			newest = max((entry for entry in os.listdir(path) if PER_RUN_INSIDE[name].match(entry)), default=None)
+			for entry in sorted(os.listdir(path)):
+				if entry != newest:
+					drop(os.path.join(path, entry))
+	for paths in per_run.values():
+		for path in sorted(paths, key=tree_mtime)[:-1]:
+			drop(path)
+	return files, folders
+
+
+# The logs rules over `.build/logs`, with the caller holding the lock exclusively. None when the
+# gates or the documents cannot be read, and then nothing is removed.
+def logs_sweep(dry):
+	writers = logs_writers(REPO)
+	documents = logs_documents(REPO)
+	if writers is None or documents is None:
+		return None
+	files, folders = logs_removals(LOGS_ROOT, writers, logs_pins(documents), pid_alive)
+	total = 0
+	for path in files:
+		try:
+			total += os.lstat(path).st_size
+			if not dry:
+				os.unlink(path)
+		except OSError:
+			pass
+	if not dry:
+		for folder in folders:
+			try:
+				os.rmdir(folder)
+			except OSError:
+				pass
+	return len(files), total
+
+
+def logs_lock():
+	os.makedirs(os.path.dirname(LOGS_LOCK), exist_ok=True)
+	return os.open(LOGS_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+
+
+def logs_exclusive(handle):
+	try:
+		fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except BlockingIOError:
+		return False
+	return True
+
+
+# THE HOLDER keeps the lock shared, on the descriptor it inherits, until OWNER ends - detached from the
+# run's terminal, its pipes and every other descriptor, so a guest the run leaves behind holds neither
+# the lock nor a reader's pipe. When OWNER has ended and no other run is alive, it applies the rules
+# once more, as `run-files.py reap` does for `.build/boot`: the set that run wrote is then the only one
+# its gate keeps, and ten runs of a gate leave one set, not two.
+def logs_hold(handle, owner):
+	if os.fork():
+		os.close(handle)
+		return
+	try:
+		os.setsid()
+		null = os.open(os.devnull, os.O_RDWR)
+		for target in (0, 1, 2):
+			os.dup2(null, target)
+		os.closerange(3, handle)
+		os.closerange(handle + 1, 65536)
+		try:
+			watch = os.pidfd_open(owner)
+		except ProcessLookupError:
+			watch = None
+		if watch is not None:
+			select.select([watch], [], [])
+			os.close(watch)
+		if logs_exclusive(handle):
+			logs_sweep(False)
+	finally:
+		os._exit(0)
+
+
+def logs_summary(swept, verb):
+	if swept is None:
+		return 'lab: logs: the gate table or the tracked documents could not be read, so nothing was removed from .build/logs'
+	return f'lab: logs: {verb} {swept[0]} file(s), {swept[1] // 1024} kB that nothing reads (kept: each target\'s newest suite run and failed runs since its last pass, the capability trace, each gate\'s newest set, every pinned file)'
 
 
 # Prune what the host accumulates and nothing else.
@@ -2532,15 +2824,30 @@ KEEP_BASELINE_SAMPLES = 20
 # or belongs to a run that is over, and may not be removed when anything still refers to it.
 # The running instance is the case that matters - its log and sockets are live state, so a
 # clean leaves them alone while it is up and says so.
+#
+# `--run PID` is the form a top-level run starts with (`logs_run_begin` in lib.sh): the logs rules
+# and nothing else, and only when no other run is alive; then the lock is held shared until PID
+# ends. The other rules stay a command run by hand: a build started by hand holds no lock, and it
+# moves a new object generation into place before it records the reference to it
+# (`build-shared.sh`), so the object rule run on its own could remove that object from under it.
 def cmd_dev_clean(args):
+	owner, args = take_arg(args, '--run', None)
 	dry = '--dry-run' in args
+	handle = logs_lock()
+	if owner is not None:
+		if logs_exclusive(handle):
+			swept = logs_sweep(False)
+			if swept is None or swept[0]:
+				print(logs_summary(swept, 'removed'), file=sys.stderr)
+		else:
+			print('lab: logs: another run is alive, so this one sweeps nothing - the logs rules run only in a run that is alone', file=sys.stderr)
+		fcntl.flock(handle, fcntl.LOCK_SH)
+		logs_hold(handle, owner)
+		return
+	if not logs_exclusive(handle):
+		die(f'a verification run holds the logs lock ({os.path.relpath(LOGS_LOCK, REPO)}); clean when it has ended - until then its logs are still written and read')
+	print(logs_summary(logs_sweep(dry), 'would remove' if dry else 'removed'))
 	removed = []
-
-	# Test logs, newest kept. They come in pairs per run, so runs are counted rather than files.
-	logs = sorted(glob.glob(os.path.join(BUILD_ROOT, 'logs', 'test', '*-run.log')), key=os.path.getmtime, reverse=True)
-	for stale in logs[KEEP_TEST_RUNS:]:
-		removed.append(stale)
-		removed.append(stale.replace('-run.log', '-guest.log'))
 
 	# Baseline samples, newest kept.
 	samples = sorted(glob.glob(os.path.join(BUILD_ROOT, 'measure', 'dev-baseline', '*')), key=os.path.getmtime, reverse=True)
@@ -2604,7 +2911,7 @@ def cmd_dev_clean(args):
 		if not dry:
 			shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.unlink(path)
 	verb = 'would remove' if dry else 'removed'
-	print(f'lab: {verb} {len(removed)} item(s), {total // 1024} kB (keeping the {KEEP_TEST_RUNS} newest test runs and {KEEP_BASELINE_SAMPLES} newest baseline samples)')
+	print(f'lab: {verb} {len(removed)} other item(s), {total // 1024} kB (keeping the {KEEP_BASELINE_SAMPLES} newest baseline samples)')
 	print('lab: current artifacts and staged images are left alone; they are inputs to the next build, and `just clean` is what discards them')
 
 

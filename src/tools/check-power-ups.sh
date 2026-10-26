@@ -64,6 +64,10 @@ sim=$!
 export NET_NONE=1
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-300}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-480}"
+# THE VERDICT ALSO READS `ups-sim.log`, which keeps growing for as long as QEMU runs: the guest keeps
+# its window past the console driver until this gate names the line after which nothing it judges
+# can still arrive.
+export GUEST_GATE_WINDOW=keep
 
 guest_gate_run $'upscheck list\nupscheck control' ""
 

@@ -699,9 +699,11 @@ fi
 
 # The shape of `.build` is created here rather than assumed: every group has a directory whose
 # name says what it is for, so a sweep can be written against a place instead of a list of
-# filename patterns. `state` holds what the next build reads, `logs` what the last one wrote,
-# `cache` the per-target artifact records, and `tmp` scratch that should always end up empty.
-mkdir -p "$build_root" "$build_root/state" "$build_root/logs" "$artifact_cache_dir" "$provider_output_dir" "$artifact_log_dir"
+# filename patterns. `state` holds what the next build reads - the image graph and its seeds'
+# diagnostics too, which a cache hit needs -, `cache` the per-target artifact records, and `tmp`
+# scratch that should always end up empty. `.build/logs` is the runs' and the gates', and a build
+# writes nothing there: its logs rules remove what nobody reads, and a cache is read.
+mkdir -p "$build_root" "$build_root/state" "$artifact_cache_dir" "$provider_output_dir" "$artifact_log_dir"
 if [[ "${LIBER_IMAGE_LOCK_HELD:-0}" != 1 ]]; then
 	exec 9>"$build_root/state/build-$target.lock"
 	flock 9
@@ -1976,8 +1978,8 @@ requested_artifact_names="$(printf '%s\n' "$@" | sed 's/=.*//')"
 if grep -Fqx -- lsrt <<<"$requested_artifact_names"; then
 	image_target="$build_root/cargo/image-$target"
 	image_target_config="$build_root/state/cargo-$target.config"
-	image_graph="$build_root/logs/cargo-$target.jsonl"
-	image_graph_errors="$build_root/logs/cargo-$target.stderr"
+	image_graph="$build_root/state/cargo-$target.jsonl"
+	image_graph_errors="$build_root/state/cargo-$target.stderr"
 	image_seed="$build_root/state/image-seed-$target.o"
 	target_spec_digest="$(if [[ -f "$cargo_target" ]]; then sha256sum "$cargo_target" | awk '{print $1}'; else printf '%s' "$cargo_target" | sha256sum | awk '{print $1}'; fi)"
 	image_target_config_value="$({
@@ -2012,7 +2014,7 @@ if grep -Fqx -- lsrt <<<"$requested_artifact_names"; then
 		verbose_log "build-shared: Cargo cache hit (global build configuration)"
 	fi
 	service_seed="$build_root/state/services-seed-$target.o"
-	service_seed_errors="$build_root/logs/services-seed-$target.stderr"
+	service_seed_errors="$build_root/state/services-seed-$target.stderr"
 	if [[ -n "$selected_artifact" ]]; then
 		image_graph_key_file="$build_root/state/cargo-$target.graph-key-$selected_kind-$selected_artifact"
 	else

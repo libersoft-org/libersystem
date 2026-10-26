@@ -733,10 +733,16 @@ row={'args':args,'image_bytes':image.read_text() if image else None,
      'disk_bytes':disk.read_text() if disk and disk.exists() else None,
      'development':os.environ.get('LIBER_DEVELOPMENT'),'rustflags':os.environ.get('RUSTFLAGS')}
 with (root/'runs.jsonl').open('a') as out: out.write(json.dumps(row)+'\\n')
+# The guest's console exists once QEMU is up, and the driver records only from then on.
+pathlib.Path(os.environ['SERIAL'].split(',')[0][len('unix:'):]).touch()
 ''')
             executable(harness / "guest-console.py", '''#!/usr/bin/env python3
-import pathlib,sys
+import pathlib,sys,time
 args=sys.argv[1:]
+socket=pathlib.Path(args[args.index('--socket')+1])
+for _ in range(100):
+    if socket.exists(): break
+    time.sleep(0.1)
 pathlib.Path(args[args.index('--log')+1]).write_text('fixture: PASS\\n')
 ''')
             executable(binaries / "xorriso", '''#!/usr/bin/env python3
@@ -840,6 +846,80 @@ guest_gate_run 'probe second' fixture
                 self.assertEqual(len(builds), 0 if pinned else 1)
                 self.assertEqual(runs[0]["disk_bytes"], "selected pinned volume" if pinned else "fresh paired volume")
                 self.assertEqual(runs[1]["disk_bytes"], "state written by first guest")
+
+
+class GuestGateStopsWithItsDriver(unittest.TestCase):
+    """`guest_gate_run` against a stand-in `run.sh` that never ends on its own, with a child for QEMU.
+
+    The break, watched: the runner ran in the foreground under `GUEST_GATE_TIMEOUT`, so a guest nobody
+    recorded any more ran on to the deadline - here a minute, in the gates 120 to 300 s."""
+
+    def exercise(self, window=None, timeout="60"):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "src/tools").mkdir(parents=True)
+            (root / "src/harness").mkdir(parents=True)
+            (root / "src/tools/guest-gate.sh").write_text((HERE / "guest-gate.sh").read_text())
+
+            def executable(path, text):
+                path.write_text(text)
+                path.chmod(0o755)
+
+            executable(root / "run.sh", '''#!/usr/bin/env python3
+import os,pathlib,subprocess
+qemu=subprocess.Popen(['sleep','300'])
+pathlib.Path(os.environ['FIXTURE_ROOT'],'guest.pids').write_text(f'{os.getpid()} {qemu.pid}')
+pathlib.Path(os.environ['SERIAL'].split(',')[0][len('unix:'):]).touch()
+qemu.wait()
+''')
+            executable(root / "src/harness/guest-console.py", '''#!/usr/bin/env python3
+import pathlib,sys,time
+args=sys.argv[1:]
+socket=pathlib.Path(args[args.index('--socket')+1])
+for _ in range(100):
+    if socket.exists(): break
+    time.sleep(0.1)
+pathlib.Path(args[args.index('--log')+1]).write_text('fixture: PASS\\n')
+time.sleep(1)
+''')
+            env = dict(os.environ, FIXTURE_ROOT=str(root), LIBER_DEVELOPMENT="1", GUEST_GATE_SECONDS="5", GUEST_GATE_TIMEOUT=timeout)
+            env.pop("GUEST_GATE_WINDOW", None)
+            if window:
+                env["GUEST_GATE_WINDOW"] = window
+            script = r'''
+set -euo pipefail
+root="$1/src"
+source "$root/tools/guest-gate.sh"
+guest_gate_arch --arch aarch64
+guest_gate_run 'probe' fixture
+cat "$GUEST_LINES"
+'''
+            started = time.monotonic()
+            result = subprocess.run(["bash", "-c", script, "fixture", str(root)], cwd=root, env=env, text=True, capture_output=True, timeout=120)
+            elapsed = time.monotonic() - started
+            pids = [int(pid) for pid in (root / "guest.pids").read_text().split()]
+            for _ in range(50):
+                if not any(Path(f"/proc/{pid}").exists() for pid in pids):
+                    break
+                time.sleep(0.1)
+            alive = [pid for pid in pids if Path(f"/proc/{pid}").exists()]
+            for pid in alive:
+                os.kill(pid, 9)
+            return result, elapsed, alive
+
+    def test_the_guest_stops_when_its_console_driver_does(self):
+        result, elapsed, alive = self.exercise()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("fixture: PASS", result.stdout)
+        self.assertLess(elapsed, 30, "the guest ran on to GUEST_GATE_TIMEOUT after its driver had stopped")
+        self.assertEqual(alive, [], "the runner or its QEMU outlived the gate")
+
+    # A gate whose verdict reads a simulator's log keeps its window: the guest runs to its deadline.
+    def test_a_kept_window_runs_the_guest_to_its_deadline(self):
+        result, elapsed, alive = self.exercise(window="keep", timeout="6")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertGreaterEqual(elapsed, 5, "a kept window was cut short at the driver's end")
+        self.assertEqual(alive, [])
 
 
 class KernelBuildOnly(unittest.TestCase):

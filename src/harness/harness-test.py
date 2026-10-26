@@ -19,6 +19,7 @@
 # Run: harness/harness-test.py            (or ./check.sh --gate boot-harness from the repository root)
 
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -1474,6 +1475,285 @@ class ChildEndpointTest(unittest.TestCase):
 		env = dict(os.environ, LAB_CHANNEL_OVERRIDE='/tmp/cold-channel.sock', LAB_SERIAL_OVERRIDE='/tmp/cold-serial.log', LAB_MON_OVERRIDE='/tmp/cold-monitor.sock', LAB_QMP_OVERRIDE='/tmp/cold-qmp.sock')
 		out = subprocess.run([sys.executable, '-c', script], cwd=HERE, env=env, capture_output=True, text=True, check=True).stdout.split()
 		self.assertEqual(out, ['/tmp/cold-channel.sock', '/tmp/cold-serial.log', '/tmp/cold-monitor.sock', '/tmp/cold-qmp.sock'])
+
+
+# `guest-console.py` against a console that closes, as QEMU's does when its guest powers off. The
+# break, watched: an empty read from a closed socket was taken for a timeout's, so the driver kept
+# recording nothing until `--seconds` ran out.
+class GuestConsoleTest(unittest.TestCase):
+	def test_the_driver_ends_when_the_console_closes(self):
+		with tempfile.TemporaryDirectory() as directory:
+			path = os.path.join(directory, 'console')
+			server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+			self.addCleanup(server.close)
+			server.bind(path)
+			server.listen(1)
+			script = os.path.join(directory, 'script')
+			with open(script, 'w') as handle:
+				handle.write('poweroff\n')
+			log = os.path.join(directory, 'guest')
+
+			def guest():
+				connection, _ = server.accept()
+				connection.settimeout(30)
+				# The banner and the prompt follow the attach line, as the shell prints them.
+				connection.sendall(b'shell attached\r\n')
+				time.sleep(0.3)
+				connection.sendall(b'LiberSystem\r\nvol://system> ')
+				typed = b''
+				while b'\n' not in typed:
+					typed += connection.recv(64)
+				connection.sendall(b'power: the system is going down\r\n')
+				connection.close()
+
+			threading.Thread(target=guest, daemon=True).start()
+			started = time.monotonic()
+			done = subprocess.run([sys.executable, os.path.join(HERE, 'guest-console.py'), '--socket', path, '--log', log, '--script', script, '--seconds', '60'], capture_output=True, text=True, timeout=120)
+			elapsed = time.monotonic() - started
+			self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+			self.assertLess(elapsed, 20, 'the driver spun on a closed console to its deadline')
+			with open(log, 'rb') as handle:
+				recorded = handle.read()
+			self.assertIn(b'# guest-console sent: poweroff', recorded)
+			self.assertIn(b'power: the system is going down', recorded)
+
+
+# A suite run's two logs, named as `test-kernel.sh` names them, passed or failed by its own pass line.
+def write_suite_run(logs, arch, stamp, pid, passed=True, trace=False):
+	stem = os.path.join(logs, 'test', f'{arch}-{stamp}-{pid}')
+	os.makedirs(os.path.dirname(stem), exist_ok=True)
+	with open(f'{stem}-guest.log', 'w') as handle:
+		handle.write(('captrace: begin\n' if trace else '') + ('test suite complete: 12 passed\n' if passed else 'test FAILED: storage::mount\n'))
+	with open(f'{stem}-run.log', 'w') as handle:
+		handle.write('running 12 tests\n')
+	return [f'{stem}-guest.log', f'{stem}-run.log']
+
+
+# WHAT `.build/logs` KEEPS - `lab.py`'s logs rules over a fixture tree. The break each test was
+# watched failing against is the rule it replaced: the newest twenty test runs by time, whatever
+# they were, and nothing for any other folder.
+class LogsRulesTest(unittest.TestCase):
+	def setUp(self):
+		self.directory = tempfile.TemporaryDirectory()
+		self.addCleanup(self.directory.cleanup)
+		self.root = os.path.join(self.directory.name, 'logs')
+		os.makedirs(os.path.join(self.root, 'test'))
+		self.writers = {'acpi', 'boot-volume-controllers', 'qemu-2d-account', 'qemu-2d-demo', 'test'}
+
+	def write(self, relative, age=0):
+		path = os.path.join(self.root, relative)
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, 'w') as handle:
+			handle.write('log\n')
+		if age:
+			stamp = time.time() - age
+			os.utime(path, (stamp, stamp))
+			os.utime(os.path.dirname(path), (stamp, stamp))
+		return path
+
+	def suite(self, arch, stamp, pid, **kwargs):
+		return {os.path.relpath(path, self.root) for path in write_suite_run(self.root, arch, stamp, pid, **kwargs)}
+
+	def removed(self, pins=(), alive=lambda pid: False):
+		files, _ = lab.logs_removals(self.root, self.writers, set(pins), alive)
+		return {os.path.relpath(path, self.root) for path in files}
+
+	def test_the_newest_run_of_each_target_is_kept_and_older_ones_go(self):
+		old = self.suite('x86_64', '20261001T000000Z', 101)
+		self.suite('x86_64', '20261002T000000Z', 102)
+		self.suite('aarch64', '20261001T000000Z', 103)
+		self.assertEqual(self.removed(), old)
+
+	# `check-capability-trace.sh` takes the newest x86_64 guest log that CARRIES a trace, from all of
+	# them: a later `./test.sh --tags numa` writes a newer log without one, and the trace must stay.
+	def test_an_older_x86_64_log_with_a_trace_is_kept_beside_a_newer_one_without(self):
+		traced = self.suite('x86_64', '20261001T000000Z', 101, trace=True)
+		self.suite('x86_64', '20261002T000000Z', 102)
+		self.assertEqual(self.removed(), {path for path in traced if path.endswith('-run.log')})
+
+	def test_a_failed_run_is_kept_until_a_later_run_of_its_target_passes(self):
+		passed = self.suite('aarch64', '20261001T000000Z', 101)
+		failed = self.suite('aarch64', '20261002T000000Z', 102, passed=False) | self.suite('aarch64', '20261003T000000Z', 103, passed=False)
+		self.assertEqual(self.removed(), passed)
+		self.suite('aarch64', '20261004T000000Z', 104)
+		self.assertEqual(self.removed(), passed | failed)
+
+	def test_a_live_runs_logs_are_left_alone(self):
+		live = self.suite('riscv64', '20261001T000000Z', 101)
+		self.suite('riscv64', '20261002T000000Z', 102)
+		self.assertEqual(self.removed(alive=lambda pid: pid == 101), set())
+		self.assertEqual(self.removed(), live)
+
+	def test_a_pinned_file_is_kept_and_an_unpinned_one_beside_it_removed(self):
+		document = os.path.join(self.directory.name, 'NOTES.md')
+		with open(document, 'w') as handle:
+			handle.write(
+				'The runs: `.build/logs/measurement/runs/{a,c}.json`, and the old suite .build/logs/test/x86_64-20261001T000000Z-101-guest.log.\n'
+				'A run folder below the top is pinned whole: .build/logs/qemu-2d-account/ordinary-2/.\n'
+				'Whole top-level folders and patterns are pointers: `.build/logs/scratch/`, `.build/logs/test/x86_64-*-guest.log`, `.build/logs/<gate>/run.log`.\n'
+			)
+		for name in ('measurement/runs/a.json', 'measurement/runs/b.json', 'measurement/runs/c.json', 'measurement/summary.txt', 'scratch/x.log', 'qemu-2d-account/ordinary-2/run.out', 'qemu-2d-account/ordinary-1/run.out'):
+			self.write(name)
+		oldest = self.suite('x86_64', '20260930T000000Z', 100)
+		old = self.suite('x86_64', '20261001T000000Z', 101)
+		self.suite('x86_64', '20261002T000000Z', 102)
+		pins = lab.logs_pins([document])
+		self.assertEqual(self.removed(pins), {'measurement/runs/b.json', 'measurement/summary.txt', 'scratch/x.log', 'qemu-2d-account/ordinary-1/run.out'} | oldest | {path for path in old if path.endswith('-run.log')})
+
+	def test_each_gate_keeps_its_newest_set_and_what_no_writer_names_goes(self):
+		self.write('acpi/serial.log', age=7200)
+		self.write('acpi/down.log')
+		self.write('boot-volume-controllers-x86_64/guest.log', age=7200)
+		self.write('qemu-2d-demo.AAAAAA/demo.log', age=7200)
+		self.write('qemu-2d-demo.BBBBBB/demo.log', age=60)
+		for run in ('20261001T000000Z', '20261002T000000Z-opt1', 'ordinary-1'):
+			self.write(f'qemu-2d-account/{run}/run.out')
+		for orphan in ('bt-pan-389ba/result.json', 'dma-aarch64-build.log', 'verify-shadow.Ab12Cd34/host-full.txt'):
+			self.write(orphan)
+		self.assertEqual(self.removed(), {'qemu-2d-demo.AAAAAA/demo.log', 'qemu-2d-account/20261001T000000Z/run.out', 'qemu-2d-account/ordinary-1/run.out', 'bt-pan-389ba/result.json', 'dma-aarch64-build.log', 'verify-shadow.Ab12Cd34/host-full.txt'})
+
+
+# THE LOGS LOCK, through the real entry points over a fixture repository. `lab.py` finds its tree
+# from its own path, so copies of it, `lib.sh` and `dev.sh` in a temporary directory sweep that
+# directory's `.build/logs` and nothing of this tree's.
+class LogsLockTest(unittest.TestCase):
+	def setUp(self):
+		self.directory = tempfile.TemporaryDirectory()
+		self.addCleanup(self.directory.cleanup)
+		self.repo = self.directory.name
+		repo = os.path.dirname(os.path.dirname(HERE))
+		os.makedirs(os.path.join(self.repo, 'src', 'harness'))
+		for name in ('lib.sh', 'dev.sh'):
+			shutil.copy2(os.path.join(repo, name), os.path.join(self.repo, name))
+		self.lab = os.path.join(self.repo, 'src', 'harness', 'lab.py')
+		shutil.copy2(os.path.join(HERE, 'lab.py'), self.lab)
+		with open(os.path.join(self.repo, 'check.sh'), 'w') as handle:
+			handle.write('declare -A GATES=(\n\t["qemu-2d-demo"]="tools/check-qemu-2d-demo.sh"\n)\n')
+		subprocess.run(['git', 'init', '-q', self.repo], check=True)
+		self.logs = os.path.join(self.repo, '.build', 'logs')
+		self.lock = os.path.join(self.repo, '.build', 'state', 'logs.lock')
+		# A run this one is part of must not make the fixture's runs nested ones.
+		self.env = {name: value for name, value in os.environ.items() if name not in ('LIBER_LOGS_RUN', 'RUN_STATUS_FILE', 'LIBER_DEV_STATE')}
+
+	def dead_pid(self):
+		ended = subprocess.Popen(['true'])
+		ended.wait()
+		return ended.pid
+
+	def hold(self):
+		os.makedirs(os.path.dirname(self.lock), exist_ok=True)
+		handle = os.open(self.lock, os.O_RDWR | os.O_CREAT)
+		fcntl.flock(handle, fcntl.LOCK_SH)
+		return handle
+
+	# The holders a run's `dev-clean --run` left behind: forks of it, so named by its command line.
+	def holders(self):
+		found = []
+		for pid in filter(str.isdigit, os.listdir('/proc')):
+			try:
+				with open(f'/proc/{pid}/cmdline', 'rb') as handle:
+					if self.lab.encode() in handle.read():
+						found.append(int(pid))
+			except OSError:
+				pass
+		return found
+
+	def settled(self):
+		for _ in range(300):
+			if not self.holders():
+				return
+			time.sleep(0.1)
+		self.fail('the holder outlived its run')
+
+	def begin(self, owner):
+		return subprocess.run([sys.executable, self.lab, 'dev-clean', '--run', str(owner)], capture_output=True, text=True, timeout=120, env=self.env)
+
+	# The break: no lock at all - every run swept, and so would a run beside a live one, removing an
+	# ended run's logs before that run's gate had read them.
+	def test_a_run_sweeps_nothing_while_another_run_holds_the_lock(self):
+		old = write_suite_run(self.logs, 'x86_64', '20261001T000000Z', self.dead_pid())
+		write_suite_run(self.logs, 'x86_64', '20261002T000000Z', self.dead_pid())
+		handle = self.hold()
+		try:
+			owner = subprocess.Popen(['sleep', '60'])
+			begun = self.begin(owner.pid)
+			self.assertEqual(begun.returncode, 0, begun.stderr)
+			self.assertIn('another run is alive', begun.stderr)
+			owner.kill()
+			owner.wait()
+			self.settled()
+			self.assertTrue(all(os.path.exists(path) for path in old), 'a run swept beside another run that was alive')
+		finally:
+			os.close(handle)
+		begun = self.begin(self.dead_pid())
+		self.assertEqual(begun.returncode, 0, begun.stderr)
+		self.settled()
+		self.assertFalse(any(os.path.exists(path) for path in old), 'a run that is alone did not sweep')
+
+	def test_a_hand_clean_refuses_while_a_run_holds_the_lock(self):
+		old = write_suite_run(self.logs, 'aarch64', '20261001T000000Z', self.dead_pid())
+		write_suite_run(self.logs, 'aarch64', '20261002T000000Z', self.dead_pid())
+		handle = self.hold()
+		try:
+			clean = subprocess.run([os.path.join(self.repo, 'dev.sh'), 'clean'], capture_output=True, text=True, timeout=120, env=self.env)
+		finally:
+			os.close(handle)
+		self.assertNotEqual(clean.returncode, 0)
+		self.assertIn('holds the logs lock', clean.stderr)
+		self.assertTrue(all(os.path.exists(path) for path in old))
+		clean = subprocess.run([os.path.join(self.repo, 'dev.sh'), 'clean'], capture_output=True, text=True, timeout=120, env=self.env)
+		self.assertEqual(clean.returncode, 0, clean.stderr)
+		self.assertFalse(any(os.path.exists(path) for path in old))
+
+	# The automatic sweep is the logs rules alone. A build started by hand holds no lock, and it
+	# moves a new object generation into place before it records the reference to it - so the
+	# object rule, run on its own, could remove the object a build is about to name.
+	def test_the_automatic_sweep_touches_nothing_outside_the_logs(self):
+		cache = os.path.join(self.repo, '.build', 'cache', 'x86_64')
+		os.makedirs(cache)
+		current, superseded = 'a' * 64, 'b' * 64
+		with open(os.path.join(cache, 'executable-tool.object'), 'w') as handle:
+			handle.write(f'key={current}\n')
+		for key in (current, superseded):
+			open(os.path.join(cache, f'object-tool-{key}.o'), 'w').close()
+		scratch = os.path.join(self.repo, '.build', 'tmp', 'killed-build')
+		os.makedirs(scratch)
+		os.utime(scratch, (time.time() - 3 * 86400, time.time() - 3 * 86400))
+		old = write_suite_run(self.logs, 'riscv64', '20261001T000000Z', self.dead_pid())
+		write_suite_run(self.logs, 'riscv64', '20261002T000000Z', self.dead_pid())
+		begun = self.begin(self.dead_pid())
+		self.assertEqual(begun.returncode, 0, begun.stderr)
+		self.settled()
+		self.assertFalse(any(os.path.exists(path) for path in old), 'the automatic sweep did not run')
+		self.assertTrue(os.path.exists(os.path.join(cache, f'object-tool-{superseded}.o')), 'the automatic sweep removed an object generation')
+		self.assertTrue(os.path.exists(scratch), 'the automatic sweep removed build scratch')
+		clean = subprocess.run([os.path.join(self.repo, 'dev.sh'), 'clean'], capture_output=True, text=True, timeout=120, env=self.env)
+		self.assertEqual(clean.returncode, 0, clean.stderr)
+		self.assertFalse(os.path.exists(os.path.join(cache, f'object-tool-{superseded}.o')), 'the hand clean lost its object rule')
+		self.assertTrue(os.path.exists(os.path.join(cache, f'object-tool-{current}.o')))
+
+	# Ten top-level runs of one gate that makes a folder per run, each through `lib.sh` as `check.sh`
+	# starts one: the sweep at each start keeps the newest set, and the one when each run ends keeps
+	# that run's own - one set, where there were ten.
+	def test_ten_runs_of_one_gate_leave_one_set(self):
+		gate = os.path.join(self.repo, 'gate.sh')
+		with open(gate, 'w') as handle:
+			handle.write(
+				'#!/usr/bin/env bash\n'
+				'SCRIPT_NAME=gate.sh\n'
+				'source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"\n'
+				'arm_run_verdict\n'
+				'logs_run_begin\n'
+				'mkdir -p "$BUILD_DIR/logs"\n'
+				'proof="$(mktemp -d "$BUILD_DIR/logs/qemu-2d-demo.XXXXXX")"\n'
+				'echo frame >"$proof/demo.log"\n'
+			)
+		os.chmod(gate, 0o755)
+		for _ in range(10):
+			run = subprocess.run([gate], capture_output=True, text=True, timeout=120, env=self.env)
+			self.assertEqual(run.returncode, 0, run.stderr)
+			self.settled()
+		self.assertEqual(len([name for name in os.listdir(self.logs) if name.startswith('qemu-2d-demo.')]), 1)
 
 
 if __name__ == '__main__':

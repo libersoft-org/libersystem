@@ -105,7 +105,7 @@ pub const CONFIGURATIONS: [&str; 9] = [
 
 // The environment variables permitted to influence a run, and the prefixes under which any other
 // variable is an UNDECLARED OVERRIDE that refuses the run.
-pub const PERMITTED_ENVIRONMENT: [&str; 24] = [
+pub const PERMITTED_ENVIRONMENT: [&str; 25] = [
 	"LIBER_RUN_MODE",
 	"LIBER_DMA_MODE",
 	"LIBER_DEVELOPMENT",
@@ -116,6 +116,7 @@ pub const PERMITTED_ENVIRONMENT: [&str; 24] = [
 	"LIBER_TRUST_KEY_ID",
 	"LIBER_VERIFY_RUN",
 	"LIBER_PUBLISH_LOCK",
+	"LIBER_LOGS_RUN",
 	"LIBER_GATE_KEY",
 	"LIBER_CONCURRENT_GUESTS",
 	"LIBER_KERNEL_STRIP",
