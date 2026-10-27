@@ -1129,6 +1129,9 @@ pub const ALONE_GATES: &[&str] = &[
 	// riscv64 TCPCI partner's timing.
 	"bluetooth-transfer",
 	"typec-tcpci-riscv64",
+	// Development instances that failed under load on 2026-10-26/27 and passed alone (the ledger).
+	"ipmi",
+	"sleep",
 	// Oracles of the machine's processes: the two-guest overlap is observed against the process baseline, and the
 	// multiport capture chosen is the newest on the machine.
 	"concurrent-selection",

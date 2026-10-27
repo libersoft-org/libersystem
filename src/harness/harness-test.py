@@ -1599,6 +1599,48 @@ class GuestConsoleTest(unittest.TestCase):
 			self.assertIn(b'power: the system is going down', recorded)
 
 
+# A SCREENSHOT OF A LAB GUEST WITH A STATE DIRECTORY OF ITS OWN snaps that guest: `qemu-run.sh` puts its control monitor
+# in `LIBER_DEV_STATE`, and `screenshot.sh` looked only in `.build/boot`, so it booted a throwaway instance of its own
+# and the 2D demo gate's frames never showed the demo. Watched failing against the old path: the capture fell back to
+# that boot.
+class ScreenshotTest(unittest.TestCase):
+	def test_a_lab_guest_in_its_own_state_directory_is_snapped_live(self):
+		directory = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, directory, True)
+		os.makedirs(os.path.join(directory, 'src', 'harness'))
+		shutil.copy(os.path.join(HERE, 'screenshot.sh'), os.path.join(directory, 'src', 'harness'))
+		state = os.path.join(directory, 'state')
+		os.makedirs(state)
+		monitor = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		self.addCleanup(monitor.close)
+		monitor.bind(os.path.join(state, 'qemu-monitor.sock'))
+		monitor.listen(4)
+
+		# An HMP monitor that answers `screendump PATH` with a one-pixel frame; the liveness probe connects and leaves.
+		def serve():
+			while True:
+				try:
+					connection, _ = monitor.accept()
+				except OSError:
+					return
+				with connection:
+					received = b''
+					while chunk := connection.recv(4096):
+						received += chunk
+						if b'\n' in received:
+							break
+					if received.startswith(b'screendump '):
+						with open(received.split(b'\n')[0][len(b'screendump '):].decode(), 'wb') as handle:
+							handle.write(b'P6\n1 1\n255\n\x10\x20\x30')
+
+		threading.Thread(target=serve, daemon=True).start()
+		out = os.path.join(directory, 'shot.ppm')
+		done = subprocess.run([os.path.join(directory, 'src', 'harness', 'screenshot.sh'), out], capture_output=True, text=True, timeout=60, env={**os.environ, 'LIBER_DEV_STATE': state})
+		self.assertEqual(done.returncode, 0, done.stderr)
+		self.assertIn('attaching to the running QEMU', done.stderr)
+		self.assertGreater(os.path.getsize(out), 0)
+
+
 
 # A GATE'S COMPLETION LINE ends the recording, the settle window after it, and nothing else. The gates that name one,
 # each with the line it refuses: the driver ends within seconds of the window rather than at its deadline, and a line

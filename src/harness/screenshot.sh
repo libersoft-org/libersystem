@@ -24,7 +24,9 @@ OUT="${1:?usage: screenshot.sh <output-path> (e.g. screenshot.png, shot.jpg, sho
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 BUILD="$REPO_ROOT/.build/boot"
-RUN_MON="$BUILD/qemu-monitor.sock" # control monitor exposed by a live `./run.sh`
+# The control monitor a live `./run.sh` exposes - in the state directory a lab guest was given (`LIBER_DEV_STATE`, where
+# `qemu-run.sh` puts it), or `.build/boot`.
+RUN_MON="${LIBER_DEV_STATE:-$BUILD}/qemu-monitor.sock"
 
 mkdir -p "$BUILD"
 # A RUN DIRECTORY OF ITS OWN, because every path here used to be a singleton.

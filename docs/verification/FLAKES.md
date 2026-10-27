@@ -19,7 +19,7 @@ The rules this ledger carries:
 
 ## L2 runs since the last flake attributed to load
 
-0 - the last were seen on 2026-10-20/21, below.
+0 - the last were seen on 2026-10-26/27, below.
 
 ## Entries
 
@@ -30,7 +30,13 @@ The rules this ledger carries:
 | The kernel transport test | 2026-10-20/21 | not recorded | the release rehearsal | One pump, then the answer expected. | Fixed on 2026-10-20/21. |
 | The transport test's patience | 2026-10-20/21 | not recorded | under load | A patience of three ticks, which load outran. | Open; seen once. |
 | `bluetooth-transfer` | 2026-10-20/21 | x86_64 | under load | The Bluetooth fixture's OPP model timed out. | Open; seen once. The gate runs alone. |
-| `typec-tcpci-riscv64` | 2026-10-20/21 | riscv64 | under load | A different timing step failed in each run: the TCPCI partner's steps are timed for a native target. | Open; seen in more than one run. The gate runs alone. |
+| `typec-tcpci-riscv64` | 2026-10-20/21 | riscv64 | under load | A different timing step failed in each run: the TCPCI partner's steps are timed for a native target. | Not a flake: it failed again running alone, in the L2 of 2026-10-26 (below). The gate runs alone. |
+| `ipmi` | 2026-10-26/27 | x86_64 | the L2 and a narrowed rehearsal, four guest slots | In the L2 its SSIF boot answered `bmc sensors` with "the BMC is unavailable" (the gate declared no bootable volume then, and gates beside it re-signed that volume); in the rehearsal, with the volume declared, its third development instance reached a shell but its agent never answered within the bring-up's 30 s. It passed alone, with one guest slot. | Open; seen in two runs. The gate runs alone. |
+| `sleep` | 2026-10-26/27 | x86_64 | the L2 and a narrowed rehearsal, four guest slots | In the L2 the instance's console refused a connection at the Ctrl+Z step, after the S3 wakes had passed; in the rehearsal its development instance did not come up. It passed alone, with one guest slot. | Open; seen in two runs. The gate runs alone. |
 
 Not a flake: the spool test on riscv64 (`spool_service_sends_submitted_jobs_exactly_once`) fails alone, two runs of
 two, on the spool service's own two-second answer bound. It belongs to that service's bound, not to this ledger.
+
+Not a flake: `typec-tcpci-riscv64` ran with nothing beside it in the L2 of 2026-10-26 and failed on "vbus-stays-off:
+detached after 330 ms, before tSrcRecover and tSrcTurnOn (1275 ms) had passed" - the TCPCI partner's timing on an
+emulated riscv64, which belongs to that work's bound.
