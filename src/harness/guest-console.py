@@ -73,8 +73,10 @@ def main():
 	# the timing is the subject of.
 	parser.add_argument("--line-seconds", type=float, default=60.0, help="how long one line may take")
 	# THE GATE'S OWN COMPLETION LINE, after which nothing it judges can still arrive. Recording stops once the line
-	# has been printed - a whole line of output, so the shell echoing the command that prints it does not count - and
-	# `--settle` seconds more have passed, the window a gate with negative checks keeps for a line arriving late.
+	# has been printed - a whole line of output, so the shell echoing the command that prints it does not count -,
+	# every command has been typed, and `--settle` seconds more have passed since the line, the window a gate with
+	# negative checks keeps for a line arriving late. The line counts wherever it came: a fixture's last event can be
+	# printed while the guest is still booting, before the shell takes the first command.
 	parser.add_argument("--done", help="a line of output after which nothing the gate judges can arrive")
 	parser.add_argument("--settle", type=float, default=0.0, help="how long to keep recording after the --done line")
 	arguments = parser.parse_args()
@@ -98,8 +100,8 @@ def main():
 	ready = False
 	prompt_at = None
 	prompt_first = 0.0
-	# Everything printed since the last line was typed, for the completion line; and when that line came.
-	after_last = bytearray()
+	# What is printed, for the completion line - kept only back to its last line end; and when that line came.
+	pending = bytearray()
 	done_at = None
 	client.settimeout(0.1)
 	with open(arguments.log, "wb") as log:
@@ -119,7 +121,7 @@ def main():
 					log.write(b"\n# guest-console: the console closed\n")
 					log.flush()
 					break
-			if done_at is not None and time.monotonic() - done_at >= arguments.settle:
+			if done_at is not None and sent >= len(commands) and time.monotonic() - done_at >= arguments.settle:
 				log.write(b"\n# guest-console: the completion line came, and the settle window after it has passed\n")
 				log.flush()
 				break
@@ -127,12 +129,11 @@ def main():
 				log.write(chunk)
 				log.flush()
 				seen += chunk
-				if done is not None and sent >= len(commands) and done_at is None:
-					after_last += chunk
-					if done in output_lines(after_last):
+				if done is not None and done_at is None:
+					pending += chunk
+					if done in output_lines(pending):
 						done_at = time.monotonic()
-					elif len(after_last) > 65536:
-						del after_last[:-4096]
+					del pending[: pending.rfind(b"\n") + 1]
 				# Only the tail can contain a prompt, and an unbounded buffer on a chatty console is
 				# a memory leak with a deadline.
 				if len(seen) > 8192:
@@ -167,7 +168,6 @@ def main():
 				log.write(b"\n# guest-console sent: " + commands[sent].encode() + b"\n")
 				log.flush()
 				sent += 1
-				after_last.clear()
 				line_deadline = time.monotonic() + arguments.line_seconds
 				continue
 			if time.monotonic() > line_deadline:

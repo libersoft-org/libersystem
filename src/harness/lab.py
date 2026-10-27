@@ -2535,9 +2535,11 @@ KEEP_BASELINE_SAMPLES = 20
 # someone ran this clean by hand - which then kept the newest twenty test runs, whatever they were.
 # The rules, from what each reader needs:
 #
-#   test/            per target, the newest ended run's logs; a failed run's - no `test suite
-#                    complete: N passed`, the line `test-kernel.sh` itself requires - until a later run
-#                    of that target passes; the newest x86_64 guest log carrying a capability trace,
+#   test/            per target, the newest ended run's logs; the newest whole run's, from which the
+#                    planner takes each test's measured duration when it splits a port's suite across
+#                    guests, because a later selection does not replace it there; a failed run's - no
+#                    `test suite complete: N passed`, the line `test-kernel.sh` itself requires - until a
+#                    later run of that target passes; the newest x86_64 guest log carrying a capability trace,
 #                    which `check-capability-trace.sh` selects by content among all of them, because
 #                    the newest run may be a selection without one; and every log of a run that is
 #                    still alive, which its name says by its runner's pid
@@ -2558,6 +2560,8 @@ LOG_ARCHITECTURES = ('x86_64', 'aarch64', 'riscv64')
 SUITE_LOG = re.compile(r'^(x86_64|aarch64|riscv64)-([0-9]{8}T[0-9]{6}Z)-([0-9]+)-.')
 SUITE_PASSED = re.compile(rb'^test suite complete: [0-9]+ passed', re.M)
 CAPABILITY_TRACE = b'captrace: begin'
+# What a whole run prints before its first test, and how the planner tells one (`measured_test_durations`).
+WHOLE_RUN = b'tests (all tags)'
 # `mktemp -d NAME.XXXXXX`: `check-qemu-2d-demo.sh`, `check-qemu-3d-demo.sh`, `verify.sh`'s shadow.
 PER_RUN_FOLDER = re.compile(r'^(.+)\.[A-Za-z0-9]{6,8}$')
 # The writers that keep a folder per run inside their own, named by when the run started.
@@ -2687,6 +2691,11 @@ def suite_logs_kept(directory, alive):
 			if newest == 0 or not passed:
 				kept.update(runs[run])
 			if passed:
+				break
+		# The newest whole run, chosen as the planner chooses it.
+		for run in reversed(ended):
+			if any(WHOLE_RUN in read_bytes(path) for path in runs[run]):
+				kept.update(runs[run])
 				break
 	# The capability trace's log, chosen as its reader chooses: the last sorted name that carries one.
 	for guest in sorted((path for run, paths in runs.items() if run[0] == 'x86_64' for path in paths if path.endswith('-guest.log')), reverse=True):
@@ -2819,7 +2828,7 @@ def logs_hold(handle, owner):
 def logs_summary(swept, verb):
 	if swept is None:
 		return 'lab: logs: the gate table or the tracked documents could not be read, so nothing was removed from .build/logs'
-	return f'lab: logs: {verb} {swept[0]} file(s), {swept[1] // 1024} kB that nothing reads (kept: each target\'s newest suite run and failed runs since its last pass, the capability trace, each gate\'s newest set, every pinned file)'
+	return f'lab: logs: {verb} {swept[0]} file(s), {swept[1] // 1024} kB that nothing reads (kept: each target\'s newest suite run, its newest whole run and its failed runs since its last pass, the capability trace, each gate\'s newest set, every pinned file)'
 
 
 # Prune what the host accumulates and nothing else.

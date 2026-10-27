@@ -1073,6 +1073,93 @@ cat "$GUEST_LINES"
         self.assertGreaterEqual(elapsed, 5, "a kept window was cut short at the driver's end")
         self.assertEqual(alive, [])
 
+    # A RUNNER THAT REFUSES ENDS THE GATE WITH ITS REFUSAL, at once. The break, watched in a release on both ports:
+    # `qemu-run.sh` refused the staging's profile in a second, the driver waited its whole budget for a socket that
+    # was never made, and the gate failed "the guest produced no console output" - a failure, not a refusal the
+    # runner can fix.
+    def test_a_refused_guest_ends_the_gate_at_once_with_the_refusal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "src/tools").mkdir(parents=True)
+            (root / "src/harness").mkdir(parents=True)
+            (root / "src/tools/guest-gate.sh").write_text((HERE / "guest-gate.sh").read_text())
+            (root / "run.sh").write_text("#!/usr/bin/env bash\necho \"qemu-run: REFUSED: the aarch64 staging's 'libs' was built in the development profile\"\nexit 75\n")
+            (root / "run.sh").chmod(0o755)
+            # The driver as it is: it waits for the socket until its budget runs out.
+            (root / "src/harness/guest-console.py").write_text('''#!/usr/bin/env python3
+import pathlib,sys,time
+args=sys.argv[1:]
+socket=pathlib.Path(args[args.index('--socket')+1])
+deadline=time.monotonic()+float(args[args.index('--seconds')+1])
+while time.monotonic()<deadline and not socket.exists():
+    time.sleep(0.1)
+''')
+            env = dict(os.environ, LIBER_DEVELOPMENT="1", GUEST_GATE_SECONDS="60", GUEST_GATE_TIMEOUT="90")
+            env.pop("GUEST_GATE_WINDOW", None)
+            script = r'''
+set -euo pipefail
+root="$1/src"
+source "$root/tools/guest-gate.sh"
+guest_gate_arch --arch aarch64
+guest_gate_run 'probe' fixture
+'''
+            started = time.monotonic()
+            result = subprocess.run(["bash", "-c", script, "fixture", str(root)], cwd=root, env=env, text=True, capture_output=True, timeout=150)
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertIn("REFUSED: the aarch64 staging", result.stderr)
+        self.assertLess(elapsed, 20, "the driver waited out its budget for a guest that had refused")
+
+
+class BootableVolumeRefusal(unittest.TestCase):
+    """A BOOT REFUSED FOR ITS BOOTABLE VOLUME IS HANDED THE VOLUME'S OWN BUILD. The real `qemu-run.sh`, over a staging
+    whose records say what a fixture wants, stopped at its refusal. The break, watched in a release on both ports: a
+    `SYSTEM_DISK` boot refused the volume and handed the runner the staging's build, which leaves the bootable volume
+    as it was - so the runner built, ran the gate once more, and was refused again."""
+
+    def refusal(self, arch, environment, volume_profile=None, volume_mode=None):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            harness = root / "src/harness"
+            tools = root / "src/tools"
+            state = root / ".build/state"
+            boot = root / ".build/boot"
+            for path in (harness, tools, state, boot):
+                path.mkdir(parents=True)
+            for name in ("qemu-run.sh", "run-files.py"):
+                (harness / name).write_text((ROOT / "src/harness" / name).read_text())
+            (tools / "staging-state.sh").write_text((HERE / "staging-state.sh").read_text())
+            for part in ("libs", "user", "packages", "volume-test"):
+                (state / f"built-{arch}-{part}.profile").write_text("shipping\n")
+            if volume_profile:
+                (state / f"built-{arch}-volume.profile").write_text(volume_profile + "\n")
+            if volume_mode:
+                (boot / f"system-volume-bootable-{arch}.dma-mode").write_text(volume_mode + "\n")
+            (root / "kernel").write_text("kernel fixture")
+            fixes = root / "fixes"
+            env = dict(os.environ, LIBER_RUN_MODE="gate", LIBER_STATE_REFUSAL=str(fixes), **environment)
+            for name in ("LIBER_DEVELOPMENT", "TEST", "BOOT_IMAGE", "LIBER_DMA_MODE"):
+                env.pop(name, None)
+            done = subprocess.run(["bash", str(harness / "qemu-run.sh"), arch, str(root / "kernel")], cwd=root, env=env, text=True, capture_output=True, timeout=60)
+            return done.returncode, done.stderr, fixes.read_text() if fixes.exists() else ""
+
+    def test_a_ports_system_disk_boot_is_handed_the_bootable_volumes_build(self):
+        build = "env -u LIBER_DEVELOPMENT ./build.sh --arch aarch64 --kernel-on-volume --dma-mode harness --part volume\n"
+        status, stderr, fixes = self.refusal("aarch64", {"SYSTEM_DISK": "nvme"})
+        self.assertEqual(status, 75, stderr)
+        self.assertIn("REFUSED: the aarch64 bootable volume carries no profile record", stderr)
+        self.assertEqual(fixes, build)
+        status, stderr, fixes = self.refusal("aarch64", {"SYSTEM_DISK": "nvme"}, volume_profile="shipping", volume_mode="enforcing-required")
+        self.assertEqual(status, 75, stderr)
+        self.assertIn("signed for DMA mode 'enforcing-required', and this needs 'harness'", stderr)
+        self.assertEqual(fixes, build)
+
+    def test_an_x86_64_boot_is_handed_the_bootable_volumes_build_in_its_mode(self):
+        status, stderr, fixes = self.refusal("x86_64", {}, volume_profile="development", volume_mode="enforcing-required")
+        self.assertEqual(status, 75, stderr)
+        self.assertIn("REFUSED: the x86_64 bootable volume was built in the development profile", stderr)
+        self.assertEqual(fixes, "env -u LIBER_DEVELOPMENT ./build.sh --arch x86_64 --kernel-on-volume --dma-mode enforcing-required --part volume\n")
+
 
 class KernelBuildOnly(unittest.TestCase):
     def exercise(self, remove_return):

@@ -152,7 +152,10 @@ fi
 # THE BOOTABLE SHAPE BY NAME. The system volume is built in two shapes - with a kernel on it for a
 # shipping medium, without one for the test harness - and naming them apart is what makes this read
 # deterministic rather than a question about which command was most recent.
-volume="$BUILD/system-volume-bootable-x86_64.img"
+# AND THE ONE BUILT WITH THE MEDIUM: inside a run, the volume its image producer stored beside it. The tree's own is
+# rebuilt by every step that writes the bootable volume, and one run between the producer and this gate left the
+# medium naming a volume that was no longer there.
+volume="$(evidence_image system-volume-bootable-x86_64.img)" || fail "no bootable system volume produced by this run"
 if [[ ! -f "$volume" ]]; then
 	echo "signed-boot: no bootable system volume at $volume, so the selected-source cases are not run" >&2
 	echo "signed-boot:   build it with:  ./build.sh --arch x86_64 --kernel-on-volume --part volume" >&2

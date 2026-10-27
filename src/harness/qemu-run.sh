@@ -3684,20 +3684,27 @@ setsid -f python3 "$HERE/run-files.py" reap "$$" "$QEMU_BUILD_DIR" </dev/null >/
 # medium from the staging; a `BOOT_IMAGE` carries its own. A staging another step left in the other profile
 # is refused now, by name, with a refusal's status, rather than booted into a failure that blames the code.
 staging_parts=(libs user packages volume-test)
+volume_mode=""
 if [[ "$TARGET_ARCH" == x86_64 ]]; then
-	[[ "${TEST:-0}" == 1 ]] || staging_parts=(libs user packages volume)
-	[[ -z "${BOOT_IMAGE:-}" ]] || staging_parts=()
+	[[ "${TEST:-0}" == 1 ]] || {
+		staging_parts=(libs user packages)
+		volume_mode="${LIBER_DMA_MODE:-enforcing-required}"
+	}
+	[[ -z "${BOOT_IMAGE:-}" ]] || staging_parts=() volume_mode=""
 elif [[ -n "${SYSTEM_DISK:-}" ]]; then
-	staging_parts=(libs user packages volume)
+	staging_parts=(libs user packages)
+	volume_mode=harness
 fi
-# AND, ON AN X86_64 RUN THAT ASSEMBLES A SHIPPING-SHAPED MEDIUM, THE BOOTABLE VOLUME SIGNED FOR THE MEDIUM'S
-# MODE (`mkimage.sh iso` signs `LIBER_DMA_MODE`, `enforcing-required` by default) - asked here with the profile,
-# so one refusal names every state the boot needs and a runner fixes them together.
+# AND THE BOOTABLE VOLUME, IN THE PROFILE AND SIGNED FOR THE MODE THE BOOT PAIRS IT WITH: an x86_64 run that assembles a
+# shipping-shaped medium, signed `LIBER_DMA_MODE` (`mkimage.sh iso`, `enforcing-required` by default), and a port's
+# `SYSTEM_DISK` boot, whose medium is signed `harness` (`stage_signed_boot_manifest`). Asked here with the staging, so
+# one refusal names every state the boot needs and a runner fixes them together - the volume by its own build: the
+# staging's leaves it as it was, and a port gate refused for its volume was refused again after that build ran.
 staging_refusals=()
 if ((${#staging_parts[@]})) && staging_refusal="$(staging_profile_refusal "$REPO_ROOT/.build" "$TARGET_ARCH" "$(run_profile)" "${staging_parts[@]}")"; then
 	staging_refusals+=("$staging_refusal")
 fi
-if [[ "$TARGET_ARCH" == x86_64 && -z "${BOOT_IMAGE:-}" && "${TEST:-0}" != 1 ]] && staging_refusal="$(volume_mode_refusal "$QEMU_BUILD_DIR/system-volume-bootable-x86_64.img" "${LIBER_DMA_MODE:-enforcing-required}" x86_64)"; then
+if [[ -n "$volume_mode" ]] && staging_refusal="$(volume_state_refusal "$REPO_ROOT/.build" "$TARGET_ARCH" "$volume_mode")"; then
 	staging_refusals+=("$staging_refusal")
 fi
 if ((${#staging_refusals[@]})); then

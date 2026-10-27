@@ -60,6 +60,11 @@ seed_mutation_inputs() {
 		rsync -a --delete "$REPO/.build/image/$target/" "$WORK/.build/image/$target/"
 		# The staged-image preflight reads these digests; compiler objects and build logs are unused.
 		rsync -a --delete --include='*.sha256' --exclude='*' "$REPO/.build/cache/$target/" "$WORK/.build/cache/$target/"
+		# AND THE PROFILE EACH PART WAS BUILT IN, which `test.sh` reads beside the staging and refuses to run without
+		# (`staging-state.sh`): the copy is the tree's staging, so its records are the tree's.
+		for part in libs user packages volume-test; do
+			[[ ! -f "$REPO/.build/state/built-x86_64-$part.profile" ]] || cp "$REPO/.build/state/built-x86_64-$part.profile" "$WORK/.build/state/"
+		done
 	) 9>"$REPO/.build/state/build-$target.lock"
 }
 

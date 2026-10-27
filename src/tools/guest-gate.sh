@@ -201,19 +201,41 @@ s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])')"
 	QEMU_MONITOR_SOCKET="$GUEST_GATE_MONITOR" QEMU_QMP_SOCKET="$GUEST_GATE_QMP" HOSTFWD_PORT="$port" SERIAL="unix:$socket,server=on,wait=off" timeout "$deadline" ./run.sh --arch "$GUEST_ARCH" --smp 2 "${guest_gate_image_args[@]}" >"$guest_gate_work/run" 2>&1 &
 	guest_gate_guest=$!
-	wait "$guest_gate_driver" 2>/dev/null || true
-	guest_gate_driver=""
-	# THE GUEST STOPS WHEN ITS CONSOLE DRIVER DOES. Nothing records the console after the driver has
-	# exited, so nothing the console log holds can change after it: the guest ran on to the deadline
-	# for nothing - 120 to 300 s past every recording of the 23 gates that type no `poweroff`. `timeout`
-	# signals its whole process group, so the runner and its QEMU end together. QEMU's own output
-	# (`run`) is only ever copied for diagnosis. A gate whose verdict also reads a simulator's log on
-	# the host, which keeps growing until QEMU stops, keeps its window with `GUEST_GATE_WINDOW=keep`.
-	if [[ "${GUEST_GATE_WINDOW:-}" != keep ]]; then
-		kill -TERM "$guest_gate_guest" 2>/dev/null || true
+	local first="" first_status=0 guest_status=0
+	wait -n -p first "$guest_gate_driver" "$guest_gate_guest" 2>/dev/null || first_status=$?
+	if [[ "$first" == "$guest_gate_guest" ]]; then
+		# A GUEST GONE FIRST ENDS ITS DRIVER. A closed console ends a driver that was reading it, but one that never
+		# connected - the runner refused, or the guest died before it made its socket - waited out its whole budget
+		# for a socket that was never coming: 600 s for each port's refused `boot-volume-controllers`.
+		guest_status=$first_status
+		guest_gate_guest=""
+		for _ in $(seq 1 50); do
+			kill -0 "$guest_gate_driver" 2>/dev/null || break
+			sleep 0.1
+		done
+		kill "$guest_gate_driver" 2>/dev/null || true
+		wait "$guest_gate_driver" 2>/dev/null || true
+		guest_gate_driver=""
+	else
+		guest_gate_driver=""
+		# THE GUEST STOPS WHEN ITS CONSOLE DRIVER DOES. Nothing records the console after the driver has
+		# exited, so nothing the console log holds can change after it: the guest ran on to the deadline
+		# for nothing - 120 to 300 s past every recording of the 23 gates that type no `poweroff`. `timeout`
+		# signals its whole process group, so the runner and its QEMU end together. QEMU's own output
+		# (`run`) is only ever copied for diagnosis. A gate whose verdict also reads a simulator's log on
+		# the host, which keeps growing until QEMU stops, keeps its window with `GUEST_GATE_WINDOW=keep`.
+		if [[ "${GUEST_GATE_WINDOW:-}" != keep ]]; then
+			kill -TERM "$guest_gate_guest" 2>/dev/null || true
+		fi
+		wait "$guest_gate_guest" 2>/dev/null || guest_status=$?
+		guest_gate_guest=""
 	fi
-	wait "$guest_gate_guest" 2>/dev/null || true
-	guest_gate_guest=""
+	# A REFUSED GUEST IS A REFUSED GATE: the staging is in another state than the one this boot needs, and the
+	# refusal's own status lets a runner bring that state about and run the gate again (`staging-state.sh`).
+	if ((guest_status == 75)); then
+		grep -a 'REFUSED' "$guest_gate_work/run" >&2 || true
+		exit 75
+	fi
 	[[ -s "$GUEST_LOG" ]] || guest_gate_fail "the guest produced no console output"
 	# AN EMPTY PREFIX KEEPS THE WHOLE LOG. A probe whose lines do not all begin with one word - the
 	# ICD one prints `icd lowest ...` and `icd lookup ...` - is read from the log itself, and the

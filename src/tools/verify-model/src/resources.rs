@@ -10,7 +10,8 @@
 // A DECLARATION NOBODY CHECKS IS A GUESS, so two halves of it are held to the gate's own scripts, in both
 // directions: whether it boots a guest, and whether it writes a staging. `verify-model check` follows each
 // gate's command in `check.sh` to the scripts it runs and refuses a gate with no declaration, one declared as
-// a host gate whose scripts call a runner, and one declared as booting whose scripts call none.
+// a host gate whose scripts call a runner, and one declared as booting whose scripts call none. And a third, one
+// way: the x86_64 bootable volume is declared in the mode the gate's boots sign it for.
 //
 // The declaration language, one gate a line:
 //   guest | host                  first, always
@@ -182,7 +183,7 @@ pub fn parse(text: &str) -> Result<Declaration, String> {
 }
 
 pub const GATE_RESOURCES: [(&str, &str); 198] = [
-	("acpi", "guest stage:x86_64:r profile:development media"),
+	("acpi", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("aml-emitter", "host"),
 	("arch-profile-aarch64-gicv2-1", "guest stage:aarch64:r profile:shipping media"),
 	("arch-profile-aarch64-gicv2-4", "guest stage:aarch64:r profile:shipping media"),
@@ -201,8 +202,8 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("arch-profile-riscv64-uefi-1", "guest stage:riscv64:r profile:shipping media"),
 	("arch-surface", "host"),
 	("artifact-metadata", "host stage:x86_64:r profile:shipping"),
-	("audio-routing", "guest stage:x86_64:r profile:development media"),
-	("balloon", "guest stage:x86_64:r profile:development media"),
+	("audio-routing", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
+	("balloon", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("bluetooth-audio", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("bluetooth-classic", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("bluetooth-codecs", "host"),
@@ -215,11 +216,11 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("boot-harness", "host"),
 	("boot-manifest", "host stage:x86_64:r profile:shipping"),
 	("boot-volume-controllers", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
-	("boot-volume-controllers-aarch64", "guest stage:aarch64:r profile:development media"),
-	("boot-volume-controllers-riscv64", "guest stage:riscv64:r profile:development media"),
+	("boot-volume-controllers-aarch64", "guest stage:aarch64:r profile:shipping media volume:aarch64:harness:r"),
+	("boot-volume-controllers-riscv64", "guest stage:riscv64:r profile:shipping media volume:riscv64:harness:r"),
 	("bootstrap-plan", "host"),
-	("brightness-acpi", "guest stage:x86_64:r profile:development media gadget"),
-	("brightness-acpi-no-dos", "guest stage:x86_64:r profile:development media gadget"),
+	("brightness-acpi", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r gadget"),
+	("brightness-acpi-no-dos", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r gadget"),
 	("brightness-usb", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r gadget"),
 	("build-order", "host stage:x86_64:w profile:shipping"),
 	("camera-usb", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
@@ -233,7 +234,7 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("dependency-policy", "host"),
 	("development-build", "host"),
 	("development-gate", "host stage:x86_64:r profile:shipping"),
-	("development-lifecycle", "guest stage:x86_64:r profile:development media"),
+	("development-lifecycle", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("dma-mode-aarch64", "guest stage:aarch64:r profile:shipping media"),
 	("dma-mode-carrier", "host"),
 	("dma-mode-ports", "guest stage:aarch64:r stage:riscv64:r profile:shipping media"),
@@ -268,7 +269,7 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("hibernate-ports", "guest stage:aarch64:r stage:riscv64:r profile:development media"),
 	("hibernate-ports-aarch64", "guest stage:aarch64:r profile:development media"),
 	("hibernate-ports-riscv64", "guest stage:riscv64:r profile:development media"),
-	("host-share", "guest stage:x86_64:r profile:development media"),
+	("host-share", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("host-tests", "host"),
 	("i2c-backend", "host"),
 	("i2c-bus", "guest stage:x86_64:r profile:shipping media"),
@@ -294,7 +295,7 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("iommu-riscv64-uefi-aia-display", "guest stage:riscv64:r profile:shipping media"),
 	("iommu-riscv64-uefi-aia-ordinary", "guest stage:riscv64:r profile:shipping media"),
 	("iommu-riscv64-uefi-aia-transition", "guest stage:riscv64:r profile:shipping media"),
-	("ipmi", "guest stage:x86_64:r profile:development media"),
+	("ipmi", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("ipmi-harness", "host"),
 	("ipv6-peer", "guest stage:x86_64:w profile:shipping media volume:x86_64:enforcing-required:w"),
 	("kernel-allocations", "host"),
@@ -302,7 +303,7 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("malformed-dynamic", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
 	("malformed-symbol-relocation", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
 	("media-import-service", "guest stage:x86_64:r profile:shipping media"),
-	("memory-hotplug", "guest stage:x86_64:r profile:development media"),
+	("memory-hotplug", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("milestone-index", "host"),
 	("model-mutations", "host"),
 	("no-fixed-provider-slots", "host"),
@@ -315,12 +316,12 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("perf-anchor", "guest stage:x86_64:r profile:shipping media volume:x86_64:enforcing-required:r"),
 	("power-service", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("power-ups", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r gadget"),
-	("processor-power", "guest stage:x86_64:r profile:development media"),
+	("processor-power", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("profile-sysroot", "host stage:x86_64:r profile:shipping"),
 	("provider-media-order", "guest stage:x86_64:r profile:shipping media"),
 	("provider-routing", "host"),
 	("qemu-2d-account", "guest stage:x86_64:r profile:development media volume:x86_64:enforcing-required:r"),
-	("qemu-2d-demo", "guest stage:x86_64:r profile:development media"),
+	("qemu-2d-demo", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("qemu-3d-demo", "guest stage:x86_64:w profile:development media"),
 	("qemu-3d-extended", "guest stage:x86_64:w profile:development media"),
 	("qemu-admin-path", "guest stage:x86_64:r profile:development media volume:x86_64:enforcing-required:r"),
@@ -332,8 +333,8 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("qemu-midi-service", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("qemu-modem-service", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("qemu-numa", "guest stage:x86_64:r stage:aarch64:r stage:riscv64:r profile:shipping media"),
-	("qemu-pcie-aer", "guest stage:x86_64:r profile:development media"),
-	("qemu-pcie-hotplug", "guest stage:x86_64:r profile:development media"),
+	("qemu-pcie-aer", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
+	("qemu-pcie-hotplug", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("qemu-tpm-tool", "guest stage:x86_64:r profile:development media volume:x86_64:enforcing-required:r"),
 	("qemu-virtio-iommu-x86_64", "guest stage:x86_64:w profile:shipping media volume:x86_64:enforcing-required:w"),
 	("rollback-floor-x86_64", "guest stage:x86_64:w profile:shipping media volume:x86_64:enforcing-required:w"),
@@ -341,9 +342,9 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("secure-boot", "guest stage:x86_64:r profile:shipping media volume:x86_64:enforcing-required:r"),
 	("serial-handoff", "guest stage:x86_64:r profile:development media volume:x86_64:enforcing-required:r"),
 	("shell-large-output", "guest stage:x86_64:r profile:development media volume:x86_64:enforcing-required:r"),
-	("signed-boot", "guest stage:x86_64:r profile:shipping media volume:x86_64:enforcing-required:r"),
+	("signed-boot", "guest stage:x86_64:r stage:aarch64:r stage:riscv64:r profile:shipping media volume:x86_64:enforcing-required:r"),
 	("single-cap-receive", "host"),
-	("sleep", "guest stage:x86_64:r profile:development media"),
+	("sleep", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("smartcard-service", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("smp-core-cap", "guest stage:x86_64:r profile:shipping media"),
 	("soft2d-performance", "host"),
@@ -360,10 +361,10 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("text-limits", "host"),
 	("tickless-idle", "guest stage:x86_64:r stage:aarch64:r stage:riscv64:r profile:development media volume:x86_64:enforcing-required:r"),
 	("trust-profile", "host"),
-	("typec-tcpci", "guest stage:x86_64:r profile:development media"),
+	("typec-tcpci", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("typec-tcpci-aarch64", "guest stage:aarch64:r profile:development media"),
 	("typec-tcpci-riscv64", "guest stage:riscv64:r profile:development media"),
-	("typec-ucsi", "guest stage:x86_64:r profile:development media"),
+	("typec-ucsi", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("ucsi-ppm", "host"),
 	("undeclared-edge", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
 	("unicode-segmentation", "host"),
@@ -379,7 +380,7 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("virtio-iommu-protocol", "host"),
 	("virtio-multiport", "guest stage:x86_64:r profile:shipping media"),
 	("volume-layout", "host stage:x86_64:r profile:shipping"),
-	("watchdog", "guest stage:x86_64:r profile:development media volume:x86_64:enforcing-required:r"),
+	("watchdog", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 ];
 
 // WHAT A STEP OF A PLAN USES, from what the step is: a gate's own declaration, or the union of its gates'; a build
@@ -439,11 +440,15 @@ pub const NOT_HELD_TO_ITS_SCRIPTS: [(&str, &str, &str); 14] = [
 	("identity-note", "staging", "mutates each target's staged image in place and restores it"),
 ];
 
-// WHAT A GATE'S SCRIPTS WERE SEEN TO CALL: a runner, which boots a guest, and a build, which writes a staging.
+// WHAT A GATE'S SCRIPTS WERE SEEN TO CALL: a runner, which boots a guest, and a build, which writes a staging; and
+// how its guests boot the bootable volume - from an image of their own, signed `harness`, or cold, from the volume
+// as it is staged.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Reach {
 	pub guest: bool,
 	pub writes_staging: bool,
+	pub development_image: bool,
+	pub cold_run: bool,
 	pub scripts: BTreeSet<String>,
 }
 
@@ -575,11 +580,32 @@ fn heredoc_word(line: &str) -> Option<String> {
 	None
 }
 
+// HOW A GUEST BOOTS THE VOLUME, by the command that boots it. A development instance (`dev.sh up`), the lab's own
+// guest (`lab.sh boot`) and a gate guest (`guest_gate_run`) boot an image built for them, signed `harness` - and that
+// build re-signs the one x86_64 bootable volume. A cold run (`lab.sh scenario-cold`, or the lab's own check that the
+// staging is current for one) boots the volume as it is staged, `enforcing-required`.
+const DEVELOPMENT_IMAGE: &str = "a development image";
+const COLD_RUN: &str = "a cold run";
+
+// Whether `line` runs `script` with `word` as its first argument: `./dev.sh up`, `"$REPO_ROOT/lab.sh" boot`.
+fn runs_with(line: &str, script: &str, word: &str) -> bool {
+	line.match_indices(script).any(|(at, _)| {
+		let rest = line[at + script.len()..].trim_start_matches(['"', '\'']);
+		rest.starts_with([' ', '\t']) && rest.trim_start().strip_prefix(word).is_some_and(|after| after.is_empty() || after.starts_with([' ', '\t', ';', '>', '|', '&', ')']))
+	})
+}
+
 // What one script calls: in shell, every script named with a path in front of it, and `guest_gate_run`; in
-// Python, every script named in a string, and the lab when it is imported.
+// Python, every script named in a string, and the lab when it is imported. And how its guests boot the volume.
 fn calls(text: &str, python: bool) -> BTreeSet<String> {
 	let mut found = BTreeSet::new();
 	for line in code_lines(text, !python) {
+		if line.contains("scenario-cold") || line.contains("staging_not_current") {
+			found.insert(String::from(COLD_RUN));
+		}
+		if !python && (runs_with(&line, "dev.sh", "up") || runs_with(&line, "lab.sh", "boot")) {
+			found.insert(String::from(DEVELOPMENT_IMAGE));
+		}
 		for (before, name, after) in script_names(&line) {
 			// A path in front of the name and a word boundary behind it, in shell; a string around it, in Python.
 			let named = if python { matches!(before, Some(b'"' | b'\'' | b'/')) && matches!(after, Some(b'"' | b'\'')) } else { before == Some(b'/') && matches!(after, None | Some(b'"' | b'\'' | b' ' | b'\t' | b';' | b')' | b'|' | b'&' | b'`')) };
@@ -612,7 +638,9 @@ pub fn reach(repo_root: &Path, command: &str) -> Reach {
 		}
 		out.guest |= RUNNERS.contains(&name.as_str()) || name == "guest_gate_run";
 		out.writes_staging |= BUILDS.contains(&name.as_str());
-		if RUNNERS.contains(&name.as_str()) || BUILDS.contains(&name.as_str()) || NOT_FOLLOWED.contains(&name.as_str()) || name == "guest_gate_run" {
+		out.development_image |= name == DEVELOPMENT_IMAGE || name == "guest_gate_run";
+		out.cold_run |= name == COLD_RUN;
+		if RUNNERS.contains(&name.as_str()) || BUILDS.contains(&name.as_str()) || NOT_FOLLOWED.contains(&name.as_str()) || name == "guest_gate_run" || name == DEVELOPMENT_IMAGE || name == COLD_RUN {
 			continue;
 		}
 		let Some(path) = script_path(repo_root, &name) else { continue };
@@ -645,8 +673,9 @@ pub fn declaration(gate: &str) -> Option<Declaration> {
 }
 
 // THE CHECK: every gate declared, every declaration well-formed, its booting and its staging writes what its
-// scripts call - and its booting what the catalog schedules it as.
-pub fn declaration_failures(repo_root: &Path, table: &[(&str, &str)], exemptions: &[(&str, &str, &str)], catalogued_guest: &dyn Fn(&str) -> bool) -> Vec<String> {
+// scripts call, the x86_64 bootable volume in the mode its boots sign it for - and its booting what the catalog
+// schedules it as, and whether it runs alone.
+pub fn declaration_failures(repo_root: &Path, table: &[(&str, &str)], exemptions: &[(&str, &str, &str)], catalogued_guest: &dyn Fn(&str) -> bool, runs_alone: &dyn Fn(&str) -> bool) -> Vec<String> {
 	let mut failures = Vec::new();
 	let gates = match gate_commands_in_check_sh(repo_root) {
 		Ok(gates) => gates,
@@ -684,6 +713,22 @@ pub fn declaration_failures(repo_root: &Path, table: &[(&str, &str)], exemptions
 				failures.push(format!("gate '{gate}' is declared to write a staging, and none of its scripts builds"));
 			} else {
 				failures.push(format!("gate '{gate}' is declared to write no staging, and its scripts build"));
+			}
+		}
+		// THE BOOTABLE VOLUME IN THE MODE ITS BOOTS SIGN IT FOR. Undeclared, the scheduler ran development instances
+		// beside cold runs, and their image builds re-signed the x86_64 volume `harness` under them: two cold-run gates
+		// were refused mid-gate in a release. A gate that writes the x86_64 staging holds the volume with it; one that
+		// boots it both ways switches it under everything beside it, so it runs alone.
+		let reads_x86 = declared.uses.iter().any(|item| item.resource == Resource::Staging(String::from("x86_64")));
+		if reads_x86 && !declared.writes_staging() && !exempt("volume") {
+			let needs: Vec<&str> = [(seen.development_image, "harness"), (seen.cold_run, "enforcing-required")].into_iter().filter_map(|(boots, mode)| boots.then_some(mode)).collect();
+			let volume = declared.uses.iter().any(|item| item.resource == Resource::Volume(String::from("x86_64")));
+			let mode = declared.volume_mode.as_deref().filter(|_| volume);
+			match needs.as_slice() {
+				[one] if mode != Some(*one) => failures.push(format!("gate '{gate}' boots the x86_64 bootable volume signed {one}, and declares {}", mode.map_or(String::from("no volume"), |mode| format!("it {mode}")))),
+				[_, _] if !runs_alone(gate) => failures.push(format!("gate '{gate}' boots the x86_64 bootable volume both signed harness and enforcing-required, which switches it under every step beside it - it runs alone")),
+				[_, _] if !mode.is_some_and(|mode| needs.contains(&mode)) => failures.push(format!("gate '{gate}' boots the x86_64 bootable volume both signed harness and enforcing-required, and declares {}", mode.map_or(String::from("no volume"), |mode| format!("it {mode}")))),
+				_ => {}
 			}
 		}
 		if declared.guest != catalogued_guest(gate) {

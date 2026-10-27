@@ -158,6 +158,24 @@ staging_current_refusal() {
 	[[ -n "$stale" ]]
 }
 
+# Print why ARCH's bootable volume cannot be booted in this run's profile paired with a medium signed for DMA mode
+# MODE - built in another profile or carrying no record of one, or signed for another mode - and succeed; print
+# nothing and fail when it can. Either is fixed by the volume's own build, which is the command handed on.
+volume_state_refusal() {
+	local build_dir="$1" arch="$2" want="$3" got
+	got="$(cat "$build_dir/state/built-$arch-volume.profile" 2>/dev/null || true)"
+	if [[ "$got" != "$(run_profile)" ]]; then
+		if [[ -n "$got" ]]; then
+			echo "REFUSED: the $arch bootable volume was built in the $got profile, and this step needs the $(run_profile) one - build it:  $(volume_build_command "$arch" "$want")"
+		else
+			echo "REFUSED: the $arch bootable volume carries no profile record, and this step needs the $(run_profile) one - build it:  $(volume_build_command "$arch" "$want")"
+		fi
+		state_refusal_fix "$(volume_build_command "$arch" "$want")"
+		return 0
+	fi
+	volume_mode_refusal "$build_dir/boot/system-volume-bootable-$arch.img" "$want" "$arch"
+}
+
 # Print why the bootable volume VOLUME cannot be paired with something that needs DMA mode MODE, and
 # succeed, when its record names another mode or there is none; print nothing and fail when it agrees.
 volume_mode_refusal() {

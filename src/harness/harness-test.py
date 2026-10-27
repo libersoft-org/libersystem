@@ -1615,7 +1615,7 @@ COMPLETION_LINES = (
 
 
 class CompletionLineTest(unittest.TestCase):
-	def drive(self, done, settle, late, delay):
+	def drive(self, done, settle, late, delay, during_boot=False):
 		directory = tempfile.mkdtemp()
 		self.addCleanup(shutil.rmtree, directory, True)
 		path = os.path.join(directory, 'console')
@@ -1633,6 +1633,9 @@ class CompletionLineTest(unittest.TestCase):
 		def guest():
 			connection, _ = server.accept()
 			connection.settimeout(30)
+			if during_boot:
+				connection.sendall(done.encode() + b'\r\n')
+				time.sleep(0.5)
 			connection.sendall(b'shell attached\r\n')
 			time.sleep(0.3)
 			connection.sendall(b'vol://system> ')
@@ -1640,9 +1643,11 @@ class CompletionLineTest(unittest.TestCase):
 			while b'\n' not in typed:
 				typed += connection.recv(64)
 			# The shell echoes what was typed, which carries no completion line of its own.
-			connection.sendall(b'probe\r\n\x1b[32m' + done.encode() + b'\x1b[0m\r\n')
+			connection.sendall(b'probe\r\n' + (b'' if during_boot else b'\x1b[32m' + done.encode() + b'\x1b[0m\r\n'))
 			time.sleep(delay)
-			connection.sendall(late.encode() + b'\r\n')
+			# A driver with no window has ended by now, and the late line meets a closed console.
+			with contextlib.suppress(OSError):
+				connection.sendall(late.encode() + b'\r\n')
 			stop.wait(120)
 			connection.close()
 
@@ -1685,12 +1690,23 @@ class CompletionLineTest(unittest.TestCase):
 				self.assertNotIn(late.encode(), missed, 'with no window the late line is missed - which is why a gate with negative checks keeps one')
 
 
+	# A LINE PRINTED WHILE THE GUEST BOOTS COUNTS: `firmware-tree`'s second acknowledged edge came before the shell
+	# took `lsdev` on both ports, and a driver that watched only what followed the last command ran to its budget.
+	def test_a_completion_line_printed_during_boot_ends_the_recording_once_the_commands_are_typed(self):
+		_, done, _, late = COMPLETION_LINES[0]
+		run, elapsed, recorded = self.drive(done, 3, late, 1, during_boot=True)
+		self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+		self.assertIn(b'# guest-console sent: probe', recorded, 'every command is still typed')
+		self.assertIn(b'the completion line came', recorded)
+		self.assertLess(elapsed, 20, 'the driver ran past its completion line toward its deadline')
+
+
 # A suite run's two logs, named as `test-kernel.sh` names them, passed or failed by its own pass line.
-def write_suite_run(logs, arch, stamp, pid, passed=True, trace=False):
+def write_suite_run(logs, arch, stamp, pid, passed=True, trace=False, whole=False):
 	stem = os.path.join(logs, 'test', f'{arch}-{stamp}-{pid}')
 	os.makedirs(os.path.dirname(stem), exist_ok=True)
 	with open(f'{stem}-guest.log', 'w') as handle:
-		handle.write(('captrace: begin\n' if trace else '') + ('test suite complete: 12 passed\n' if passed else 'test FAILED: storage::mount\n'))
+		handle.write(('running 12 tests (all tags)\n' if whole else '') + ('captrace: begin\n' if trace else '') + ('test suite complete: 12 passed\n' if passed else 'test FAILED: storage::mount\n'))
 	with open(f'{stem}-run.log', 'w') as handle:
 		handle.write('running 12 tests\n')
 	return [f'{stem}-guest.log', f'{stem}-run.log']
@@ -1758,6 +1774,16 @@ class LogsRulesTest(unittest.TestCase):
 		self.assertEqual(self.removed(), set(), 'a resumed run is kept as a failed one, its resumed boots with it')
 		self.suite('x86_64', '20261004T000000Z', 104)
 		self.assertTrue(resumed <= self.removed(), 'and goes, whole, once a later run of its target passes')
+
+	# THE PLANNER'S DURATIONS: a port's suite is split across guests by each test's measured duration in the newest
+	# whole run, which a later selection does not replace - so that run stays beside the newer one, and goes once a newer
+	# whole run of its target has ended.
+	def test_the_newest_whole_run_is_kept_beside_a_newer_selection(self):
+		whole = self.suite('aarch64', '20261001T000000Z', 101, whole=True)
+		selection = self.suite('aarch64', '20261002T000000Z', 102)
+		self.assertEqual(self.removed(), set())
+		self.suite('aarch64', '20261003T000000Z', 103, whole=True)
+		self.assertEqual(self.removed(), whole | selection)
 
 	def test_a_live_runs_logs_are_left_alone(self):
 		live = self.suite('riscv64', '20261001T000000Z', 101)

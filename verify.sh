@@ -1221,9 +1221,11 @@ run_one_step() {
 		# being answered when that step finishes on its own.
 		# THE STEP'S OWN STATUS, not a flattened 1: a refusal (`STATE_REFUSED`) is told apart from a
 		# failure by it.
-		LIBER_STATE_REFUSAL="$outfile.refusal" run_owned_shell 'eval "$command" 2>&1 | tee "$LIBER_VERIFY_RUN/logs/.step-$index.log"' || status=$?
+		# AND THE HISTORY IS THE RUNNER'S ALONE: a step that runs the verify model's own tests saved their
+		# fixture history over the tree's, through the path this run names for itself - an empty one is none.
+		LIBER_VERIFY_HISTORY="" LIBER_STATE_REFUSAL="$outfile.refusal" run_owned_shell 'eval "$command" 2>&1 | tee "$LIBER_VERIFY_RUN/logs/.step-$index.log"' || status=$?
 	else
-		LIBER_STATE_REFUSAL="$outfile.refusal" run_owned_shell 'eval "$command"' || status=$?
+		LIBER_VERIFY_HISTORY="" LIBER_STATE_REFUSAL="$outfile.refusal" run_owned_shell 'eval "$command"' || status=$?
 	fi
 	elapsed=$((SECONDS - started))
 	# The clock has whole-second resolution. Round an observed successful sub-second run up,

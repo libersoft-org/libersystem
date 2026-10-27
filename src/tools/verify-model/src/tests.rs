@@ -3279,7 +3279,7 @@ fn an_account_separates_what_runs_alone_the_lanes_and_the_exclusive_chains() {
 // were scheduled as host gates.
 #[test]
 fn every_gate_declares_what_it_uses_and_its_scripts_agree() {
-	let failures = crate::resources::declaration_failures(&repo_root(), &crate::resources::GATE_RESOURCES, &crate::resources::NOT_HELD_TO_ITS_SCRIPTS, &crate::catalog::gate_schedules_a_guest);
+	let failures = crate::resources::declaration_failures(&repo_root(), &crate::resources::GATE_RESOURCES, &crate::resources::NOT_HELD_TO_ITS_SCRIPTS, &crate::catalog::gate_schedules_a_guest, &|gate| crate::catalog::ALONE_GATES.contains(&gate));
 	assert!(failures.is_empty(), "{failures:#?}");
 }
 
@@ -3301,7 +3301,7 @@ fn resource_fixture(name: &str, gates: &[(&str, &str)]) -> std::path::PathBuf {
 #[test]
 fn a_gate_added_without_a_declaration_is_refused() {
 	let root = resource_fixture("undeclared", &[("declared", "#!/usr/bin/env bash\ntrue\n"), ("added", "#!/usr/bin/env bash\ntrue\n")]);
-	let failures = crate::resources::declaration_failures(&root, &[("declared", "host")], &[], &|_| false);
+	let failures = crate::resources::declaration_failures(&root, &[("declared", "host")], &[], &|_| false, &|_| false);
 	assert_eq!(failures, vec![String::from("gate 'added' declares no resources - say what it reads and writes, or that it is a host gate that shares nothing")]);
 	let _ = std::fs::remove_dir_all(&root);
 }
@@ -3315,7 +3315,7 @@ fn a_host_gate_whose_script_boots_a_guest_is_refused_and_a_guest_gate_with_no_ru
 			("quiet", "#!/usr/bin/env bash\necho \"run ./test.sh to see\"\n"),
 		],
 	);
-	let failures = crate::resources::declaration_failures(&root, &[("probe", "host"), ("quiet", "guest stage:x86_64:r profile:shipping media")], &[], &|gate| gate == "quiet");
+	let failures = crate::resources::declaration_failures(&root, &[("probe", "host"), ("quiet", "guest stage:x86_64:r profile:shipping media")], &[], &|gate| gate == "quiet", &|_| false);
 	assert!(failures.iter().any(|failure| failure.starts_with("gate 'probe' is declared as a host gate, and its scripts call guest_gate_run")), "{failures:#?}");
 	assert!(failures.iter().any(|failure| failure == "gate 'quiet' is declared to boot a guest, and none of its scripts calls a runner"), "{failures:#?}");
 	// A runner's own image build is no staging write: the staging is brought to the declared state before the step.
@@ -3326,9 +3326,45 @@ fn a_host_gate_whose_script_boots_a_guest_is_refused_and_a_guest_gate_with_no_ru
 #[test]
 fn a_staging_write_is_declared_in_both_directions() {
 	let root = resource_fixture("staging", &[("builder", "#!/usr/bin/env bash\n\"$repo/build.sh\" --arch x86_64\n"), ("reader", "#!/usr/bin/env bash\nls .build/image\n")]);
-	let failures = crate::resources::declaration_failures(&root, &[("builder", "host stage:x86_64:r profile:shipping"), ("reader", "host stage:x86_64:w profile:shipping")], &[], &|_| false);
+	let failures = crate::resources::declaration_failures(&root, &[("builder", "host stage:x86_64:r profile:shipping"), ("reader", "host stage:x86_64:w profile:shipping")], &[], &|_| false, &|_| false);
 	assert!(failures.contains(&String::from("gate 'builder' is declared to write no staging, and its scripts build")), "{failures:#?}");
 	assert!(failures.contains(&String::from("gate 'reader' is declared to write a staging, and none of its scripts builds")), "{failures:#?}");
+	let _ = std::fs::remove_dir_all(&root);
+}
+
+// THE BOOTABLE VOLUME IN THE MODE ITS BOOTS SIGN IT FOR. The break, watched: in a release, `watchdog`, `ipmi` and
+// `typec-ucsi` declared no volume or another mode, their development instances' image builds re-signed the x86_64
+// volume `harness` beside `qemu-ipmi-admin` and `qemu-tpm-tool`, and both were refused mid-gate.
+#[test]
+fn the_x86_64_volume_is_declared_in_the_mode_a_gates_boots_sign_it_for() {
+	let root = resource_fixture(
+		"volume",
+		&[
+			("instance", "#!/usr/bin/env bash\n./dev.sh up --timeout 300 >\"$state/up.log\" 2>&1\n"),
+			("lab", "#!/usr/bin/env bash\n\"$REPO_ROOT/lab.sh\" boot >/dev/null || die \"the guest did not boot\"\n"),
+			("cold", "#!/usr/bin/env bash\n./lab.sh scenario-cold x86_64 \"$work/case.toml\"\n"),
+			("both", "#!/usr/bin/env bash\n./lab.sh scenario-cold --serial-broker x86_64 case.toml\n./dev.sh up --timeout 300\n"),
+			("aside", "#!/usr/bin/env bash\n# ./dev.sh up in a comment boots nothing\n./dev.sh launch --timeout 60 probe\n"),
+		],
+	);
+	let declared = [
+		("instance", "guest stage:x86_64:r profile:development media"),
+		("lab", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
+		("cold", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
+		("both", "guest stage:x86_64:r profile:development media volume:x86_64:enforcing-required:r"),
+		("aside", "guest stage:x86_64:r profile:development media"),
+	];
+	let failures = crate::resources::declaration_failures(&root, &declared, &[], &|_| true, &|_| false);
+	assert_eq!(
+		failures,
+		vec![
+			String::from("gate 'both' boots the x86_64 bootable volume both signed harness and enforcing-required, which switches it under every step beside it - it runs alone"),
+			String::from("gate 'cold' boots the x86_64 bootable volume signed enforcing-required, and declares it harness"),
+			String::from("gate 'instance' boots the x86_64 bootable volume signed harness, and declares no volume"),
+		]
+	);
+	let alone = crate::resources::declaration_failures(&root, &declared, &[], &|_| true, &|gate| gate == "both");
+	assert!(!alone.iter().any(|failure| failure.contains("'both'")), "{alone:#?}");
 	let _ = std::fs::remove_dir_all(&root);
 }
 

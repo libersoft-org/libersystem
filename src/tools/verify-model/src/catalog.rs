@@ -1133,6 +1133,9 @@ pub const ALONE_GATES: &[&str] = &[
 	// multiport capture chosen is the newest on the machine.
 	"concurrent-selection",
 	"virtio-multiport",
+	// A gate that switches the x86_64 bootable volume while it runs - a cold run signed `enforcing-required`, then a
+	// development instance whose image build signs it `harness` - changes it under every step beside it.
+	"serial-handoff",
 ];
 
 // Whether this gate boots a guest of its own and therefore needs one of the runner's slots.
