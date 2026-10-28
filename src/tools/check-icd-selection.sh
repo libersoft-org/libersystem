@@ -72,7 +72,10 @@ record="$(llvm-objcopy --dump-section .note.liber.identity=/dev/stdout "$consume
 grep -q "^selection=vulkan-icd:icdprobe.lslib=[0-9a-f]\{64\}$" <<<"$record" || fail "the consumer record carries no selection slot naming the candidate by digest"
 
 # THE LAUNCH ITSELF. The guest console types the probe into the shell and reads back what it said.
-guest_gate_run icdcheck ""
+# THE COMPLETION LINE: the script's last line prints `icd-selection-done`, and every line this gate requires comes
+# before it. Its checks are all of lines that must appear, so it keeps no settle window.
+export GUEST_GATE_DONE="icd-selection-done" GUEST_GATE_SETTLE=0
+guest_gate_run $'icdcheck\necho icd-selection-done' ""
 lines="$GUEST_LINES"
 
 expect() {

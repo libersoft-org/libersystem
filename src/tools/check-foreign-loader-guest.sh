@@ -89,7 +89,11 @@ grep -q "^selection=vulkan-icd:icdprobe\.lslib=[0-9a-f]\{64\}$" <<<"$record" || 
 grep -qx "licence=Apache-2.0" <<<"$record" || fail "the consumer record does not carry the upstream licence it links"
 echo "foreign-loader-guest: the staged consumer carries the loader and binds its ICD through a slot"
 
-guest_gate_run vkprobe vkprobe
+# THE COMPLETION LINE: the script's last line prints `foreign-loader-guest-done`, after which nothing this gate needs
+# can arrive. It also refuses a refused negotiation, which a late line could carry, so it keeps a settle window of 5 s
+# after it.
+export GUEST_GATE_DONE="foreign-loader-guest-done" GUEST_GATE_SETTLE=5
+guest_gate_run $'vkprobe\necho foreign-loader-guest-done' vkprobe
 lines="$GUEST_LINES"
 
 expect() {

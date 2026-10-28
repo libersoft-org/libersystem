@@ -49,8 +49,11 @@ guest_gate_require_programs bt_fixture btclassic bluetooth_service bluetooth_bon
 export QEMU_EXTRA="-device edu,addr=0x1d"
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-210}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-360}"
+# THE COMPLETION LINE: the script's last line prints `bluetooth-audio-done`, and every line this gate requires comes
+# before it. Its checks are all of lines that must appear, so it keeps no settle window.
+export GUEST_GATE_DONE="bluetooth-audio-done" GUEST_GATE_SETTLE=0
 
-guest_gate_run $'btclassic audio\nbtclassic voice' ""
+guest_gate_run $'btclassic audio\nbtclassic voice\necho bluetooth-audio-done' ""
 lines="$GUEST_LINES"
 grep -qF "btclassic: PASS audio" "$lines" || {
 	echo "bluetooth-audio: expected \"btclassic: PASS audio\"" >&2

@@ -89,10 +89,11 @@ cat "$work/transport.log"
 export NET_NONE=1
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-300}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-480}"
-# THE VERDICT ALSO READS `monitor-sim.log`, which keeps growing for as long as QEMU runs: the guest
-# keeps its window past the console driver until this gate names the line after which nothing it
-# judges can still arrive.
-export GUEST_GATE_WINDOW=keep
+# THE COMPLETION LINE: the script's last line prints `brightness-usb-done`, after which nothing this gate judges can
+# arrive but the monitor's record of the last level set - the verdict also reads `monitor-sim.log`, which grows for as
+# long as QEMU runs - and a probe failure or a request the monitor has no control for, which a late line could carry.
+# So it keeps a settle window of 10 s after it, and the guest stops with the driver.
+export GUEST_GATE_DONE="brightness-usb-done" GUEST_GATE_SETTLE=10
 
 commands=(
 	"brightcheck wait 60"
@@ -118,6 +119,7 @@ commands=(
 	"brightcheck wait 30"
 	"brightcheck settings"
 	"brightcheck set 45"
+	"echo brightness-usb-done"
 )
 guest_gate_run "$(printf '%s\n' "${commands[@]}")" ""
 

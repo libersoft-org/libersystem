@@ -31,7 +31,10 @@ guest_gate_arch "$@"
 guest_gate_development
 guest_gate_prepare_image
 guest_gate_require_quarantine abiprobe
-guest_gate_run abiprobe abiprobe
+# THE COMPLETION LINE: the script's last line prints `foreign-facilities-guest-done`, and every line this gate requires
+# comes before it. Its checks are all of lines that must appear, so it keeps no settle window.
+export GUEST_GATE_DONE="foreign-facilities-guest-done" GUEST_GATE_SETTLE=0
+guest_gate_run $'abiprobe\necho foreign-facilities-guest-done' abiprobe
 
 expect_line() {
 	grep -qxF "abiprobe: $1" "$GUEST_LINES" || {

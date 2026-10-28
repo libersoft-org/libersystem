@@ -58,6 +58,10 @@ export QEMU_EXTRA="-device edu,addr=0x1b"
 # Several phases wait on five- and ten-second deadlines by design, and a restart follows them.
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-300}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-480}"
+# THE COMPLETION LINE: the script's last line prints `smartcard-service-done`, after which nothing this gate needs can
+# arrive. It also refuses a probe failure - a background `cardhold` among them - which a late line could carry, so it
+# keeps a settle window of 10 s after it.
+export GUEST_GATE_DONE="smartcard-service-done" GUEST_GATE_SETTLE=10
 
 expect() {
 	local lines="$1" line="$2" why="$3"
@@ -78,7 +82,7 @@ expect() {
 # THE RESTART IS THE PROBE'S, not the shell's `stop` and `start`: a replacement admits reader A only once
 # the provider has answered its session, so every launch needing a reader-A grant is refused until the old
 # exchange has drained - and the shell reports a refused launch by printing nothing.
-guest_gate_run $'cardread\ngraph\ncardcheck insert\ncardcheck pin\ncardb\ncardcheck refuse\ncardcheck isolation\ncardhold hold 4 &\ncardcheck queue\ncardhold dup | cardcheck inherit\ncardcheck expiry\ncardcheck removal\ncardcheck stuck\ncardcheck overflow\ngraph\ncardcheck prime-slow\ncardhold slow &\ncardcheck inflight\ncardcheck restart\ncardcheck session\ncardcheck republish' ""
+guest_gate_run $'cardread\ngraph\ncardcheck insert\ncardcheck pin\ncardb\ncardcheck refuse\ncardcheck isolation\ncardhold hold 4 &\ncardcheck queue\ncardhold dup | cardcheck inherit\ncardcheck expiry\ncardcheck removal\ncardcheck stuck\ncardcheck overflow\ngraph\ncardcheck prime-slow\ncardhold slow &\ncardcheck inflight\ncardcheck restart\ncardcheck session\ncardcheck republish\necho smartcard-service-done' ""
 lines="$GUEST_LINES"
 
 if grep -aq 'cardcheck: FAIL\|cardhold: FAIL\|cardread: FAIL\|cardb: FAIL' "$lines"; then

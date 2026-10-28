@@ -63,6 +63,9 @@ export QEMU_EXTRA="-device edu,addr=0x1e"
 # with three of its fifteen lines typed.
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-300}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-480}"
+# THE COMPLETION LINE: the script's last line prints `power-service-done`, after which nothing this gate needs can
+# arrive. It also refuses a probe failure, which a late line could carry, so it keeps a settle window of 10 s after it.
+export GUEST_GATE_DONE="power-service-done" GUEST_GATE_SETTLE=10
 
 expect() {
 	local lines="$1" line="$2" why="$3"
@@ -75,7 +78,7 @@ expect() {
 	echo "power-service: $line"
 }
 
-guest_gate_run $'powercheck list exact\npowerread control\npowerread publish\npowercheck control\npowercheck denied\npowercheck watch\npowercheck alarm\npowercheck coalesce\npowercheck overflow\npowercheck withhold\npowercheck indeterminate\npowercheck stalled\npowercheck adoption\npowercheck extra\npowercheck remove\nstop power_service\nstart power_service\npowercheck list' ""
+guest_gate_run $'powercheck list exact\npowerread control\npowerread publish\npowercheck control\npowercheck denied\npowercheck watch\npowercheck alarm\npowercheck coalesce\npowercheck overflow\npowercheck withhold\npowercheck indeterminate\npowercheck stalled\npowercheck adoption\npowercheck extra\npowercheck remove\nstop power_service\nstart power_service\npowercheck list\necho power-service-done' ""
 lines="$GUEST_LINES"
 
 if grep -aq 'powercheck: FAIL\|powerread: FAIL' "$lines"; then

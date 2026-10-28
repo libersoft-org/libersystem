@@ -1643,16 +1643,31 @@ class ScreenshotTest(unittest.TestCase):
 
 
 # A GATE'S COMPLETION LINE ends the recording, the settle window after it, and nothing else. The gates that name one,
-# each with the line it refuses: the driver ends within seconds of the window rather than at its deadline, and a line
-# arriving late inside the window is in the log the gate's oracle reads. Watched failing with the window taken away:
-# the same late line is then missing, so a gate that judged it would pass.
+# each with a late line its oracle judges: the driver ends within seconds of the window rather than at its deadline,
+# and a line arriving late inside the window is in the log the gate's oracle reads. Watched failing with the window
+# taken away: the same late line is then missing, so a gate that refused it would pass, and one that needed it would
+# fail. A gate whose checks are all of lines that must appear before its completion line keeps no window, and has no
+# late line to judge.
 COMPLETION_LINES = (
-	# (gate script, the completion line it names, its settle window, a line its oracle refuses)
+	# (gate script, the completion line it names, its settle window, a late line its oracle refuses or needs)
 	('check-firmware-tree.sh', 'tree-fixture: event 2: GPIO line 2 high, acknowledged', 20, 'tree-fixture: refused: injected late'),
 	('check-usb-release.sh', 'usb-release-done', 10, "thread 'main' panicked at injected late"),
 	('check-usb-legacy.sh', 'usb-legacy-done', 10, "thread 'main' panicked at injected late"),
 	('check-i2c-hid.sh', 'hidcheck: PASS malformed', 10, 'hidcheck: FAIL injected late'),
 	('check-bluetooth-le.sh', 'btclassic: PASS ctkd', 5, 'btclassic: BEGIN SC authentication downgrade'),
+	('check-brightness-usb.sh', 'brightness-usb-done', 10, 'brightcheck: FAIL injected late'),
+	('check-power-ups.sh', 'power-ups-done', 10, 'upscheck: FAIL injected late'),
+	('check-bluetooth-classic.sh', 'bluetooth-classic-done', 10, 'bt-fixture: paired keyboard type 0x08 key 0badc0de'),
+	('check-bluetooth-service.sh', 'bluetooth-service-done', 10, 'bt-fixture: paired; key 0badc0de'),
+	('check-power-service.sh', 'power-service-done', 10, 'powercheck: FAIL injected late'),
+	('check-smartcard-service.sh', 'smartcard-service-done', 10, 'cardhold: FAIL injected late'),
+	('check-bluetooth-transfer.sh', 'bluetooth-transfer-done', 20, 'network: configured via DHCP - 10.0.2.15'),
+	('check-foreign-loader-guest.sh', 'foreign-loader-guest-done', 5, 'vkprobe: foreign: icd interface: injected late - refused'),
+	('check-lifecycle.sh', 'lifecycle-done', 5, 'lifecheck: crashing'),
+	('check-bluetooth-le-audio.sh', 'bluetooth-le-audio-done', 0, None),
+	('check-bluetooth-audio.sh', 'bluetooth-audio-done', 0, None),
+	('check-foreign-facilities-guest.sh', 'foreign-facilities-guest-done', 0, None),
+	('check-icd-selection.sh', 'icd-selection-done', 0, None),
 )
 
 
@@ -1716,18 +1731,19 @@ class CompletionLineTest(unittest.TestCase):
 			# The late line half-way through the gate's window, with the window and without it.
 			results[case] = (self.drive(done, settle, late, settle / 2), self.drive(done, 0, late, settle / 2))
 
-		threads = [threading.Thread(target=one, args=(case,)) for case in COMPLETION_LINES]
+		windowed = [case for case in COMPLETION_LINES if case[3] is not None]
+		threads = [threading.Thread(target=one, args=(case,)) for case in windowed]
 		for thread in threads:
 			thread.start()
 		for thread in threads:
 			thread.join()
-		for case in COMPLETION_LINES:
+		for case in windowed:
 			name, done, settle, late = case
 			with self.subTest(gate=name):
 				(run, elapsed, recorded), (_, unwindowed, missed) = results[case]
 				self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 				self.assertLess(elapsed, settle + 20, 'the driver ran past its completion line and window toward its deadline')
-				self.assertIn(late.encode(), recorded, 'a failure line inside the window reaches the log the oracle reads')
+				self.assertIn(late.encode(), recorded, 'a line inside the window reaches the log the oracle reads')
 				self.assertLess(unwindowed, settle / 2 + 15)
 				self.assertNotIn(late.encode(), missed, 'with no window the late line is missed - which is why a gate with negative checks keeps one')
 

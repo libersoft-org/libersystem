@@ -223,10 +223,9 @@ print(s.getsockname()[1])')"
 		# for nothing - 120 to 300 s past every recording of the 23 gates that type no `poweroff`. `timeout`
 		# signals its whole process group, so the runner and its QEMU end together. QEMU's own output
 		# (`run`) is only ever copied for diagnosis. A gate whose verdict also reads a simulator's log on
-		# the host, which keeps growing until QEMU stops, keeps its window with `GUEST_GATE_WINDOW=keep`.
-		if [[ "${GUEST_GATE_WINDOW:-}" != keep ]]; then
-			kill -TERM "$guest_gate_guest" 2>/dev/null || true
-		fi
+		# the host, which keeps growing until QEMU stops, names its completion line and a settle window that
+		# covers what the simulator still records.
+		kill -TERM "$guest_gate_guest" 2>/dev/null || true
 		wait "$guest_gate_guest" 2>/dev/null || guest_status=$?
 		guest_gate_guest=""
 	fi

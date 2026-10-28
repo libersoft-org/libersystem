@@ -64,6 +64,10 @@ export QEMU_EXTRA="-device edu,addr=0x1d"
 export RUN_DISK="$guest_gate_work/system.img"
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-280}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-440}"
+# THE COMPLETION LINE: each boot's last line prints `bluetooth-classic-done`, after which nothing this gate needs can
+# arrive. It also refuses a pairing that must not happen, which a late line could carry, so it keeps a settle window of
+# 10 s after it.
+export GUEST_GATE_DONE="bluetooth-classic-done" GUEST_GATE_SETTLE=10
 
 expect() {
 	local lines="$1" line="$2" why="$3"
@@ -77,7 +81,7 @@ expect() {
 }
 
 # ---- boot one: the pairings, the policy, and a restart of the service.
-guest_gate_run $'btclassic pair\nbtclassic policy\nbtclassic serial\nbtserial\nstop bluetooth_service\nstart bluetooth_service\nbtclassic reuse' ""
+guest_gate_run $'btclassic pair\nbtclassic policy\nbtclassic serial\nbtserial\nstop bluetooth_service\nstart bluetooth_service\nbtclassic reuse\necho bluetooth-classic-done' ""
 first="$guest_gate_work/first"
 cp "$GUEST_LINES" "$first"
 if grep -aqF "vol://system is a live copy in memory" "$first" || ! grep -aqF "boot: the system volume is a paired block volume" "$first"; then
@@ -100,7 +104,7 @@ if grep -aqE 'bt-fixture: paired keyboard' "$after_restart"; then
 fi
 
 # ---- boot two: the same disk, a cold reboot, reuse, then forget.
-guest_gate_run $'btclassic reuse\nbtclassic knob\nbtclassic forget\nbtclassic stall' ""
+guest_gate_run $'btclassic reuse\nbtclassic knob\nbtclassic forget\nbtclassic stall\necho bluetooth-classic-done' ""
 second="$guest_gate_work/second"
 cp "$GUEST_LINES" "$second"
 presented="$(grep -m 1 -aoE 'bt-fixture: authenticated keyboard with a key this boot never paired, key [0-9a-f]{8}' "$second" | awk '{print $NF}')"

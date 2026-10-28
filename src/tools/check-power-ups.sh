@@ -64,12 +64,13 @@ sim=$!
 export NET_NONE=1
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-300}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-480}"
-# THE VERDICT ALSO READS `ups-sim.log`, which keeps growing for as long as QEMU runs: the guest keeps
-# its window past the console driver until this gate names the line after which nothing it judges
-# can still arrive.
-export GUEST_GATE_WINDOW=keep
+# THE COMPLETION LINE: the script's last line prints `power-ups-done`, after which nothing this gate judges can arrive
+# but what the UPS's firmware records - the verdict also reads `ups-sim.log`, which grows for as long as QEMU runs -
+# and a probe failure, which a late line could carry. It refuses a request the UPS has no control for and a second
+# turn-off or cancel, so it keeps a settle window of 10 s after it, and the guest stops with the driver.
+export GUEST_GATE_DONE="power-ups-done" GUEST_GATE_SETTLE=10
 
-guest_gate_run $'upscheck list\nupscheck control' ""
+guest_gate_run $'upscheck list\nupscheck control\necho power-ups-done' ""
 
 expect() {
 	local line="$1" why="$2"

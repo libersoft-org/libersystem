@@ -75,6 +75,10 @@ export RUN_DISK="$guest_gate_work/system.img"
 # The scenario takes longer than a probe: pairing, a watched cursor and a service restart.
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-260}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-420}"
+# THE COMPLETION LINE: each boot's last line prints `bluetooth-service-done`, after which nothing this gate needs can
+# arrive. It also refuses a pairing that must not happen, which a late line could carry, so it keeps a settle window of
+# 10 s after it.
+export GUEST_GATE_DONE="bluetooth-service-done" GUEST_GATE_SETTLE=10
 
 expect() {
 	local lines="$1" line="$2" why="$3"
@@ -115,7 +119,7 @@ EOF_MONITOR
 # ---- boot one: a read client, a pairing, a cursor, and a restart of the service.
 unrelated_pointer &
 pointer=$!
-guest_gate_run $'btread\nbtcheck pair\nbtcheck deny\nbtcheck limits\nbtcheck exhaust\nbtcheck refund\ndate\nstart bluetooth_service\nbtcheck limits\nbtcheck reuse\nbtcheck loss\nbtcheck reuse' ""
+guest_gate_run $'btread\nbtcheck pair\nbtcheck deny\nbtcheck limits\nbtcheck exhaust\nbtcheck refund\ndate\nstart bluetooth_service\nbtcheck limits\nbtcheck reuse\nbtcheck loss\nbtcheck reuse\necho bluetooth-service-done' ""
 kill "$pointer" 2>/dev/null || true
 first="$guest_gate_work/first"
 cp "$GUEST_LINES" "$first"
@@ -143,7 +147,7 @@ pairings="$(grep -acE 'bt-fixture: paired;' "$first" || true)"
 
 # ---- boot two: the same disk, a cold reboot, reuse, then forget - and then the shipping operator command
 # pairing the mouse again from a scan.
-guest_gate_run $'btcheck reuse\nbtcheck forget\nbtctl scan 3\nbtctl pair c0:ff:ee:00:00:01\nbtctl enable c0:ff:ee:00:00:01\nbtctl' ""
+guest_gate_run $'btcheck reuse\nbtcheck forget\nbtctl scan 3\nbtctl pair c0:ff:ee:00:00:01\nbtctl enable c0:ff:ee:00:00:01\nbtctl\necho bluetooth-service-done' ""
 second="$guest_gate_work/second"
 cp "$GUEST_LINES" "$second"
 # Up to the forget, and after it: `btctl` pairs again on purpose, once the bond is gone.

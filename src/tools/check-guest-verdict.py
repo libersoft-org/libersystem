@@ -1006,7 +1006,7 @@ class GuestGateStopsWithItsDriver(unittest.TestCase):
     The break, watched: the runner ran in the foreground under `GUEST_GATE_TIMEOUT`, so a guest nobody
     recorded any more ran on to the deadline - here a minute, in the gates 120 to 300 s."""
 
-    def exercise(self, window=None, timeout="60"):
+    def exercise(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "src/tools").mkdir(parents=True)
@@ -1034,10 +1034,7 @@ for _ in range(100):
 pathlib.Path(args[args.index('--log')+1]).write_text('fixture: PASS\\n')
 time.sleep(1)
 ''')
-            env = dict(os.environ, FIXTURE_ROOT=str(root), LIBER_DEVELOPMENT="1", GUEST_GATE_SECONDS="5", GUEST_GATE_TIMEOUT=timeout)
-            env.pop("GUEST_GATE_WINDOW", None)
-            if window:
-                env["GUEST_GATE_WINDOW"] = window
+            env = dict(os.environ, FIXTURE_ROOT=str(root), LIBER_DEVELOPMENT="1", GUEST_GATE_SECONDS="5", GUEST_GATE_TIMEOUT="60")
             script = r'''
 set -euo pipefail
 root="$1/src"
@@ -1066,13 +1063,6 @@ cat "$GUEST_LINES"
         self.assertLess(elapsed, 30, "the guest ran on to GUEST_GATE_TIMEOUT after its driver had stopped")
         self.assertEqual(alive, [], "the runner or its QEMU outlived the gate")
 
-    # A gate whose verdict reads a simulator's log keeps its window: the guest runs to its deadline.
-    def test_a_kept_window_runs_the_guest_to_its_deadline(self):
-        result, elapsed, alive = self.exercise(window="keep", timeout="6")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertGreaterEqual(elapsed, 5, "a kept window was cut short at the driver's end")
-        self.assertEqual(alive, [])
-
     # A RUNNER THAT REFUSES ENDS THE GATE WITH ITS REFUSAL, at once. The break, watched in a release on both ports:
     # `qemu-run.sh` refused the staging's profile in a second, the driver waited its whole budget for a socket that
     # was never made, and the gate failed "the guest produced no console output" - a failure, not a refusal the
@@ -1095,7 +1085,6 @@ while time.monotonic()<deadline and not socket.exists():
     time.sleep(0.1)
 ''')
             env = dict(os.environ, LIBER_DEVELOPMENT="1", GUEST_GATE_SECONDS="60", GUEST_GATE_TIMEOUT="90")
-            env.pop("GUEST_GATE_WINDOW", None)
             script = r'''
 set -euo pipefail
 root="$1/src"

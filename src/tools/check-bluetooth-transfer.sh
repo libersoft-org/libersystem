@@ -52,6 +52,10 @@ guest_gate_require_programs bt_fixture btclassic btctl bluetooth_service bluetoo
 export QEMU_EXTRA="-device edu,addr=0x1d"
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-260}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-400}"
+# THE COMPLETION LINE: the script's last line prints `bluetooth-transfer-done`. One line this gate needs can still
+# follow it - NetworkService going back to its NIC once the PAN link has departed, through a DHCP exchange of its own -
+# so it keeps a settle window of 20 s after it.
+export GUEST_GATE_DONE="bluetooth-transfer-done" GUEST_GATE_SETTLE=20
 
 phone="00:1b:dc:20:00:02"
 serial="00:1b:dc:20:00:05"
@@ -72,7 +76,8 @@ btctl disconnect $phone pan
 btctl connect $phone pan replace
 btclassic tether up
 ping -c 3 192.168.44.1
-btctl disconnect $phone pan" ""
+btctl disconnect $phone pan
+echo bluetooth-transfer-done" ""
 lines="$GUEST_LINES"
 
 expect() {

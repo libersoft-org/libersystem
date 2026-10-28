@@ -52,9 +52,13 @@ done
 
 # THREE RUNS IN ONE BOOT: a normal exit, the same program crashing, and a normal exit again. The
 # difference between the first and the second is what a lifecycle contract says.
+# THE COMPLETION LINE: the script's last line prints `lifecycle-done`, after which nothing this gate needs can arrive.
+# It counts crashes, exits and destructors, which a late line could change, so it keeps a settle window of 5 s after it.
+export GUEST_GATE_DONE="lifecycle-done" GUEST_GATE_SETTLE=5
 guest_gate_run 'lifecheck
 lifecheck crash
-lifecheck' lifecheck
+lifecheck
+echo lifecycle-done' lifecheck
 lines="$GUEST_LINES"
 
 expect() {
