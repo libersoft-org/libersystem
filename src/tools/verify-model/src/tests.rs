@@ -2265,6 +2265,25 @@ fn five_different_changes_are_five_pieces_of_evidence_even_when_the_decision_is_
 	assert_eq!(distinct, 5, "five different changes producing one decision must count as five pieces of evidence, or a frozen-subsystem candidate can never reach the threshold it is graded against");
 }
 
+// AND IN A PLAN FOR A CHANGE: a change that selects everything boots every target and runs the planner's own tests,
+// which read the test kernels those suites compile.
+#[test]
+fn a_check_that_reads_the_test_kernels_waits_for_the_suites_of_its_plan() {
+	let model = model();
+	let plan = plan_for(&model, &["src/harness/test-kernel.sh"]);
+	let per_target: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+	let steps = crate::commands::steps(&plan, &per_target, &model.registry);
+	let suites: Vec<&String> = steps.iter().filter(|step| step.id.starts_with("guest:")).map(|step| &step.id).collect();
+	assert!(!suites.is_empty(), "a harness change boots the targets, or this fixture proves nothing");
+	let readers: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.keys.iter().any(|key| crate::catalog::CHECKS_THAT_READ_THE_TEST_KERNELS.contains(&key.check.as_str()))).collect();
+	assert!(!readers.is_empty(), "a harness change selects the planner's own tests, or this fixture proves nothing");
+	for step in readers {
+		for suite in &suites {
+			assert!(step.requires.contains(suite), "{} waits for {suite}: {:?}", step.id, step.requires);
+		}
+	}
+}
+
 #[test]
 fn every_separately_runnable_check_is_its_own_step() {
 	// M4 ASKS FOR EVERY SEPARATELY SCHEDULABLE UNIT TO BE SEPARATELY TIMED, and the batches were
@@ -2952,6 +2971,24 @@ fn the_dearest_guest_step_starts_first_and_one_state_is_one_group() {
 	assert_eq!(ordered.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(), vec!["guest:late", "guest:needs"]);
 }
 
+// A STEP THAT RUNS ALONE COMES LAST IN ITS GROUP. The runner keeps everything after it from starting until it can run
+// alone, so one ordered among the host steps held every guest step back while the host lane worked: in the L2 and the
+// first L3 the four guest slots stood idle for about 80 minutes behind `soft2d-performance`.
+#[test]
+fn a_step_that_runs_alone_comes_after_the_guest_steps_of_its_group() {
+	let steps = vec![
+		step_for_test("build:x86_64:volume", &[]),
+		crate::commands::Step { exclusive_guests: true, ..step_for_test("gate:host:alone", &["build:x86_64:volume"]) },
+		step_for_test("host:suite", &["build:x86_64:volume"]),
+		crate::commands::Step { guests: 1, ..step_for_test("guest:x86_64:all", &["build:x86_64:volume"]) },
+		crate::commands::Step { guests: 1, exclusive_guests: true, ..step_for_test("gate-guest:host:alone-guest", &["build:x86_64:volume"]) },
+		crate::commands::Step { guests: 1, ..step_for_test("guest:dev", &[]) },
+	];
+	let order = crate::commands::order_for_slots(steps, |_| Some(10.0), |step| if step.id == "guest:dev" { 4 } else { 0 }).unwrap();
+	let ids: Vec<&str> = order.iter().map(|step| step.id.as_str()).collect();
+	assert_eq!(ids, vec!["build:x86_64:volume", "host:suite", "guest:x86_64:all", "gate-guest:host:alone-guest", "gate:host:alone", "guest:dev"], "the steps that run alone after the guest steps of the shipping group, and the development group after them");
+}
+
 // WHAT A PLAN'S STEPS USE, derived from what each is, and the tokens the runner compares.
 #[test]
 fn a_steps_declaration_follows_from_what_it_is() {
@@ -3160,6 +3197,15 @@ fn the_release_plan_discharges_every_required_key_once_with_producers_before_con
 	for architecture in crate::registry::ARCHITECTURES {
 		assert!(after_guest.requires.contains(&format!("guest:{architecture}:all")), "{:?}", after_guest.requires);
 		assert!(position(&format!("guest:{architecture}:all")) > position(&format!("build:{architecture}:volume")));
+	}
+	// The checks that read the built test kernels after every suite, which compiles them: in the first sealed release,
+	// built from nothing, they ran before any suite and found none.
+	for check in crate::catalog::CHECKS_THAT_READ_THE_TEST_KERNELS {
+		let step = steps.iter().find(|step| step.keys.iter().any(|key| key.check == check)).unwrap_or_else(|| panic!("no step for {check}"));
+		for architecture in crate::registry::ARCHITECTURES {
+			assert!(step.requires.contains(&format!("guest:{architecture}:all")), "{check} waits for the {architecture} suite: {:?}", step.requires);
+			assert!(position(&step.id) > position(&format!("guest:{architecture}:all")));
+		}
 	}
 	let lifecycle = steps.iter().find(|step| step.id == "dev:lifecycle").expect("the lifecycle step");
 	assert_eq!(lifecycle.keys.len(), 5, "the lifecycle carries its own key and the four development checks: {:?}", lifecycle.keys);

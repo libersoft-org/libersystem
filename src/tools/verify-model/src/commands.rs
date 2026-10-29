@@ -136,8 +136,11 @@ pub fn order_by_cost(mut pending: Vec<Step>, cost: impl Fn(&Step) -> f64) -> Res
 // profile's, and within each the bootable volume's modes (`rank`, from `Declaration::state_rank`) - so the runner
 // switches each state once. Within that the builds come first, in their order; then the host steps, which run on a lane
 // of their own beside the guests: the host suites first and the cheap before the dear, so their failures come in the
-// first minutes, and a host step never measured after the measured ones; and the guest steps dearest first, so a long
-// one is never the last to start. A step never comes before what it requires.
+// first minutes, and a host step never measured after the measured ones; then the guest steps dearest first, so a long
+// one is never the last to start; and last the steps that run alone. The runner keeps everything after a step that runs
+// alone from starting until it can (`dispatch`), so one placed among the host steps held every guest step back while the
+// host lane worked through what came before it - four idle slots for 80 minutes of the L2 and of the first L3. A step
+// never comes before what it requires.
 //
 // `cost` is a step's price, `None` when it has none.
 pub fn order_for_slots(mut pending: Vec<Step>, cost: impl Fn(&Step) -> Option<f64>, rank: impl Fn(&Step) -> usize) -> Result<Vec<Step>, Vec<String>> {
@@ -145,6 +148,8 @@ pub fn order_for_slots(mut pending: Vec<Step>, cost: impl Fn(&Step) -> Option<f6
 	let key = |step: &Step| {
 		let class = if step.id.starts_with("build:") {
 			0u8
+		} else if step.exclusive_guests {
+			3
 		} else if step.guests == 0 {
 			1
 		} else {
@@ -473,13 +478,19 @@ pub fn release_steps(catalog: &crate::catalog::Catalog, registry: &crate::regist
 				step.requires.extend(check.prerequisites.iter().filter_map(|id| producer_ids.get(id).cloned()));
 			}
 		}
-		if step.id.starts_with("gate-after-guest") {
+		if step.id.starts_with("gate-after-guest") || reads_the_test_kernels(step) {
 			step.requires.extend(suite_ids.iter().cloned());
 		}
 		step.requires.sort();
 		step.requires.dedup();
 	}
 	steps
+}
+
+// A step that carries a check reading the built test kernels (`catalog::CHECKS_THAT_READ_THE_TEST_KERNELS`): it waits for
+// every kernel suite of its plan, which compiles them.
+fn reads_the_test_kernels(step: &Step) -> bool {
+	step.keys.iter().any(|key| crate::catalog::CHECKS_THAT_READ_THE_TEST_KERNELS.contains(&key.check.as_str()))
 }
 
 pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target: &BTreeMap<String, usize>, registry: &crate::registry::Registry) -> Vec<Step> {
@@ -652,9 +663,15 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 
 	// Profile and development gates boot through scripts too. Their slot declarations must not
 	// let them run before the selected artifacts exist merely because their command is check.sh.
+	let suite_ids: Vec<String> = steps.iter().filter(|step| step.id.starts_with("guest:")).map(|step| step.id.clone()).collect();
 	for step in &mut steps {
 		if step.guests > 0 && !step.id.starts_with("guest:") {
 			step.requires.extend(build_ids.values().cloned());
+			step.requires.sort();
+			step.requires.dedup();
+		}
+		if reads_the_test_kernels(step) {
+			step.requires.extend(suite_ids.iter().cloned());
 			step.requires.sort();
 			step.requires.dedup();
 		}

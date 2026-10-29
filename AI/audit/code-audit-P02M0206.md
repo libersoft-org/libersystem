@@ -1274,3 +1274,67 @@ The end-of-job runs (2026-10-26/27/28)
   - So A3's L3 figure is NOT measured by this run: the build from nothing did not complete, and the size and time
     above are of a partial build. A3 stays `[ ]`. Classes 2-4 are older than this milestone, and each one fails every
     sealed release on this host whatever the code does; class 1 is the host. Asked the owner how to go on.
+  THE OWNER'S DECISIONS (2026-10-29), asked after the first L3: "Opravit tady, L3 znovu" - fix classes 2 to 5 here,
+  then commit and run L3 again; and, asked once two more were found while fixing them, "Opravit oba" - fix 6 and 7.
+  No retry of a build step that dies on a signal (class 1, the host's rustc) was asked for or added.
+  THE FIXES (2026-10-29):
+  - Class 2, the socket path. `verify.sh` `release_prepare`: the snapshot is `.build/release/<first 12 digits of the
+    revision>`. The tree-relative UNIX sockets a release's steps make are at most 50 bytes past the root (the longest,
+    `.build/boot/dev-channel-riscv64-test.PID.sock` with a 7-digit pid); a socket path has 107 bytes. Here the longest
+    is 102 bytes (it was 130). Only `verify.sh` names the snapshot's directory (`check-verify-evidence.sh` makes its own
+    `fixture-$$`).
+  - Class 3, the prepared third-party inputs. `verify.sh` `release_seed_prepared`, called once the snapshot exists:
+    every `cache` path `toolchain.lock` names (the TLA+ jar and the 21 UCD files) is copied from the tree when it is
+    there, and `.build/bluetooth-oracles` - the pinned codec archives and the radio peers' venv, which only the network
+    installs - is copied whole. The gates still check each against its pin; the release fetches nothing.
+    Exercised on a scratch snapshot (`/root/p0206-l3/seedtest`, removed): the function copied the jar, 21 UCD files and
+    the oracle tree; `./bootstrap.sh --verify` there passed for all 22 lock entries; the three archives matched
+    `bluetooth-oracles-sources.json`; the copied venv's python imported `bumble` from the copy.
+  - Class 4, `targeted-cache` in a sealed tree. `src/tools/check-shared-cache.sh` targeted mode: when `src/abi/src/
+    lib.rs` has no owner write bit (the seal), it is unsealed (`release-snapshot.sh unseal`) for the append and its
+    restoration and resealed after, as `perf-gate.py` does with its probe. Exercised on a sealed scratch tree under
+    `.build/tmp` (`release-snapshot.sh seal`, immutable attribute applied): the plain append was refused ("Operation not
+    permitted", the L3's failure); the gate's lines detected the seal, appended, restored the bytes (`cmp`) and resealed
+    (`lsattr` `i`; a second append refused again).
+  - Class 5, the size. `verify.sh` `release_finish` records `.build/state/release-build-size` only for a sealed run in
+    which no step was blocked or skipped, and otherwise says why it does not. The 25.6 GB the first L3 recorded was
+    removed from `.build/state` (no other file read it), so the next L3 starts "with the room there is", as the first.
+  - Class 6, found while fixing the others: `host.verify-model`, `gate.verify-model-tests` and `gate.host-tests` run the
+    planner's own tests, which plan real changes over the real tree; the model enumerates a target's tests from its
+    newest built test kernel (`kerneltests.rs` `test_binaries`, `.build/cargo/kernel/<triple>/debug/deps`), which only a
+    kernel suite compiles, and with none every plan is FULL and 13 of them fail. In the tree one was always there; a
+    sealed release had none when they ran. `catalog.rs` `CHECKS_THAT_READ_THE_TEST_KERNELS` names the three, and
+    `commands.rs` (`release_steps` and `steps_for_items`, through `reads_the_test_kernels`) makes each step carrying one
+    require every kernel suite of its plan - as `capability-trace` already waits - so they run after the suites have
+    compiled. A split suite's parts inherit the requirement (`split_suites`).
+  - Class 7, found in the first L3's and the L2's timings: the aarch64 suite started 79 minutes into the L2 (12:54:30Z,
+    its guest log 14:13:27Z) and 111 minutes into the L3 (00:27Z, 02:18Z), its builds long done. `order_for_slots` put
+    the steps that run alone among the host steps (`soft2d-performance`, step 221 of the release plan, before every
+    guest step), and the runner keeps everything after such a step from starting until it can run alone (`dispatch`,
+    `reserve_all`) - so the four guest slots stood idle while the host lane worked through the 200 host steps before
+    it. Now a step that runs alone is the last class of its state group (after the guest steps), so the drain it needs
+    comes once, at the group's end.
+  - Tests, each watched failing: `a_step_that_runs_alone_comes_after_the_guest_steps_of_its_group` (new);
+    `a_check_that_reads_the_test_kernels_waits_for_the_suites_of_its_plan` (new, the real planner over a harness change
+    that boots every target); and `the_release_plan_discharges_every_required_key_once_with_producers_before_consumers`
+    (extended: the three wait for every whole suite and come after them). With both fixes undone in place (the class-3
+    branch removed, `reads_the_test_kernels` returning false) all three failed - "the steps that run alone after the
+    guest steps ...", "host:verify-model:default waits for guest:aarch64:all: []", "host.verify-model waits for the
+    x86_64 suite: []" - and `commands.rs` was restored from a copy (`cmp`). With the fixes: the four ordering and plan
+    tests pass, and the whole host suite `cargo test --manifest-path src/tools/verify-model/Cargo.toml`: 173 passed
+    (one rustc SIGSEGV on the first compile, retried).
+  - `shfmt -d verify.sh src/tools/check-shared-cache.sh` clean; `cargo fmt --check` for verify-model clean; shellcheck
+    is not installed here.
+  - Gates after these changes: `./check.sh --gate verify-scheduler,targeted-cache,verify-model` RESULT ok (1,370 s):
+    "failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE, seeded costs and the summed guest-slot
+    bound all hold", "shared-cache-check: targeted passed" (in place, the unsealed branch; `src/abi/src/lib.rs`
+    restored), and the verify-model gate.
+  - The owner committed the verify.sh, check-shared-cache.sh and record changes meanwhile (b7bcff48); the planner's
+    changes (`catalog.rs`, `commands.rs`, `tests.rs`) and the plan, TODO and this record's newest part are in the tree.
+  THE PLAN AND TODO: the status line, A3's L3 bullet (the first L3, what it found, each fix) and an OPEN bullet with the
+  owner's answers of 2026-10-29; TODO's line names the second L3, after the owner's commit, as what measures the figure.
+  NOT PERFORMED: the second L3, which builds a committed revision and so waits for the owner's commit of the planner's
+  changes; any run of the sealed path itself before it (the socket length and the seeding were checked by length and on
+  a scratch tree; the gates that need them run in the L3).
+  STATE (2026-10-29): every item implemented; every item verified but A3's L3 figure; P02M0206 IN PROGRESS until the
+  second L3 has measured it.

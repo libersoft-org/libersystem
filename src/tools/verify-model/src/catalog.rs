@@ -241,6 +241,13 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
+// THE CHECKS THAT READ THE BUILT TEST KERNELS. The planner's own tests plan real changes over the real tree, and the
+// model enumerates a target's tests from the newest test kernel built for it (`kerneltests.rs`), which only a kernel
+// suite compiles; with none, every plan is FULL and those tests fail. The tree always had one from an earlier run, and
+// a sealed release built from nothing had none: all three failed in the first one. So each waits for every kernel suite
+// of its plan (`commands.rs`).
+pub const CHECKS_THAT_READ_THE_TEST_KERNELS: [&str; 3] = ["host.verify-model", "gate.verify-model-tests", "gate.host-tests"];
+
 const GATES: [(&str, &str); 197] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
