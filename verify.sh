@@ -432,6 +432,22 @@ release_cleanup() {
 		(cd "$release_main_root" && src/tools/release-snapshot.sh remove "$release_snapshot")
 	fi
 }
+# THE PREPARED THIRD-PARTY INPUTS come from this tree. A person prepares them once - `bootstrap.sh` fetches the caches
+# `toolchain.lock` pins, and `prepare-bluetooth-oracles.py` the pinned codec archives and the radio peers' environment,
+# which only the network can install - and the gates read them offline, against their pins. A snapshot's `.build`
+# starts empty and a release fetches nothing, so every gate that reads them failed in a sealed release.
+release_seed_prepared() {
+	local cache
+	while read -r cache; do
+		[[ -f "$release_main_root/$cache" ]] || continue
+		mkdir -p "$release_snapshot/${cache%/*}"
+		cp -p "$release_main_root/$cache" "$release_snapshot/$cache"
+	done < <(sed -n 's/^cache[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$release_snapshot/toolchain.lock")
+	if [[ -d "$release_main_root/.build/bluetooth-oracles" ]]; then
+		mkdir -p "$release_snapshot/.build"
+		cp -a "$release_main_root/.build/bluetooth-oracles" "$release_snapshot/.build/"
+	fi
+}
 release_prepare() {
 	local revision out_root="${release_out_root:-$release_main_root/.build/runs}"
 	[[ "$out_root" == /* ]] || out_root="$PWD/$out_root"
@@ -442,13 +458,17 @@ release_prepare() {
 	else
 		[[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "the working tree is dirty; a release is cut from a revision, not from a desk (--in-place rehearses the release path over this tree and never produces a release)"
 		revision="$(git rev-parse HEAD)"
-		release_snapshot="$BUILD_DIR/release/$revision"
+		# NAMED BY A SHORT REVISION: the guests' UNIX sockets live under the snapshot's `.build` (the longest,
+		# `.build/boot/dev-channel-riscv64-test.PID.sock`, is 50 bytes past the root), and a socket path has 107 bytes.
+		# Under the full 40-digit revision every port's guest failed to start in a sealed release.
+		release_snapshot="$BUILD_DIR/release/${revision:0:12}"
 		[[ "$out_root" != "$release_snapshot"* ]] || die "--out-root must be OUTSIDE the snapshot, which is removed when the run ends"
 		note "release snapshot: $revision at $release_snapshot"
 		src/tools/release-snapshot.sh create "$release_snapshot" "$revision" >/dev/null || die "could not create the snapshot"
 		# REGISTERED THE MOMENT THE SNAPSHOT EXISTS, so a failure between here and the rest of the
 		# release setup still removes it.
 		register_run_cleanup release_cleanup
+		release_seed_prepared
 	fi
 	if [[ -n "$release_required_file" ]]; then
 		[[ "$release_required_file" == /* ]] || release_required_file="$PWD/$release_required_file"
@@ -499,10 +519,16 @@ release_finish() {
 	# or incomplete run keeps its evidence with its state rather than losing it with the snapshot.
 	chmod -R a-w "$release_run_dir" 2>/dev/null || true
 	note "release: dossier $release_run_dir/dossier.md (state: ${state:-not rendered})"
-	# A SEALED BUILD'S SIZE, for the next L3's check: the snapshot's `.build`, built from nothing by this run.
+	# A SEALED BUILD'S SIZE, for the next L3's check: the snapshot's `.build`, built from nothing by this run - and
+	# only when every step ran. A failed build blocks what reads it, and the first L3 recorded 25.6 GB from a build
+	# that never built two of its three targets, less than the room a whole one needs.
 	if [[ "$release_snapshot" != "$release_main_root" && -d "$release_snapshot/.build" ]]; then
-		du -sb "$release_snapshot/.build" | cut -f1 >"$release_main_root/.build/state/release-build-size"
-		note "release: the sealed build from nothing took $(<"$release_main_root/.build/state/release-build-size") bytes"
+		if ((${#blocked[@]} > 0 || ${#skipped[@]} > 0)); then
+			note "release: the sealed build's size is not recorded - ${#blocked[@]} step(s) were blocked and ${#skipped[@]} skipped, so it did not build everything"
+		else
+			du -sb "$release_snapshot/.build" | cut -f1 >"$release_main_root/.build/state/release-build-size"
+			note "release: the sealed build from nothing took $(<"$release_main_root/.build/state/release-build-size") bytes"
+		fi
 	fi
 	if ((failures > 0 || status != 0)); then
 		die "the release run is NOT complete: $failures failed step(s); dossier state: ${state:-not rendered}"

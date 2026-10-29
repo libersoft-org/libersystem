@@ -212,11 +212,17 @@ targeted)
 		echo "shared-cache-check: $source is not there - this mode needs a crate the artifact depends on and does not contain" >&2
 		exit 1
 	}
+	# A RELEASE SNAPSHOT IS READ-ONLY, and this edit is declared and undone here: the file is made writable for that
+	# span and sealed again, as the performance gate does with its probe. Sealed, the append was refused.
+	sealed=0
+	(($(stat -c '0%a' "$source") & 0200)) || sealed=1
+	((sealed == 0)) || "$root/tools/release-snapshot.sh" unseal "$source"
 	backup="$(mktemp)"
 	cp "$source" "$backup"
 	printf '\n// shared-cache-check-%s\n' "$$" >>"$source"
 	decision="$(targeted_decision "$artifact")"
 	cp "$backup" "$source"
+	((sealed == 0)) || "$root/tools/release-snapshot.sh" reseal "$source"
 	if [[ "$decision" != "miss" ]]; then
 		echo "shared-cache-check: $artifact hit its targeted state after a dependency changed - the closure is not in it" >&2
 		exit 1

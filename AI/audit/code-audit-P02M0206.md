@@ -1238,3 +1238,39 @@ The end-of-job runs (2026-10-26/27/28)
   estimated in place of being measured. Plan status line updated with this; `./check.sh --gate source-hygiene,
   milestone-index` to follow the edit.
   That gate run: RESULT ok (102 s).
+  THE FIRST L3 (2026-10-29 00:27 - 03:18Z). The owner chose "commit, then run L3" and committed the tree (dedaee14).
+  `./verify.sh --level L3`, started with `setsid` from `/root/p0206-l3/run.sh`, with a watcher that would stop it below
+  10 GiB free (it never acted: the lowest free was 80.8 GB):
+  - "L3: no sealed build has been measured yet - this one starts with the room there is and records its size"; the
+    snapshot at `.build/release/dedaee14...`; "estimate: 374 step(s), 70190 s of priced steps ... no schedule over 4
+    slot(s) finishes in under 19768 s (5.5 h)".
+  - RESULT failed exit=1 in 10,305 s: "measured: 10215 s wall clock over 4 guest slot(s); the steps took 7031 s";
+    245 steps ran, 224 passed, 21 failed, 129 BLOCKED; dossier `incomplete` (378 required keys, 154 refusals);
+    "the sealed build from nothing took 25625459459 bytes".
+  - WHY, step by step (from `/root/p0206-l3/l3.out` and the run's `logs/`):
+    1. rustc died on SIGSEGV twice, the host's known intermittent crash: `build riscv64 libs` (`lsmem`, after 839 s)
+       and `build x86_64 kernel` (`core`, after 1 s). Everything after them on those targets was BLOCKED: riscv64
+       user..volume, x86_64 loader..volume, the images, both suites and every gate that boots a guest or reads all
+       three targets. Failed as a consequence: `driver-protocol-note` ("no staged ... for: riscv64"), `build-order`
+       (no bootable x86_64 volume), `dynamic-report` (no riscv64 `lsmem` reference), the six image-injection gates
+       (`identity-note`, `static-image`, `undeclared-edge`, `duplicate-edge`, `malformed-symbol-relocation`,
+       `malformed-dynamic`: "riscv64 baseline packaging failed"), `boot-harness` (4 scenarios name build output
+       that was not built), and the verify-model host suite with `verify-model-tests` and `host-tests` (13 and 11
+       tests: "no x86_64 kernel test binary has been built").
+    2. `kernel suite aarch64 (whole)`, whose builds passed, failed at QEMU's start: "UNIX socket path ... Path must
+       be less than 108 bytes". The test run's channel socket is `$QEMU_BUILD_DIR/dev-channel-aarch64-test.$$.sock`
+       (`qemu-run.sh:3008`, as old as 2026-08-24), and under the snapshot (`.build/release/<40-hex revision>`, as
+       old as 2026-09-10) that path is 130 bytes, against 74 in the tree. So no guest step can boot in a sealed
+       release here; the L2s ran in place and never met it.
+    3. The snapshot's `.build` starts empty, so the bootstrap's pinned third-party inputs are not there:
+       `unicode-segmentation` ("ucd_* is NOT cached - run ./bootstrap.sh"), `model-mutations` and
+       `capability-model` (".build/tools/tla2tools.jar is not here"), `bluetooth-codecs` ("aosp-sbc: run
+       prepare-bluetooth-oracles.py --only codecs once"). The release plan has no step that provides them.
+    4. `targeted-cache` writes into a source file, which the seal refuses: "src/abi/src/lib.rs: Operation not
+       permitted" (`tools/check-shared-cache.sh:217`).
+    5. This milestone's own: `release_finish` (`verify.sh`) records the snapshot's `.build` size for the next L3's
+       room check whatever the outcome, so `.build/state/release-build-size` now holds 25.6 GB from a build that
+       never built two of three targets - less than a whole one needs.
+  - So A3's L3 figure is NOT measured by this run: the build from nothing did not complete, and the size and time
+    above are of a partial build. A3 stays `[ ]`. Classes 2-4 are older than this milestone, and each one fails every
+    sealed release on this host whatever the code does; class 1 is the host. Asked the owner how to go on.
