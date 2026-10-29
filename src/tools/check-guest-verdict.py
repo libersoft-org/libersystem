@@ -189,7 +189,8 @@ note() { printf '%s\n' "$*" >&2; }
     # EVERY PRIVATE FILE THE RUNNER HANDS A GUEST, by the name `qemu-run.sh` gives it. The break, watched: the
     # scratch disks, the NVDIMM backing files, the second serial port's capture, the legacy controllers' USB stick
     # and the suite's audio capture were not on the guard's list, so a run holding only its own failed as though
-    # another run held this tree's images.
+    # another run held this tree's images. And a resumed boot's logs, named after the run whose test failed: one
+    # part's resumed boot had every later part of its target refused.
     PRIVATE_SCRATCH = (
         "boot/uas-scratch.{owner}.img",
         "boot/nvme-scratch.{owner}.img",
@@ -204,6 +205,9 @@ note() { printf '%s\n' "$*" >&2; }
         "boot/virtio-serialport-test.{owner}.out",
         "boot/usb-media-x86_64.{key}.legacy.{owner}.img",
         "logs/test/x86_64-20261020T120000Z-{owner}-usb-audio.pcap",
+        "logs/test/aarch64-20261028T111704Z-{owner}-restart1-run.log",
+        "logs/test/riscv64-20261028T112152Z-{owner}-restart1-guest.log",
+        "logs/test/x86_64-20261028T120000Z-{owner}-restart2-usb-audio.pcap",
     )
 
     def test_every_private_scratch_file_is_admitted_with_its_owner(self):

@@ -428,6 +428,25 @@ impl Service {
 		}
 	}
 
+	// AN ANSWER THAT HAS ARRIVED IS NOT LATE. The loop serves one ready handle a pass and then judges the deadlines, so
+	// a service that had not run for longer than an answer's time found a printer's attach answer waiting behind
+	// another handle and declared the printer unavailable. Every printer with a request outstanding is read first,
+	// without waiting.
+	fn take_answers(&mut self, buf: &mut [u8]) {
+		// A fixed array, as `pump` keeps its lost printers: no `Vec<u32>` growth routine to import.
+		let mut asked = [0u32; jobs::MAX_PRINTERS];
+		let mut count = 0;
+		for printer in self.printers.iter().filter(|printer| printer.asked.is_some()) {
+			asked[count] = printer.key;
+			count += 1;
+		}
+		for &key in &asked[..count] {
+			if let Err(why) = self.on_answer(key, buf) {
+				self.lose(key, why);
+			}
+		}
+	}
+
 	// Deadlines: the jobs' own, a write that has gone unanswered as long as a job may go without progress, an
 	// attach or a reset past its answer time, and the reads that follow `again`.
 	fn tick(&mut self) {
@@ -579,6 +598,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if ready >= 0 {
 			serve(&mut service, waitset[ready as usize], &mut serve_root, subscription, &mut subscribed, &mut buf, &mut reply_buf);
 		}
+		service.take_answers(&mut buf);
 		service.tick();
 		service.pump();
 		service.prune();

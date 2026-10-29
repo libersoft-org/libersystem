@@ -236,13 +236,16 @@ require_no_stray_qemu() {
 			# serial port's capture, the legacy controllers' second USB stick and the suite's USB audio
 			# capture were not on this list, so six profile rows failed in one second on "already holds
 			# this tree's disk images" for a run that held only its own.
+			# AND THE LOGS OF A RESUMED BOOT, named after the run that failed (`-restartN`, whose pid is
+			# that run's and an ancestor of the boot): a suite split across guests had every later part of
+			# the same target refused while one part's resumed boot ran.
 			relative="${target#"$build/"}"
 			owner=""
 			if [[ "$relative" =~ ^boot/(virtio-blk|usb-media)[a-z0-9_-]*\.[0-9a-f]{64}\.([0-9]+)\.img$ ]]; then
 				owner="${BASH_REMATCH[2]}"
 			elif [[ "$relative" =~ ^boot/usb-media[a-z0-9_-]*\.[0-9a-f]{64}\.legacy\.([0-9]+)\.img$ ]]; then
 				owner="${BASH_REMATCH[1]}"
-			elif [[ "$relative" =~ ^logs/test/(x86_64|aarch64|riscv64)-[0-9]{8}T[0-9]{6}Z-([0-9]+)-(run\.log|guest\.log|usb-audio\.pcap)$ ]]; then
+			elif [[ "$relative" =~ ^logs/test/(x86_64|aarch64|riscv64)-[0-9]{8}T[0-9]{6}Z-([0-9]+)(-restart[0-9]+)?-(run\.log|guest\.log|usb-audio\.pcap)$ ]]; then
 				owner="${BASH_REMATCH[2]}"
 			else
 				case "$relative" in

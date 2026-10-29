@@ -36,6 +36,11 @@ The rules this ledger carries:
 
 Not a flake: the spool test on riscv64 (`spool_service_sends_submitted_jobs_exactly_once`) fails alone, two runs of
 two, on the spool service's own two-second answer bound. It belongs to that service's bound, not to this ledger.
+On aarch64 it passed in the whole suite, three runs of three, and failed in its part of the split suite and alone.
+The cause, found on 2026-10-28, was not the bound: the service judged a printer's answer late when that answer had
+already arrived and waited behind another handle, after the test had let about the answer time pass without running
+the service. Fixed on 2026-10-28 in the spool service and its probe; it passes alone on both ports and in the split
+aarch64 suite.
 
 Not a flake: `typec-tcpci-riscv64` ran with nothing beside it in the L2 of 2026-10-26 and failed on "vbus-stays-off:
 detached after 330 ms, before tSrcRecover and tSrcTurnOn (1275 ms) had passed" - the TCPCI partner's timing on an

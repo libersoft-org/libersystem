@@ -422,8 +422,16 @@ fn recovery(probe: &Probe) -> ! {
 		}
 		sleep_until(clock() + 2);
 	};
-	if !matches!(probe.create(&gone.id, 10), Err(Error::Io)) {
-		probe.fail("an unavailable printer admitted a job");
+	// WHILE THE RESET IS IN FLIGHT the printer is not available either, and refuses with `Again`; only the reset's
+	// failure makes it unavailable, refusing with `Io`. In a fresh boot this saw it not available mid-reset.
+	let refused = loop {
+		match probe.create(&gone.id, 10) {
+			Err(Error::Again) if clock() < deadline => sleep_until(clock() + 2),
+			refused => break refused,
+		}
+	};
+	if !matches!(refused, Err(Error::Io)) {
+		probe.fail(&format!("an unavailable printer admitted a job: {refused:?}"));
 	}
 	pass("recovery", "")
 }

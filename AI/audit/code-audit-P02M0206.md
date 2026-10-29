@@ -820,3 +820,421 @@ The host gates after the second batch (2026-10-26)
     is unchanged. `check-guest-verdict.py KernelSuiteResumes` 3 tests OK (91 s); then
     `./check.sh --gate source-hygiene,milestone-index,gate-result-logs` RESULT ok (110 s).
   - `./format.sh --changed`: nothing to change.
+
+The end-of-job runs (2026-10-26/27/28)
+  THE L2 (VERIFICATION's one L2): `./verify.sh --release --in-place` (four guest slots).
+  - A first attempt from 12:22:56Z was stopped at step 9 of 374: a commit at 12:48Z (48547848, made by the owner while
+    it ran) moved the tree's identity from the working tree to the git tree. The next run's E1 lookup refused to continue
+    it ("source tree moved"), as E1 requires, and the run began again.
+  - Run 20261026T125430Z-48547848-1136383-f9d54c, 12:54:07Z - 22:22:55Z: 374 steps; measured 34,044 s (9.5 h) of wall
+    clock over four guest slots, the steps 66,457 s (18.5 h) between them; its estimate before it started was
+    83,589 s of priced steps and a floor of 21,755 s. Against the baseline - 22.3 h for 183 steps and about two hours
+    more for the other 190, one after another - the whole release list ran in 9.5 h. `.build/logs` before it:
+    330,284,339 bytes.
+  - 20 steps failed and `capability-trace` did not run (it reads the riscv64 suite's run, which failed). Each failure was
+    read from its envelope and logs, and every one that could be the harness's was run again alone. By cause:
+    HARNESS, this milestone's, fixed (below): `implementation-mutations`, `qemu-ipmi-admin`, `qemu-tpm-tool`,
+    `boot-volume-controllers-aarch64` and `-riscv64`, `signed-boot`, `qemu-2d-demo`; and two that did not fail a step but
+    broke the measurement: the history (C6) and the logs rule against D1 (G1). And `firmware-tree` on both ports passed
+    but ran 983 and 970 s (B2's completion line, below).
+    CODE, failing alone, outside this milestone (OPEN): `iommu-aarch64-direct-gicv2-hostile` (and the two other hostile
+    profiles; alone: the same kernel test fails, 44 s); `arch-profile-aarch64-no-dt-absent-1` and its riscv64 twin (alone,
+    337 s: the loader prints "kernel loaded" before "FATAL - no DMA mode" and then hangs to the 300-s test timeout; the
+    loader last changed in 559e8fb8, another milestone); the riscv64 suite on
+    `kernel.services.spool_service_sends_submitted_jobs_exactly_once` (the known spool bound; D3 resumed after it - 538
+    ran, 1 failed, the restarted boot ran the other 11 and they passed, verdict failed); `system-suspend-riscv64` (alone,
+    486 s: "the clocks differ by 0 ms across sleep, not the reported 5112 ms") and `tickless-idle` on the same clock
+    check on both ports - the ports' boot-time clock does not count sleep; `typec-tcpci-riscv64`, which ran alone in the
+    L2 (`ALONE_GATES`) and failed on "vbus-stays-off: detached after 330 ms, before tSrcRecover and tSrcTurnOn (1275 ms)
+    had passed" - by the ledger's rule a failure alone is no flake, so it is moved there to the code's bound;
+    `development-lifecycle` (its protocol fuzz) and `qemu-pcie-hotplug` (its removal order), failing alone in the
+    narrowed rehearsal below.
+    UNDER LOAD, passing alone: `ipmi` and `sleep` (below).
+  - Passed in the L2, closing items whose real runs were pending: `hibernate-ports-aarch64` 2,675 s and `-riscv64`
+    3,898 s, each its own step and key (C8; 6,842 s as one step before); `concurrent-selection` 107 s,
+    `verify-evidence` 486 s and `perf-anchor` 50 s (B6); `usb-release` 171 s, `usb-legacy` 272 s, `i2c-hid` 160 s and
+    `bluetooth-le` 138 s (B2); `staged-consistency` 254 s, `run-verdict` 105 s; the x86_64 and aarch64 suites (F1).
+    `tickless-idle` counted the wakes on the console holder's line after the handoff on all three targets (x86_64
+    interrupt 36, aarch64 33, riscv64 "the console UART was handed to its driver, whose claim raises interrupt 55
+    where the boot armed 63 ... woke the idle machine 23 time(s) on the UART's interrupt 55") - B6's part - and
+    failed on the ports' sleep clock above.
+
+  THE FIXES. Each was watched failing first.
+  - C6, THE HISTORY WAS OVERWRITTEN BY A STEP. A release exports `LIBER_VERIFY_HISTORY` so the runner records into the
+    tree's history; every step inherited it, and the host step that runs verify-model's own tests saved their fixture
+    history (another model hash, 265 entries of 0 s) over the tree's at 14:54:19Z, losing every record before it. The
+    L1 inner run that followed ended STALE (exit 5) on 1,680 keys past the age window because of it.
+    - Fixed: `run_one_step` runs each step with `LIBER_VERIFY_HISTORY` empty; the history is the runner's alone.
+    - Repaired: the tree's history was rebuilt from the run's own envelopes (a script in the scratch directory): the
+      265 fixture entries dropped, the 244 steps' prices and keys recorded again under the run's model hash
+      (73 minutes of `verify-model record` calls). `capability-trace`, which did not run, is not recorded. The
+      envelopes carry the steps' keys, not each kernel test's, so the per-test keys stay unrecorded ("never" in
+      `./verify.sh --age`) until a suite records them again.
+  - B3, `implementation-mutations`: its work copy of the tree had the staging but not the profile records beside it,
+    so `test.sh` in the copy refused (75) and the gate read that as "not by the assertion". Fixed: the copy takes the
+    tree's `built-x86_64-*.profile` records with the staging they describe (`seed_mutation_inputs`). Passed in the
+    narrowed rehearsal (286 s).
+  - C1, THE BOOTABLE VOLUME'S MODE. `qemu-ipmi-admin` and `qemu-tpm-tool` failed on "lab: REFUSED: the x86_64 bootable
+    volume is not signed for DMA mode 'enforcing-required'": the development-instance gates (`dev.sh up`, `lab.sh
+    boot` - their image build signs the shared volume `harness`) declared no volume, so the scheduler ran them beside
+    cold runs that need it `enforcing-required`, and the volume was switched under them.
+    - A third rule in `verify-model check` (`resources.rs`): the x86_64 bootable volume is declared in the mode a
+      gate's boots sign it for - `harness` wherever its scripts bring up a development instance or image
+      (`dev.sh up`, `lab.sh boot`, `guest_gate_run`), `enforcing-required` wherever they start a cold run
+      (`scenario-cold`, `staging_not_current`); a gate whose boots need both switches the volume under every step
+      beside it, so it must run alone (`ALONE_GATES`) and declare one of them. Gates that write the staging themselves
+      are exempt (they declare a writer).
+    - Watch-failed on HEAD's declarations: the rule named exactly 18 gates - 16 development-instance gates with no
+      volume, `watchdog` declared `enforcing-required`, and `serial-handoff` (a cold run and a development instance in
+      one gate) not alone. Fixed: the 16 declare `volume:x86_64:harness:r`, `watchdog` `harness`, `serial-handoff` runs
+      alone. verify-model's new test `the_x86_64_volume_is_declared_in_the_mode_a_gates_boots_sign_it_for` (a fixture
+      of five gates: three failures expected, none for the alone one).
+    - `qemu-ipmi-admin` and `qemu-tpm-tool` passed in the narrowed rehearsal (412 s, 230 s).
+  - B7 AND B3, A REFUSED PORT GUEST WAS A FAILURE. `boot-volume-controllers-aarch64` and `-riscv64` were declared in the
+    development profile, but the gate never enters it, so `qemu-run.sh` refused the staging (shipping wanted) in a
+    second; the console driver then waited its 600-s budget for a socket that never came, and the refusal reached the
+    runner as "the guest produced no console output".
+    - `guest_gate_run` waits for whichever of the driver and the guest ends first; a guest gone first ends its driver
+      (after five seconds' grace), and a guest that exited 75 makes the gate exit 75 with the REFUSED line.
+      Test `test_a_refused_guest_ends_the_gate_at_once_with_the_refusal` (`check-guest-verdict.py`): watch-failed against
+      HEAD's `guest-gate.sh` (60 s, exit 1), passes in seconds with 75 and the refusal.
+    - The two declarations name the shipping profile.
+  - B7 AND B3 ON THE PORTS' BOOTABLE VOLUME. In the first narrowed rehearsal the ports' boot-volume-controllers were
+    refused for their bootable volume ("carries no profile record") and handed the STAGING's build, which never
+    rebuilds the volume - so the runner built it and the gate was refused again.
+    - `staging-state.sh` `volume_state_refusal`: a volume built in another profile, or with no record of one, or
+      signed for another DMA mode, is refused with the VOLUME's own build (`volume_build_command`) as its fix.
+    - `qemu-run.sh` checks the volume beside the staging: on x86_64 outside a test run in the mode it pairs with
+      (`LIBER_DMA_MODE`, default `enforcing-required`), and on a port's system-disk boot (`SYSTEM_DISK`) `harness`;
+      the staging's own parts drop `volume-test` there.
+    - `boot-volume-controllers-aarch64` and `-riscv64` declare `volume:ARCH:harness:r`.
+    - Tests: `BootableVolumeRefusal` (check-guest-verdict.py) - the real `qemu-run.sh` in a fixture tree: a port's
+      system-disk boot with no volume record, and with a volume signed `enforcing-required`, is refused 75 with the
+      volume's build as the fix; an x86_64 boot with a volume built in the development profile likewise. Watched
+      failing against HEAD's `qemu-run.sh` and `staging-state.sh`: both handed the staging's build.
+  - `signed-boot` checked the medium - the run's artifact, from the image producer - against the LIVE bootable volume,
+    which steps after the producer had rebuilt ("not built together"). Fixed: inside a run it reads the volume the
+    producer stored beside the medium (`evidence_image system-volume-bootable-x86_64.img`). Its port half was then
+    refused in the first narrowed rehearsal because its declaration named no port staging, so
+    `firmware-tree-aarch64` beside it switched the aarch64 staging to the development profile; it declares
+    `stage:aarch64:r stage:riscv64:r` now. Every case, the port half included, passed in the second (204 s).
+  - B2, `firmware-tree` on the ports ran 983 and 970 s: its completion line is printed while the guest is still
+    booting, before the shell takes the first command, and the driver watched for it only after the last command was
+    typed. Fixed (`guest-console.py`): the line counts wherever it comes, and the recording ends once every command has
+    been typed and the settle window after the line has passed. Test `test_a_completion_line_printed_during_boot_ends_
+    the_recording_once_the_commands_are_typed` (harness-test.py): watch-failed (ran to its 90-s budget), passes in about
+    4 s. In the first narrowed rehearsal: 302 s on aarch64 and 362 s on riscv64, each guest log ending "#
+    guest-console: the completion line came, and the settle window after it has passed" (1200 s before B1 and B7).
+  - G1 AGAINST D1: the logs rule kept each target's newest suite run, which after the L2 was a later selection, so the
+    whole port suites' logs - the measured durations D1's planner deals the parts by - were pruned. Fixed (`lab.py`
+    `suite_logs_kept`): each target's newest WHOLE run (`tests (all tags)`) is kept too, chosen as the planner chooses it.
+    Test `test_the_newest_whole_run_is_kept_beside_a_newer_selection` (LogsRulesTest), watch-failed.
+  - QEMU-2D-DEMO, A REGRESSION OF C7: the gate runs its lab guest in a state directory of its own (`LIBER_DEV_STATE`,
+    where `qemu-run.sh` puts the guest's control monitor), and `screenshot.sh` looked only in `.build/boot`, so every
+    shot booted a throwaway instance of its own and the demo "never reached the screen" (the L2 and the first narrowed
+    rehearsal).
+    - `screenshot.sh`: `RUN_MON="${LIBER_DEV_STATE:-$BUILD}/qemu-monitor.sock"`.
+    - Test `ScreenshotTest` (harness-test.py): `screenshot.sh` in a fixture tree with a stand-in HMP monitor on
+      `<state>/qemu-monitor.sock` attaches to it and writes the frame. Watched failing against HEAD's script ("kernel
+      ELF not found" - it fell back to booting one).
+    - `./check.sh --gate qemu-2d-demo` alone: PASS (157 s), "three live frames prove animation, analytic coverage,
+      blending, filtering and a colour glyph".
+  - IPMI AND SLEEP RUN ALONE. Both failed under four slots in two runs and passed alone with one slot: in the L2 (when
+    they declared no bootable volume and gates beside them re-signed it) ipmi's SSIF boot answered `bmc sensors` with
+    "the BMC is unavailable" and sleep's console refused a connection at the Ctrl+Z step; in the first narrowed
+    rehearsal, with the volume declared, both development instances "reached a shell but [the] development agent never
+    answered" within the bring-up's 30 s. By the ledger's rule (F2) they run alone (`ALONE_GATES`, eleven now), each
+    with an entry in `docs/verification/FLAKES.md`, whose count of L2 runs since a flake attributed to load stays 0.
+    `typec-tcpci-riscv64` moves from the ledger's open entries to "not a flake".
+  - B2, THE GATES WITH THE MOST IDLE AFTER B1 AND B7, ranked by the L2's measured times. Of the release list's guest
+    gates, the ones that type no `poweroff` and named no completion line recorded to their whole console budget: in
+    the L2 bluetooth-classic 649 s (two boots of a 280-s budget), bluetooth-service 612 s (two of 260 s), power-ups
+    566 s and brightness-usb 562 s (each 300 s, and their guest kept to its 480-s deadline by `GUEST_GATE_WINDOW=keep`),
+    power-service 381 s, smartcard-service 380 s, bluetooth-transfer 337 s, bluetooth-le-audio 317 s,
+    bluetooth-audio 286 s, bluetooth-input 172 s, and the four with the default 70-s budget at about 150 s
+    (foreign-loader-guest, foreign-facilities-guest, icd-selection, lifecycle).
+    - Thirteen of them name a completion line now: each types `echo <gate>-done` as its last line - the console
+      driver types a line only once the shell's prompt is back, so every command before it has returned - and
+      states its window: 10 s where the oracle refuses lines (a probe failure, a pairing that must not happen, a
+      request a simulated device has no control for), 5 s for foreign-loader-guest (a refused negotiation) and
+      lifecycle (its crash, exit and destructor counts), 20 s for bluetooth-transfer, which still needs
+      NetworkService's return to its NIC after the PAN link departs, and none for the four whose checks are all of
+      lines that must appear (bluetooth-le-audio, bluetooth-audio, foreign-facilities-guest, icd-selection).
+    - power-ups and brightness-usb, whose verdicts also read their simulator's log on the host, cover what the
+      simulator still records with that window, so `GUEST_GATE_WINDOW=keep` - kept by B7 "until B2 names their
+      completion lines" - is gone from `guest-gate.sh`, with its test (`test_a_kept_window_runs_the_guest_to_its_
+      deadline`).
+    - Not converted: bluetooth-input - after its last command the fixture's keyboard types into the same shell, and
+      its oracle refuses a restart after the keyboard's chords, which needs its whole 90-s budget; and the four guest
+      gates outside the release list (midi-service, camera-service, modem-service, gamepad-tool), which have no
+      measured time to rank.
+    - Test: `CompletionLineTest` carries the thirteen - each script names its line and states its window, and for
+      each with a window a line its oracle judges, injected half-way through the window, is recorded with it and
+      missed without it. Watched failing against HEAD's gate scripts: the thirteen new cases fail ("the gate names
+      its completion line"), the five older ones pass.
+    - Each run alone, on the fixed tree (`LIBER_DEVELOPMENT=1 ./check.sh --gate G`, one after another; the L2's time,
+      under four slots, in brackets): bluetooth-classic 229 s (649), bluetooth-service 217 s (612), power-ups 130 s
+      (566), brightness-usb 165 s (562), power-service 163 s (381), smartcard-service 167 s (380), bluetooth-transfer
+      191 s (337), bluetooth-le-audio 140 s (317), bluetooth-audio 133 s (286), foreign-loader-guest 130 s (149),
+      foreign-facilities-guest 124 s (153), icd-selection 124 s (152), lifecycle 131 s (150) - all PASS.
+      bluetooth-classic's and bluetooth-service's cold reboots found the bond the first boot stored. The two guest
+      logs a gate keeps (`.build/logs/power-ups/guest.log`, `.build/logs/brightness-usb/guest.log`) end "#
+      guest-console: the completion line came, and the settle window after it has passed"; brightness-usb's window
+      caught a late line ("BrightnessPolicy: ... stored at 45").
+
+  THE NARROWED REHEARSALS - the failures the L2 left, run again on the fixed tree (`./verify.sh --release --in-place
+  --required <the failed keys and their producers>`; rehearsals, as their dossiers say):
+  - #1, four guest slots (run 20261027T001029Z-48547848-2630969-e929ee, 00:10 - 01:35Z, 39 steps): 5,007 s of wall
+    clock, the steps 7,407 s. PASSED: implementation-mutations (286 s), qemu-ipmi-admin (412 s), qemu-tpm-tool
+    (230 s), firmware-tree-aarch64 (302 s) and -riscv64 (362 s), typec-ucsi (1,157 s), watchdog (1,862 s),
+    qemu-virtio-iommu-x86_64 (704 s), dev.selftest and both image producers. FAILED for causes of this milestone's,
+    fixed above: the ports' boot-volume-controllers, signed-boot's port half, qemu-2d-demo. FAILED, decided by #2:
+    development-lifecycle, qemu-pcie-hotplug, sleep, ipmi.
+  - #2, one guest slot (run 20261027T014652Z-48547848-2929926-e0714b, 01:46 - 04:30Z, 31 steps): 9,734 s of wall
+    clock, the steps 8,399 s. The runner brought `volume:aarch64` and `volume:riscv64` to shipping/harness before
+    the ports' boot-volume-controllers ("in 'no recorded state' - bringing it about: env -u LIBER_DEVELOPMENT
+    ./build.sh --arch ARCH --kernel-on-volume --dma-mode harness --part volume"). PASSED: boot-volume-controllers-
+    aarch64 (1,634 s) and -riscv64 (2,078 s; 3,901 s before B1 and B7), signed-boot with its port half (204 s), ipmi
+    (1,725 s), sleep (1,618 s), dev.selftest, both image producers. FAILED ALONE: development-lifecycle -
+    `dev.proto-test`'s fuzz timed out sending (`TimeoutError` in `fuzz_rounds`, 67 s), after which `dev.perf-gate` and
+    `dev.gpu-restart` found the instance "starting" (3 s each), as in the L2 - and qemu-pcie-hotplug ("the slot was
+    powered down at line 1, before the driver let go at line 2 - that is a surprise removal"): both code, both under
+    OPEN already. qemu-2d-demo failed as expected (its fix came after the run). The owner's commit 2d365732 landed
+    during the run; the dossier says "the tree changed while the run was in progress" (the working tree's identity,
+    then the same content as a git tree).
+
+  HOST CHECKS on the fixed tree: verify-model `cargo test` 171 passed; `verify-model check` consistent (model hash
+  aaa5673e...); `harness-test.py` 127 tests OK; `check-guest-verdict.py` 114 tests OK; `./format.sh --changed` clean;
+  `./check.sh --gate verify-model,verify-model-tests,verify-scheduler,guest-verdict,boot-harness,source-hygiene,
+  milestone-index,gate-result-logs` RESULT ok (836 s). The owner committed the first fixes as 2d365732 and 1434284f;
+  the thirteen B2 gates and the kept window's removal are in the working tree.
+
+  THE MEASUREMENT RUNS (L0 on three changes, L1 on the first, D1, D4), one after another on one tree:
+  - L0, a leaf driver: `./verify.sh --for src/user/drivers/core/src/acpi_fan_driver.rs` (2026-10-27 05:35Z): 4 inner,
+    6 deferred keys; estimate 92 s of priced steps; all 4 steps passed; measured 357 s of wall clock over one guest
+    slot, the steps 158 s between them (the rest the staging's switch back to the volume's shipping mode, 64 s, and
+    the planner); exit 5, STALE - 1,701 keys past the age window, the per-test kernel keys the lost history no longer
+    records ("never").
+  - L0, a kernel change (`--for src/kernel/sched`, from 05:42Z) was cut off at 06:30Z with 147 of its keys passed,
+    when the session running it ended; the host then rebooted (18:32Z), which emptied the scratch directory with this
+    section's drafts. It is run again from the start, with the rest, below.
+  - THE CHAIN, run again from the start (2026-10-28, `/root/p0206-end/chain.sh` and then `after.sh`, detached, one
+    after another on one tree; scratch files outside the repository):
+    - L0, a kernel change: `./verify.sh --for src/kernel/sched` (04:29 - 07:41Z): 239 steps (823 inner, 1,238
+      deferred keys); estimate 7,478 s of priced steps, floor 7,015 s at one slot; measured 11,483 s of wall clock,
+      the steps 7,535 s between them; 238 passed. `run-verdict` FAILED on "a run ended without saying so, or said the
+      wrong thing" (its HUP case).
+    - L0, a harness change: `./verify.sh --for src/harness/test-kernel.sh` (07:41 - 10:57Z): the same 239 steps;
+      estimate 7,499 s, floor 7,044 s; measured 11,665 s, the steps 7,706 s; 238 passed, `run-verdict` FAILED the same.
+    - THE run-verdict FAILURE IS AN ARTEFACT OF HOW THE CHAIN WAS STARTED. The chain ran under `nohup`, so SIGHUP was
+      ignored from the start, and a process that inherits an ignored signal cannot trap it. The gate's case sends
+      HUP to a shell that traps it and expects exit 129. A probe under `nohup` survived its own HUP ("survived").
+      `./check.sh --gate run-verdict` started under `setsid` only, on the same tree: RESULT ok (46 s), "a HUP to the
+      shell -> RESULT failed exit=129". So the rest ran under `setsid` without `nohup`.
+    - THE WALL CLOCK AGAINST THE STEPS. Both L0s spent about 3,950 s (11,483 - 7,535; 11,665 - 7,706) outside their
+      steps, over 239 steps: 16.5 s a step. That is `record_one_step`. In the runner, after each step,
+      `verify-model record` loads the model (16 to 18.5 s timed by hand), and nothing is dispatched until it returns.
+      No item of this milestone covers it. It is recorded in the plan (A3, OPEN) for a milestone of its own.
+    - L1 on the leaf change. Inner half: `./verify.sh --for src/user/drivers/core/src/acpi_fan_driver.rs --l1-suites`
+      (10:57 - 11:11Z): 5 steps, all passed, 824 s (the steps 731 s); exit 5, STALE (1,116 keys). `--merge` needs a
+      commit of exactly the tested content, which is the owner's, so the deferred half ran from the handoff as a
+      prepared plan. `deferred-steps.py` took the full plan (`verify-model commands`) and kept every step that carries
+      a deferred key: 30 steps, which cover 1,101 of 1,101 deferred keys, none missing. 8 other keys came along, the
+      ports' build parts, which the parts read. It ran as `LIBER_VERIFY_STEPS=<that plan> ./verify.sh --jobs 4`.
+    - Deferred half, first run (11:12 - 12:00Z): 2,854 s, the steps 9,157 s; 12 of 30 failed. 10 were refused by
+      `test.sh`'s guard against stray guests: "a qemu-system-aarch64 already holds this tree's disk images: 1412312
+      (.../aarch64-20261028T111704Z-1337472-restart1-run.log)". That was one part's RESUMED boot (D3), whose logs are
+      named `<stem>-restartN-{run,guest}.log` after the run whose test failed. The guard's list of a run's own private
+      files had `<arch>-<stamp>-<pid>-run.log` and not the `-restartN` form, so every later part of the same target
+      took that boot for a foreign run. A HARNESS DEFECT OF THIS MILESTONE: D1 and D3 meet only when parts run beside
+      each other. The other 2 failures were both ports' part 8/8 on the spool test.
+    - THE FIX (after the chain ended, before `after.sh`):
+      - `test.sh` `require_no_stray_qemu`: the private log pattern takes an optional `-restart[0-9]+`
+        (`^logs/test/(x86_64|aarch64|riscv64)-[0-9]{8}T[0-9]{6}Z-([0-9]+)(-restart[0-9]+)?-(run\.log|guest\.log|usb-
+        audio\.pcap)$`). The owner is still the second group, the pid of the run that failed; that run is the parent
+        of the resumed boot (`test-kernel.sh` starts it as a child, `:757`), so it is in the QEMU's ancestry.
+      - `src/tools/check-guest-verdict.py` `ExistingQemuAdmission`: `PRIVATE_SCRATCH` gains three resumed-boot names
+        (aarch64 `-restart1-run.log`, riscv64 `-restart1-guest.log`, x86_64 `-restart2-usb-audio.pcap`).
+      - Watched failing: the fixture against the unfixed `test.sh` in a mirror failed the three new subtests
+        ("23 != 0"); with the fix they pass. `check-guest-verdict.py` whole: 114 tests OK. `shfmt -d test.sh` clean.
+    - D4 (12:00 - 13:43Z), `src/harness/test-kernel.sh aarch64` with `TEST_TIMEOUT=60m`, debug against
+      `CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_TEST_OPT_LEVEL=1`, each with its own `CARGO_TARGET_DIR` under
+      `.build/tmp/d4`:
+      - the whole aarch64 suite, debug: 4,357 s, 546 passed (4,343 s in the guest);
+      - at `opt-level` 1: 1,442 s over three boots (1,429 s in the guest); 544 passed. Two failed:
+        `kernel.extable.the_exception_table_exists_and_is_small_enough_to_scan` ("the exception table has grown to
+        200 entries") and `kernel.hardware.hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer` ("the
+        controller's link position counter should advance"). D3 resumed after each;
+      - built from nothing: 35 s debug, 42 to 43 s at `opt-level` 1. My first "warm" timing touched a file and
+        measured only a no-op rebuild (4 s each), so it was measured again with real content changed: one string in
+        a function of `src/kernel/sched/mod.rs` (`after.sh`), the kernel crate rebuilt in 3.6 s debug and 7.2 s at
+        `opt-level` 1. The file was restored from a copy and checked with `git diff --quiet`.
+      By the plan's rule (adopted only if every outcome is the same and the per-change level is not slower) it is NOT
+      ADOPTED: two outcomes differ, and a change rebuilds twice as slowly. The two bounds are those tests' own. The
+      target directories (1.3 GB and 1.6 GB) were deleted after the measurement.
+    - Deferred half, second run, on the fixed tree (`after.sh`, 13:55 - 15:08Z; inner half again first, 617 s, all 5
+      passed, STALE 563): 4,374 s of wall clock over four slots, the steps 14,861 s between them; estimate 12,559 s,
+      floor 3,076 s. No refusals. 28 of 30 passed. Both ports' part 8/8 FAILED on
+      `kernel.services.spool_service_sends_submitted_jobs_exactly_once` ("SpoolService: a printer did not answer an
+      attach or a reset - it is unavailable"). D3 resumed after it in both, and the rest passed (aarch64 8, riscv64 5).
+      Each part costs about 12 to 13 s more than its time in the guest (compile under the build lock and boot): for
+      example 258 s against 245 s, and 1,866 s against 1,853 s.
+    - D1's ORACLE, by `d1.py` over the guest logs (kept as hard links in `.build/tmp/d1-logs`, since G1's sweep keeps
+      only a target's newest runs): the aarch64 split against the whole debug suite above. 546 compiled ids; the parts
+      546 results, 546 distinct, none twice, none missing, none uncompiled. One verdict differs: the spool test, ok
+      in the whole suite and failed in its part.
+    - D1's CONTROL: was the spool difference load or the split? Part 8/8 run alone with nothing beside it (15:10 -
+      15:45Z): `TEST_SELECTION=<that part's 270 ids, from the prepared plan> ./test.sh --arch aarch64`, memory-capped.
+      FAIL, 2,134 s: 261 tests before spool `[ok]`, spool failed with the same "a printer did not answer an attach or
+      a reset - it is unavailable" (`services.rs:4593`, "spool_probe inventory ran to its end"), and D3's resumed boot
+      ran the 8 after it, all passed. In the whole aarch64 suite spool passed every time: in the L2 (four slots), in
+      the debug run alone (35 s), and at `opt-level` 1 (3 s, in a resumed boot that started at test 390). In its part
+      it failed every time: twice at four slots, once alone. So it is NOT LOAD, AND NOT THE SPLIT'S DEALING (every id
+      ran exactly once). The test passes only after something a test before it in the whole suite leaves. What I
+      saw: the service marks a printer unavailable when an attach is not answered within `ANSWER_TICKS` (200 ticks,
+      `spool_service.rs:42`, `:442`), and the test's rig answers attaches only when it pumps (`Rig::pump`). Which
+      earlier test makes it pass was not looked for. Bisecting a 276-test predecessor set is long, and the fix is the
+      spool test's, outside this milestone (EXCLUDES: product bounds; the spool bound is already under OPEN).
+      RESULT: D1 IS NOT VERIFIED; its oracle's equal verdict waits for that fix. D1 stays `[ ]`, and the dependence
+      is recorded in the plan (D1, OPEN) and in `docs/verification/FLAKES.md` (a note beside riscv64's: no flake
+      either).
+    - A3, `verify-model account` over each level's own plan (`--steps`; the L0 plans regenerated with
+      `verify-model tier-inner --state <scratch> --stdin` from the same paths, the L1 deferred plan as run; the
+      release plan with no `--steps`):
+      - L0 leaf, 1 slot: 4 steps, 88 s; host lane 54 s; longest 41 s (`build:x86_64:volume`); floor 54 s.
+      - L0 kernel = L0 harness, 1 slot: 239 steps, 7,663 s; alone 11 s; host lane 7,199 s; guest 453 s; chain
+        2,377 s (`stage:x86_64`); longest 1,429 s (`gate:host:capability-model`); floor 7,210 s.
+      - L1 deferred, 4 slots: 30 steps, 11,934 s; host lane 120 s; guest 2,954 s a slot; longest 1,866 s (an aarch64
+        part of 270); floor 2,954 s.
+      - L2 (release plan), 4 slots: 374 steps, 373 priced (109 older), 1 unpriced (`gate-after-guest:host:capability-
+        trace`); 69,983 s; alone 5,548 s; host lane 7,554 s; guest 14,220 s a slot; chain 10,392 s (`stage:x86_64`);
+        longest 4,426 s (`guest:aarch64:all`); floor 19,768 s.
+      - What no item covers, for a milestone of its own: the per-step record (16.5 s a step, serial in the runner,
+        about 3,950 s of each L0 of 239 steps, about 1.7 h over the release plan), and the one host lane, which is
+        2.0 h of an L0 of a change that selects everything.
+      - L3's figure (its build from nothing, time and size) is measured by its first sealed run, which runs on the
+        owner's request (A1) and was not made. A3 stays `[ ]` for that part alone.
+  THE PLAN AND THE LEDGER after these runs (`docs/todo/P02M0206.md`, written from drafts once nothing ran):
+  - B2, B6, C8, D4 and F1 checked, each with what verified it (D4: NOT ADOPTED, by its rule). D1 and A3 stay open,
+    with the reasons above. The status line says the same. VERIFICATION has the L2, the three L0s, the L1 and
+    `.build/logs` before and after (330,284,339 bytes before the L2, 331,045,840 after every run). OPEN has the
+    defects these runs found outside this milestone: the typec and sleep-clock code, the spool test's dependence,
+    `ipmi`/`sleep` under load, `lab.py`'s double close of its lock descriptor, `evidence_store_artifact`'s `.uuid`
+    sidecar name, and the runner's per-step record and single host lane.
+  - `docs/todo/TODO.md`: the line stays IN PROGRESS (2026-10-28), naming the two items that wait.
+  - `docs/verification/FLAKES.md`: the aarch64 spool note.
+  CHECKS after the last edits: `shfmt -d test.sh` clean; `./format.sh --changed` nothing to change; `./check.sh --gate
+  guest-verdict,source-hygiene,milestone-index` RESULT ok (233 s; `check-guest-verdict.py` 114 tests OK, the guard's
+  three resumed-boot cases among them). The guard's fix was also exercised for real: the second deferred half ran
+  16 kernel-suite parts at four slots, two of them with resumed boots, and no part was refused.
+  NOT PERFORMED: an L3 (the owner's to start); `--merge` of the L1 (it needs a commit, which is the owner's); a
+  search for the test whose leftovers make the spool test pass on aarch64; any run of the ports after the guard's fix
+  other than the deferred half and the lone part above.
+  FINAL STATE (2026-10-28): every item implemented. Every item but D1 and A3 verified. D1 is blocked by the spool
+  test's dependence on an earlier test, outside this milestone. A3 has one part, L3's figure, that waits for the
+  owner's first sealed run. The working tree holds the guard fix (`test.sh`, `src/tools/check-guest-verdict.py`), the
+  plan, TODO and ledger texts and this record, uncommitted. The scratch files in `/root/p0206-end` and the hard links
+  in `.build/tmp/d1-logs` were removed after this record was written.
+  THE SPOOL TEST'S CAUSE, found after the record above (2026-10-28 15:55 - 16:00Z):
+  - `TEST_SELECTION=kernel.services.spool_service_sends_submitted_jobs_exactly_once ./test.sh --arch aarch64` alone:
+    FAIL in 77 s, the same "a printer did not answer an attach or a reset - it is unavailable" and `spool: ` empty.
+    So on aarch64 the test fails in any fresh boot, not only in its part of the split.
+  - A temporary measurement in `run_spool_probe` (one `serial_println!` of `arch::apic::ticks()` from the step's
+    start to the probe's spawn, the file restored from a copy afterwards and checked with `git diff --quiet`):
+    "spool-diag: inventory: 196 ticks from the step's start to the probe's spawn", then the unavailable printer.
+  - The mechanism, read from the code. `Rig::start` (`services.rs`) returns once every simulated printer has SENT its
+    attach answer (`Sink::attach` sets `attached`), not once SpoolService has taken it. The service runs only while
+    the test pumps. `run_spool_probe` then parses the packages and spawns the dynamic probe without pumping: 196 ticks
+    in a fresh aarch64 debug boot. When the service runs again, its loop serves ONE ready handle (`wait_any`, the
+    lowest index first) and then calls `tick()`, which marks a printer whose attach is older than `ANSWER_TICKS`
+    (200, `spool_service.rs:42`, `:442`) unavailable, though that printer's answer is already in its channel. In the
+    whole suite the boot is warm and the gap falls just under 200 ticks, so the test passes.
+  - So the defect is in the spool service and its test, both P02M0186's: an answer that has already arrived is judged
+    late, and the test lets the deadline pass without running the service. The plan excludes product bounds and
+    timeouts. Fixing them here is the owner's decision, and D1's equal verdict waits on it.
+  THE OWNER'S DECISIONS (2026-10-28), asked once the cause was known: "Fix the service here", and for L3 "Not yet".
+  So the spool service and its probe are fixed below, as an adjacent change that D1's oracle needs. L3 is not run,
+  and A3 keeps its one open part.
+  THE SPOOL FIX (2026-10-28, 17:30 - 18:05Z):
+  - `src/user/services/core/src/spool_service.rs`: `Service::take_answers(&mut self, buf)`, called in the main loop
+    after the one served handle and before `tick()`. It reads every printer with a request outstanding through
+    `on_answer`, which drains with `try_recv_caps` and does not wait, and loses a printer whose connection closed, as
+    `serve` does. The keys go in a fixed array of `jobs::MAX_PRINTERS`, as `pump` keeps its lost printers, so no
+    `Vec<u32>` growth routine is imported, which differs per target. So an answer that has arrived is never judged
+    late.
+  - Watched: before the fix the test failed alone on aarch64 twice (above). With the service fix alone it got past
+    `inventory`, `two`, `stall`, `abandon`, `crash`, `detach`, `unplug` and `reset`, and then failed `recovery`:
+    "an unavailable printer admitted a job".
+  - `src/user/services/core/src/spool_probe.rs` `recovery`: the probe waited until the printer was "not available",
+    and then expected `create` to be refused with `Io`. But a printer whose reset is still in flight is not available
+    either (`Phase::Attaching`), and `create` refuses it with `Again` (`spool_service.rs`, admission). In a fresh boot
+    the probe asked mid-reset. It passed only when the simulated printer happened to answer the reset between the
+    probe's two requests. Now, while `create` answers `Again`, the probe waits under its existing deadline, and then
+    requires `Io`. Its failure message names the refusal it got.
+  - With both fixes, each run alone in a fresh boot, `TEST_SELECTION=kernel.services.spool_service_sends_submitted_
+    jobs_exactly_once ./test.sh --arch A`: aarch64 PASS (66 s), with "a printer's reset failed - it is unavailable
+    until it is withdrawn" and "PASS recovery"; riscv64 PASS (65 s). On riscv64 it "failed alone, two runs of two" in
+    the ledger and was under OPEN, so the same defect is fixed there.
+  - `./build.sh --arch aarch64` (twice, 336 s and 266 s) and `./build.sh --arch riscv64` (323 s): RESULT ok, the cross
+    builds of the changed service and probe.
+  - L0 of the change, `./verify.sh --for src/user/services/core/src/spool_service.rs,src/user/services/core/src/
+    spool_probe.rs`: 4 inner steps (the x86_64 user, packages and volume builds and the spool test), all passed, 367 s
+    of wall clock; 6 deferred keys, which are the ports' user, packages and volume builds, passed by the builds above;
+    exit 5, STALE (563 keys of the lost history).
+  - `./check.sh --gate spool-service`: RESULT ok (37 s), "recovery passed". `./check.sh --gate dynamic-report,
+    dynamic-report-regressions`: RESULT ok (430 s), "92 tools x 3 targets, 6 waves and 3 whole images match".
+    `./format.sh --changed`: nothing to change.
+  WHAT D4'S MEASUREMENT LEFT IN THE PLANNER'S INPUT. `measured_test_durations` (`commands.rs`) deals the parts by the
+  newest WHOLE run's guest log in `.build/logs/test`. After G1's sweep, that was D4's `opt-level` 1 run, about three
+  times faster and with no time for its two failed tests, and the debug whole run of 12:00Z had been swept. So a plan
+  made then dealt aarch64 into 7 parts (six alone and one of 540). The D1 run below runs the debug whole suite first,
+  which gives the dealing its debug durations back.
+  D1 AGAIN, ON THE FIXED TREE (`/root/p0206-d1/chain.sh`, started with `setsid`, 2026-10-28 18:11 - 19:58Z):
+  - the compiled ids: `verify-model kernel-tests --arch aarch64`, 546;
+  - the whole suite alone, `systemd-run --scope -p MemoryMax=16G ./test.sh --arch aarch64`: PASS, "546 passed
+    (4327s)", RESULT ok in 4,340 s. It is also what the planner deals by, so the dealing used debug durations again;
+  - the plan: `verify-model commands`, from which a script took the "kernel suite aarch64 part" steps and their
+    build prerequisites (15 steps, a prepared plan); the planner dealt 8 parts - the six heaviest alone, one of 269
+    and one of 271;
+  - the split: `LIBER_VERIFY_STEPS=<that plan> ./verify.sh --jobs 4`: "all 15 step(s) passed", "measured: 2072 s
+    wall clock over 4 guest slot(s); the steps took 7006 s between them" (the estimate had said 4,928 s of priced
+    steps and no schedule under 1,216 s), RESULT ok in 2,090 s;
+  - the oracle, a comparison of the per-test results in the guest logs: whole 546 results, 546 distinct, none twice,
+    none failed; parts 546 results, 546 distinct, none twice, none failed; none only in one of them; "verdicts that
+    differ: 0". The ids are the compiled ones: 546 compiled, 546 run in the whole suite, none missing, none extra, none
+    twice. So every compiled id ran exactly once in the parts, and every verdict equals the whole suite's. D1 is
+    checked.
+  - A note on the evidence: the chain's second check read the part logs a moment after the comparison and found one
+    gone. G1's sweep runs again when a top-level run ends (`lab.py`, the watcher forked by `logs_hold`), and keeps
+    per target the newest run and the newest whole run, so the split's part logs are removed once `verify.sh` has
+    ended; the comparison had read all eight first. The ids check was then made against the whole run's log, which
+    is kept. This is G1 as designed, not a defect: the parts' verdicts are in the ledger (`verify-model record`).
+  THE PLAN, TODO AND LEDGER after this (`docs/todo/P02M0206.md`):
+  - D1 checked, with VERIFIED 2026-10-28: the first run's one differing verdict, the cause, the owner's decision and
+    the fix, the second run, and the split's cost (2,072 s for the aarch64 suite in 8 parts at four slots, against
+    4,340 s whole), replacing the "ORACLE NOT MET" paragraph this session had written and not committed.
+  - The status line: every item verified but A3's L3 figure, which waits on the first sealed run; the owner said not
+    yet on 2026-10-28. F1's and VERIFICATION's spool mentions say the defect is fixed; OPEN's spool entries are marked
+    answered, and a bullet records the owner's two answers of 2026-10-28.
+  - `docs/todo/TODO.md`: still IN PROGRESS, for A3's L3 figure alone. `docs/verification/FLAKES.md`: the spool
+    note says the cause was found and fixed, and the test passes alone on both ports and in the split.
+  CHECKS after these edits: `./format.sh --changed` nothing to change; `./check.sh --gate source-hygiene,
+  milestone-index` RESULT ok (102 s).
+  NOT PERFORMED: an L3 (the owner said "Not yet"); `--merge` of the L1 (it needs a commit, the owner's); the split of
+  the riscv64 suite on the fixed tree (D1's oracle names aarch64; riscv64's spool test passes alone); the x86_64
+  suite whole on the fixed tree (the L0 ran its spool test, passed); the search for which earlier test kept the
+  boot warm enough to hide the defect, which the fix makes moot.
+  FINAL STATE (2026-10-28, after D1's second run): every item implemented. Every item verified but A3's L3 figure
+  (its build from nothing, time and size), which its first sealed run measures; that run is the owner's to start and
+  is not started, so P02M0206 stays IN PROGRESS. D1 is verified, after the spool service's defect it exposed was fixed
+  on the owner's word. The working tree holds, uncommitted: the guard fix (`test.sh`,
+  `src/tools/check-guest-verdict.py`), the spool fix (`src/user/services/core/src/spool_service.rs`, `spool_probe.rs`),
+  the plan, TODO and ledger texts, and this record. The scratch files in `/root/p0206-d1` are removed after this
+  record is written.
+  WHAT HOLDS A3, stated for the next reader (2026-10-28): the L3 that measures its last figure is a sealed release,
+  and `src/tools/release-snapshot.sh` builds it from a detached worktree of a committed revision (`create DIR
+  REVISION`). This tree's spool and guard fixes are uncommitted, and commits are the owner's; so is starting the L3,
+  which the owner held back on 2026-10-28 ("Not yet"). The run was not started, and A3 stays `[ ]`: its figure is not
+  estimated in place of being measured. Plan status line updated with this; `./check.sh --gate source-hygiene,
+  milestone-index` to follow the edit.
+  That gate run: RESULT ok (102 s).
