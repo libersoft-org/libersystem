@@ -1379,3 +1379,9 @@ The end-of-job runs (2026-10-26/27/28)
   STATE (2026-10-30): every item implemented; every item verified but A3's L3 figure, which waits for an L3 that ends -
   on the owner's word, after the crashed run's snapshot is removed and with the host's crashes in mind. P02M0206 stays
   IN PROGRESS.
+  THE OWNER'S ANSWERS (2026-10-30): "Ano, nastav" - `/etc/sysctl.d/90-panic-reboot.conf` written (`kernel.panic_on_oops
+  = 1`, `kernel.panic = 10`) and applied with `sysctl -p` (read back: 1 and 10); "Ano, odstraň" - `src/tools/
+  release-snapshot.sh remove .build/release/fa6d59530aa7`, rc 0: the directory is gone, the worktree no longer listed,
+  the four other worktrees untouched, `/data` from 55 to 100 GB free; "Až po kontrole hostitele" - no L3 is started
+  until the owner has had the host checked and says so. The plan's OPEN and status say the same. P02M0206 stays IN
+  PROGRESS for A3's L3 figure alone.
