@@ -1338,3 +1338,44 @@ The end-of-job runs (2026-10-26/27/28)
   a scratch tree; the gates that need them run in the L3).
   STATE (2026-10-29): every item implemented; every item verified but A3's L3 figure; P02M0206 IN PROGRESS until the
   second L3 has measured it.
+  THE SECOND L3 (2026-10-29 16:35Z, after the owner committed b7bcff48 and fa6d5953): `./verify.sh --level L3` from
+  `/root/p0206-l3/run.sh` with the disk watcher, the snapshot at `.build/release/fa6d59530aa7` (the 12-digit name),
+  the prepared inputs seeded (the jar, 21 UCD files, the oracle tree with its venv - checked in the snapshot).
+  - "estimate: 374 step(s), 71914 s of priced steps ... no schedule over 4 slot(s) finishes in under 19769 s".
+  - Every build from nothing passed: 21 build steps, no BLOCKED step, 3,266 s of step time, the last ended at
+    17:35:54Z (59.5 minutes after the run began). The watcher's last line, 23:36:08Z: 58.6 GB free on `/data`, the
+    snapshot 48,275,732,170 bytes.
+  - At step 337 of 374 the VM's kernel oopsed (2026-10-30 00:36:45 CET, `Oops: stack segment` in
+    `__rmqueue_pcplist+0x6f8`, a non-canonical list pointer, in a `python3` page fault), then RCU stalls and soft
+    lockups (`qemu-system-x86`), and the host froze until the owner reset it at 03:41 CET. The run never ended: no
+    dossier, no `release-build-size`, no `measured:` line. A3's figure is NOT measured; the numbers above are a partial
+    run's.
+  - 18 steps had failed by then. Code defects already under OPEN: `arch-profile-{aarch64,riscv64}-no-dt-absent-1`, the
+    three IOMMU hostile and transition profiles, `tickless-idle`, `system-suspend-riscv64`, `typec-tcpci-riscv64`. And,
+    read from the run's step logs: `boot-harness` (4 shipped scenarios: "no such file" under the snapshot),
+    `dynamic-report` (x86_64 `dmesg`, `free`, `lscpu` rows that do not match), `verify-evidence` (its nested fixture's
+    `volume-layout` envelope "records failed"), `implementation-mutations` (two mutants "failed the suite, but not by
+    the assertion it was written against"), the development lifecycle ("abiprobe is audit-produced and was not staged"),
+    `qemu-virtio-iommu-x86_64` ("the bootable volume was signed for DMA mode 'harness'"), `capability-trace`,
+    `bluetooth-independent`, `boot-volume-controllers-aarch64` and `typec-ucsi` (the development agent never answered,
+    then the `lab.py` double close - "Bad file descriptor"). Recorded under OPEN, for milestones of their own; none of
+    them stops A3's figure, which needs only an L3 that ends with nothing blocked.
+  THE HOST, investigated on the owner's request (2026-10-30, read only - nothing removed or changed):
+  - `journalctl --list-boots`: the boots ending 2026-10-20 00:44 CEST, 2026-10-27 07:30 CET and 2026-10-30 00:36 CET
+    each end in a kernel oops followed by RCU stalls and soft lockups: a NULL dereference in `sched_balance_newidle`
+    (6.12.111, `qemu-system-aar`), and twice the same `__rmqueue_pcplist+0x6f8` stack-segment fault (6.12.113, `nm`
+    and `python3`). `kernel.panic`, `panic_on_oops`, `softlockup_panic` and `hung_task_panic` are all 0, so the VM
+    hangs instead of rebooting. Not tainted.
+  - `atopsar` at each crash: 150 to 190 GB of 251 GB free, no swap configured, 1 to 3 of 100 cores busy; guest (nested
+    KVM) time on 2026-10-30, none on 2026-10-27. So neither load, memory nor nested KVM is required for it.
+  - rustc segfaults or general-protection faults in every boot (9, 3, 1, 5 and 4 in the last five), in different
+    libraries. The balloon device negotiates statistics only and never inflated.
+  - Disk: `/` 54 GB free (43 % used); `/data` 55 GB free (95 %): `.build/cargo` 224 GB, `.build/unsafe-audit` 57 GB,
+    the crashed run's sealed snapshot 45 GB, two P02M0177 copies of 48 GB each and its two worktrees of 16 GB each,
+    `/data/logs/screen` 14 GB; the journal 217 MB, `/var/log` 1.1 GB (atop 884 MB).
+  - Proposed to the owner, not done: `kernel.panic_on_oops=1` and `kernel.panic=10`, so the VM reboots instead of
+    hanging; the host's own log for machine-check or EDAC errors, or the provider; a memory test (`memtester`) or
+    `debug_pagealloc=on`; and removing the crashed run's snapshot with `release-snapshot.sh remove` before any L3.
+  STATE (2026-10-30): every item implemented; every item verified but A3's L3 figure, which waits for an L3 that ends -
+  on the owner's word, after the crashed run's snapshot is removed and with the host's crashes in mind. P02M0206 stays
+  IN PROGRESS.
