@@ -33,6 +33,8 @@ The rules this ledger carries:
 | `typec-tcpci-riscv64` | 2026-10-20/21 | riscv64 | under load | A different timing step failed in each run: the TCPCI partner's steps are timed for a native target. | Not a flake: it failed again running alone, in the L2 of 2026-10-26 (below). The gate runs alone. |
 | `ipmi` | 2026-10-26/27 | x86_64 | the L2 and a narrowed rehearsal, four guest slots | In the L2 its SSIF boot answered `bmc sensors` with "the BMC is unavailable" (the gate declared no bootable volume then, and gates beside it re-signed that volume); in the rehearsal, with the volume declared, its third development instance reached a shell but its agent never answered within the bring-up's 30 s. It passed alone, with one guest slot. | Open; seen in two runs. The gate runs alone. |
 | `sleep` | 2026-10-26/27 | x86_64 | the L2 and a narrowed rehearsal, four guest slots | In the L2 the instance's console refused a connection at the Ctrl+Z step, after the S3 wakes had passed; in the rehearsal its development instance did not come up. It passed alone, with one guest slot. | Open; seen in two runs. The gate runs alone. |
+| `soft2d-performance` | 2026-10-31 | x86_64 | the third sealed release, running alone | Its `image-convert` scene was over its frozen budget. It passed in the L2 of 2026-10-26. | Open; seen once. |
+| `watchdog`, `typec-ucsi` | 2026-10-29/31 | x86_64 | the second and third sealed releases, four guest slots | The guest reached a shell but its development agent never answered within the bring-up's 30 s, as with `ipmi` and `sleep`; the bring-up's own message was then lost to a second close of the lab's lock descriptor. | Open; `typec-ucsi` seen in two runs, `watchdog` in one. |
 
 Not a flake: the spool test on riscv64 (`spool_service_sends_submitted_jobs_exactly_once`) fails alone, two runs of
 two, on the spool service's own two-second answer bound. It belongs to that service's bound, not to this ledger.
@@ -40,7 +42,9 @@ On aarch64 it passed in the whole suite, three runs of three, and failed in its 
 The cause, found on 2026-10-28, was not the bound: the service judged a printer's answer late when that answer had
 already arrived and waited behind another handle, after the test had let about the answer time pass without running
 the service. Fixed on 2026-10-28 in the spool service and its probe; it passes alone on both ports and in the split
-aarch64 suite.
+aarch64 suite. On 2026-10-31 it failed once more, in a whole riscv64 suite, at its `reset` step ("a job of 1000 bytes
+was refused: Exhausted"): the probe made a job the moment it had closed two, while the service still counted them. A
+race in the probe, fixed the same day; it passes alone on all three targets.
 
 Not a flake: `typec-tcpci-riscv64` ran with nothing beside it in the L2 of 2026-10-26 and failed on "vbus-stays-off:
 detached after 330 ms, before tSrcRecover and tSrcTurnOn (1275 ms) had passed" - the TCPCI partner's timing on an

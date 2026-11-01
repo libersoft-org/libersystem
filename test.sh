@@ -247,6 +247,11 @@ require_no_stray_qemu() {
 				owner="${BASH_REMATCH[1]}"
 			elif [[ "$relative" =~ ^logs/test/(x86_64|aarch64|riscv64)-[0-9]{8}T[0-9]{6}Z-([0-9]+)(-restart[0-9]+)?-(run\.log|guest\.log|usb-audio\.pcap)$ ]]; then
 				owner="${BASH_REMATCH[2]}"
+			elif [[ "$relative" =~ ^boot/(virtio-blk|virtio-console|virtio-serialport|fat-media|iso-media|udf-media|usb-media)-dev-([^/]+)$ ]]; then
+				# ANOTHER DEVELOPMENT STATE'S SET: `qemu-run.sh` names an instance's media and captures after its state
+				# directory (`-dev-<basename>`), so no other run opens them. A gate's private instance beside a test run
+				# had the test refused once steps overlapped (the third sealed release); this run's own set still blocks.
+				[[ -n "${LIBER_DEV_STATE:-}" && "${BASH_REMATCH[2]}" == "$(basename "$LIBER_DEV_STATE")."* ]] || continue
 			else
 				case "$relative" in
 				boot/esp-x86_64.*.img | boot/esp-aarch64.*.img | boot/esp-riscv64.*.img | boot/ovmf-vars.*.fd | boot/aavmf-vars.*.fd | boot/virtio-console*.out | boot/virtio-serialport*.out | \

@@ -1385,3 +1385,84 @@ The end-of-job runs (2026-10-26/27/28)
   the four other worktrees untouched, `/data` from 55 to 100 GB free; "Až po kontrole hostitele" - no L3 is started
   until the owner has had the host checked and says so. The plan's OPEN and status say the same. P02M0206 stays IN
   PROGRESS for A3's L3 figure alone.
+  THE HOST CHECK, left to the implementer by the owner (2026-10-30: "to bys mel asi zkontrolovat ty"): the VM cannot see
+  its physical host, so what it can check was checked. `memtester 8G 1` twenty times side by side (160 of 251 GB,
+  `/root/memtest`, under `systemd-run --scope -p MemoryMax=170G`): all 20 finished their loop with no failure, in 77
+  minutes. `apt-get update` then `apt-cache policy linux-image-amd64`: 6.12.113-1 is the newest. No oops, lockup or
+  segfault in the kernel log since the reset of 2026-10-30 03:41 CET. That rules out plainly bad memory, not an
+  intermittent fault below the VM.
+  THE THIRD L3 (2026-10-30 23:32:03Z - 2026-10-31 07:45:51Z, at 23df6e6a, `/root/p0206-l3/run.sh` with the disk watcher;
+  the second run's files moved to `/root/p0206-l3/second`):
+  - "estimate: 374 step(s), 76958 s of priced steps (355 priced under an older model, 1 never measured); no schedule
+    over 4 slot(s) finishes in under 20730 s (5.8 h)".
+  - IT ENDED: RESULT failed exit=1 in 29,628 s; "measured: 29523 s wall clock over 4 guest slot(s); the steps took
+    66267 s between them"; 21 steps failed, 4 BLOCKED; the dossier `incomplete`. The host did not crash.
+  - THE BUILD FROM NOTHING: the 21 build steps all passed, 3,264 s of step time; the last build step's log was written
+    at 00:32:20Z, 60 minutes after the run started (run id 20261030T233244Z).
+  - THE SIZE: "the sealed build's size is not recorded - 4 step(s) were blocked and 0 skipped" - the rule of
+    2026-10-29 counted any blocked step, and the riscv64 suite's failure blocked the three test-kernel readers and
+    `capability-trace`. So a second watcher (`/root/p0206-l3/size.sh`, started at 03:50Z when the four blocked steps
+    were seen) sampled `du -sb` of the snapshot's `.build` each minute: 50,236,422,147 bytes at its largest (04:22:52Z),
+    48,150,596,434 at 07:44:21Z after the last step, 47,714,685,717 at 07:45:21Z, the last sample before the snapshot
+    was removed. The disk watcher's lowest free figure on `/data` was 57.8 GB.
+  - So A3's L3 figure is measured by a sealed run that ended: the build from nothing 3,264 s of steps and 60 minutes of
+    wall clock; its `.build` 47.7 GB at the end, 50.2 GB at its largest. `.build/state/release-build-size` was written
+    by hand with the largest (50,236,422,147), which is the room the next L3 is checked against; the run would have
+    written its end size had the rule been right.
+  - The first guest step, the aarch64 suite, started at 23:54:08Z, 21 minutes in (its guest log's name), where it
+    waited 79 minutes in the L2: the class-7 fix holds in a real run.
+  - Failed: the code defects already under OPEN (`arch-profile-{aarch64,riscv64}-no-dt-absent-1`, the three IOMMU
+    hostile and transition profiles, `system-suspend-riscv64`, `tickless-idle`, `qemu-pcie-hotplug`); the second L3's
+    `boot-harness`, `verify-evidence`, `implementation-mutations`, `dynamic-report`, `boot-volume-controllers-aarch64`,
+    `bluetooth-independent`, `typec-ucsi` and the development lifecycle; and new: `soft2d-performance` ("image-convert
+    ... OVER", "a scene is over its frozen budget"), `watchdog` (the development agent never answered, then "Bad file
+    descriptor"), `bluetooth-input` ("bt-fixture did not bind (iommu-required)"), `qemu-modem-service` and the riscv64
+    suite - the last two fixed below.
+  THREE FIXES AFTER IT (2026-10-31, the run over, nothing else running):
+  - `verify.sh` `release_finish`: the size is recorded unless a BUILD step (`build:*`) failed or was blocked. Exercised
+    on fake runs (the rule's lines run under `bash -euo pipefail`): a failed suite and a blocked reader - 0 unbuilt; a
+    blocked build - 1. `shfmt -d` clean.
+  - `src/user/services/core/src/spool_probe.rs`: the riscv64 suite failed on "spool-probe: FAIL reset: a job of 1000
+    bytes was refused: Exhausted" - the reset step closed its two jobs and made a third at once, while the service still
+    counted the closed ones against the grant context's two (the step dates from 2026-09-24). `Probe::admitted` waits
+    out `Exhausted` under a 200-tick deadline, as the inventory step's own loop does, and `send`'s staging and submit
+    are `Probe::submitted`, which the reset step now uses on the admitted job. It is a race, not watched failing on
+    demand: the failure is the L3's own log. Then `./build.sh --arch A` and `TEST_SELECTION=kernel.services.
+    spool_service_sends_submitted_jobs_exactly_once ./test.sh --arch A`: x86_64 PASS (26 s), riscv64 PASS (55 s),
+    aarch64 PASS (54 s); the builds RESULT ok (298, 276 and 296 s).
+  - `test.sh`'s guard against stray guests: `qemu-modem-service` failed in one second on "a qemu-system-x86_64 already
+    holds this tree's disk images: 1878728 (.../boot/virtio-serialport-dev-liber-tcpci.0KM44w.1878728.out)" - the
+    typec-tcpci gate's private development instance, whose files `qemu-run.sh` names after its state directory
+    (`-dev-$(basename "$LIBER_DEV_STATE")`, a `mktemp` name with a dot), which no pattern of the guard knew. Steps that
+    ran one after another never met it; overlap did. Another state's set (`boot/{virtio-blk,virtio-console,
+    virtio-serialport,fat-media,iso-media,udf-media,usb-media}-dev-*`) is admitted now; the run's own state's set still
+    refuses. `check-guest-verdict.py` `test_another_development_states_set_is_admitted_and_its_own_is_not`, five names:
+    before the fix all five refused ("23 != 0"); after it the module's 115 tests pass. A real `./test.sh --arch x86_64`
+    selection passed (32 s).
+  - Gates: `./check.sh --gate spool-service,verify-scheduler` RESULT ok (383 s); `--gate dynamic-report,
+    dynamic-report-regressions` RESULT ok (430 s), "41 checks passed"; `--gate guest-verdict` RESULT ok (132 s).
+    `./format.sh --changed`: nothing to change.
+  THE PLAN, TODO AND LEDGER: A3 checked with the third L3's text; the status line COMPLETE (2026-10-31); OPEN has the
+  third L3's findings, the three fixed here and the rest for milestones of their own; TODO's line `[x]` COMPLETE;
+  `docs/verification/FLAKES.md` has `soft2d-performance`, `watchdog` and `typec-ucsi` and the spool test's reset race.
+  NOT PERFORMED: another L3 after these three fixes (none of them changes the build from nothing that A3 measures);
+  the spool test in a whole riscv64 suite after the fix; `--merge` of the L1 (it needs a commit, the owner's).
+  FINAL STATE (2026-10-31): every item of P02M0206 implemented and verified, A3 included; the milestone COMPLETE. The
+  working tree holds, uncommitted: `verify.sh`, `test.sh`, `src/tools/check-guest-verdict.py`,
+  `src/user/services/core/src/spool_probe.rs`, the plan, TODO, the ledger and this record.
+  THE SIZE RULE, HELD TO A RUN (2026-10-31, after the record above): A1 says the first sealed run "records its size for
+  the next", and the third L3 did not; the fixed rule had been exercised only on its own lines. `src/tools/
+  check-verify-scheduler.sh` case 13: a committed fixture tree (`git init` in the gate's temporary directory), released
+  sealed by the real `verify.sh --release` over a real `release-snapshot.sh` snapshot, with a prepared plan of a build
+  step, a suite that fails and a reader the suite blocks - "a sealed release whose suite failed and blocked a reader
+  still records its build's size", "and says so"; and with the build step failing - "one whose build failed records
+  none", "and says why". The fixture needed `.build/state`, which the tree always has. Watched: with `release_finish`'s
+  condition put back to the old one (any blocked or skipped step) the gate failed on the first two checks
+  ("expected '1', got '0'") and `verify.sh` was restored from a copy (`cmp`); with the fix `./check.sh --gate
+  verify-scheduler` RESULT ok (345 s). `shfmt -d` clean.
+  VERIFICATION in the plan has the L3 beside the L2: 21 failed and 4 blocked against 20 and 1; two of the L2's seven
+  harness failures (`implementation-mutations`, `boot-volume-controllers-aarch64`) failed again sealed and pass in the
+  tree (OPEN). The plan's VERIFICATION asks for one L2 with its failures set beside the baseline, which is recorded,
+  and for A3's account, which now has the L3 figure; it does not ask an L3 to pass.
+  FINAL STATE (2026-10-31, after this): unchanged - P02M0206 COMPLETE; the working tree also holds
+  `src/tools/check-verify-scheduler.sh`.

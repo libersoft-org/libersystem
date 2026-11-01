@@ -622,6 +622,42 @@ rc=0
 (cd "$release" && ./verify.sh --level L4) >"$release/l4.log" 2>&1 || rc=$?
 check "a level that is not one is refused" 1 "$(grep -c "is L0, L1, L2 or L3, not 'L4'" "$release/l4.log" || true)"
 
+# 13. A SEALED RELEASE RECORDS ITS BUILD'S SIZE FOR THE NEXT L3 unless a build step failed or was blocked. A suite that
+#     fails blocks the steps that read its test kernel and builds nothing, and the third L3 lost its record to that.
+#     A committed fixture tree, released over a real snapshot of it.
+sealed="$work/sealed"
+mkdir -p "$sealed/src/tools/verify-model" "$work/sealed-bin"
+cp "$repo/verify.sh" "$repo/lib.sh" "$sealed/"
+cp "$repo/src/tools/result-logs.sh" "$repo/src/tools/evidence.sh" "$repo/src/tools/staging-state.sh" "$repo/src/tools/release-snapshot.sh" "$sealed/src/tools/"
+: >"$sealed/src/tools/verify-model/Cargo.toml"
+: >"$sealed/toolchain.lock"
+printf '%s\n' '/.build/' '/run*/' '/*.log' '/calls' '/plan*' >"$sealed/.gitignore"
+cp "$release/bin/cargo" "$work/sealed-bin/cargo"
+git -C "$sealed" init -q
+git -C "$sealed" add -A
+git -C "$sealed" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
+sealed_release() {
+	local name="$1" build_command="$2"
+	{
+		printf 'STATUS\tfull\tprepared\n'
+		printf 'STEP\t0\t1\tbuild x86_64 sdk\t%s\t\n' "$build_command"
+		printf 'STEPID\t0\tbuild:x86_64:sdk\nSTEPCOST\t0\t1\nSTEPGUESTS\t0\t0\nKEY\t0\tbuild.sdk / x86_64 / host / shared-image\n'
+		printf 'STEP\t1\t1\tkernel suite x86_64 (whole)\tfalse\t\n'
+		printf 'STEPID\t1\tguest:x86_64:all\nSTEPREQ\t1\tbuild:x86_64:sdk\nSTEPCOST\t1\t1\nSTEPGUESTS\t1\t0\nKEY\t1\tsuite.kernel / x86_64 / test-guest / test\n'
+		printf 'STEP\t2\t1\thost suite verify-model (default)\ttrue\t\n'
+		printf 'STEPID\t2\thost:verify-model:default\nSTEPREQ\t2\tguest:x86_64:all\nSTEPCOST\t2\t1\nSTEPGUESTS\t2\t0\nKEY\t2\thost.verify-model / host / host / default\n'
+	} >"$sealed/plan-$name"
+	mkdir -p "$sealed/.build/state"
+	rm -f "$sealed/.build/state/release-build-size"
+	(cd "$sealed" && PATH="$work/sealed-bin:$PATH" CARGO_CALLS="$sealed/calls" RELEASE_RUN="$sealed/run-$name" LIBER_VERIFY_STEPS="$sealed/plan-$name" ./verify.sh --release --jobs 1) >"$sealed/$name.log" 2>&1 || true
+}
+sealed_release suite-failed true
+check "a sealed release whose suite failed and blocked a reader still records its build's size" 1 "$([[ -s "$sealed/.build/state/release-build-size" ]] && echo 1 || echo 0)"
+check "and says so" 1 "$(grep -c 'release: the sealed build from nothing took' "$sealed/suite-failed.log" || true)"
+sealed_release build-failed false
+check "one whose build failed records none" 0 "$([[ -e "$sealed/.build/state/release-build-size" ]] && echo 1 || echo 0)"
+check "and says why" 1 "$(grep -c '1 build step(s) failed or were blocked' "$sealed/build-failed.log" || true)"
+
 if ((failed != 0)); then
 	echo "verify-scheduler: the shell scheduler did not behave as the milestone requires" >&2
 	exit 1

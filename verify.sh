@@ -520,11 +520,18 @@ release_finish() {
 	chmod -R a-w "$release_run_dir" 2>/dev/null || true
 	note "release: dossier $release_run_dir/dossier.md (state: ${state:-not rendered})"
 	# A SEALED BUILD'S SIZE, for the next L3's check: the snapshot's `.build`, built from nothing by this run - and
-	# only when every step ran. A failed build blocks what reads it, and the first L3 recorded 25.6 GB from a build
-	# that never built two of its three targets, less than the room a whole one needs.
+	# only when every build step passed. The first L3 recorded 25.6 GB from a build that never built two of its three
+	# targets, less than the room a whole one needs. A step blocked by anything else - a failed suite blocks the steps
+	# that read its test kernel - builds nothing, so it does not stop the record: the third L3 lost its for that.
+	local id unbuilt=0
+	for id in "${step_ids[@]}"; do
+		if [[ "$id" == build:* && (-n "${failed_ids[$id]:-}" || -n "${blocked_ids[$id]:-}") ]]; then
+			unbuilt=$((unbuilt + 1))
+		fi
+	done
 	if [[ "$release_snapshot" != "$release_main_root" && -d "$release_snapshot/.build" ]]; then
-		if ((${#blocked[@]} > 0 || ${#skipped[@]} > 0)); then
-			note "release: the sealed build's size is not recorded - ${#blocked[@]} step(s) were blocked and ${#skipped[@]} skipped, so it did not build everything"
+		if ((unbuilt > 0)); then
+			note "release: the sealed build's size is not recorded - $unbuilt build step(s) failed or were blocked, so it did not build everything"
 		else
 			du -sb "$release_snapshot/.build" | cut -f1 >"$release_main_root/.build/state/release-build-size"
 			note "release: the sealed build from nothing took $(<"$release_main_root/.build/state/release-build-size") bytes"

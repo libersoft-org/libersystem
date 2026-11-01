@@ -145,15 +145,33 @@ impl Probe {
 		}
 	}
 
+	// A job made after jobs were just closed: a closed job's record counts against the grant context's two until the
+	// service has read the close, so `Exhausted` is waited out, under a deadline.
+	fn admitted(&self, printer: &PrinterId, length: u32) -> u64 {
+		let deadline = clock() + 200;
+		loop {
+			match self.create(printer, length) {
+				Ok(job) => return job,
+				Err(Error::Exhausted) if clock() < deadline => sleep_until(clock() + 2),
+				Err(error) => self.fail(&format!("a job of {length} bytes was refused: {error:?}")),
+			}
+		}
+	}
+
 	// One whole document, created, staged and submitted.
 	fn send(&self, printer: &PrinterId, seed: u8, length: usize) -> u64 {
 		let job = self.created(printer, length as u32);
+		self.submitted(job, seed, length);
+		job
+	}
+
+	// A made job's whole document, staged and submitted.
+	fn submitted(&self, job: u64, seed: u8, length: usize) {
 		self.stage(job, &document(seed, length));
 		let submitted = self.submit(job);
 		if submitted.state == JobState::Writing || submitted.staged != length as u32 {
 			self.fail(&format!("a submitted job did not leave writing: {submitted:?}"));
 		}
-		job
 	}
 }
 
@@ -398,7 +416,10 @@ fn reset(probe: &Probe) -> ! {
 	if !matches!(probe.create(&alpha.id, 10), Err(Error::Stale)) {
 		probe.fail("the old attachment was admitted after the reset");
 	}
-	let fresh = probe.send(&back.id, 14, 1_000);
+	// THE TWO JOBS JUST CLOSED STILL COUNT until the service has read their closes, so the next one waits for their
+	// release. Made at once, it was refused with `Exhausted` in a whole riscv64 suite.
+	let fresh = probe.admitted(&back.id, 1_000);
+	probe.submitted(fresh, 14, 1_000);
 	probe.transferred(fresh, 1_000);
 	pass("reset", "")
 }

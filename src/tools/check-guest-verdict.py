@@ -118,7 +118,7 @@ class GuestVerdicts(unittest.TestCase):
 class ExistingQemuAdmission(unittest.TestCase):
     """The real guard inspects real open FDs; discovery names only this fixture."""
 
-    def exercise(self, paths, child=False, mutation=None):
+    def exercise(self, paths, child=False, mutation=None, env=None):
         import re
         source = (ROOT / "test.sh").read_text()
         match = re.search(r"^require_no_stray_qemu\(\) \{\n.*?^\}\n", source, re.M | re.S)
@@ -156,7 +156,7 @@ die() { printf '%s\n' "$*" >&2; exit 23; }
 note() { printf '%s\n' "$*" >&2; }
 ''' + guard + '\nrequire_no_stray_qemu aarch64\n'
                 result = subprocess.run(["bash", "-c", script],
-                                        env=dict(os.environ, BUILD_DIR=str(root), FIXTURE_PID=str(pid)),
+                                        env=dict({key: value for key, value in os.environ.items() if key != "LIBER_DEV_STATE"}, BUILD_DIR=str(root), FIXTURE_PID=str(pid), **(env or {})),
                                         capture_output=True, text=True, timeout=5)
                 if result.returncode:
                     self.assertEqual(result.returncode, 23, result.stderr)
@@ -220,6 +220,23 @@ note() { printf '%s\n' "$*" >&2; }
         for name in self.PRIVATE_SCRATCH:
             with self.subTest(path=name):
                 self.assertNotEqual(self.exercise([(name.replace("{owner}", "{wrong_owner}"), True)]), 0)
+
+    # ANOTHER DEVELOPMENT STATE'S SET, named after its state directory (`-dev-<basename>`): a gate's private instance
+    # holds them, and no other run opens them. Refused, a test run beside such a gate failed once steps overlapped (the
+    # third sealed release, 2026-10-31). The run's own state's set still refuses.
+    DEV_STATE_SET = (
+        "boot/virtio-serialport-dev-liber-tcpci.0KM44w.{owner}.out",
+        "boot/virtio-console-dev-liber-tcpci.0KM44w.{owner}.out",
+        "boot/virtio-blk-dev-liber-tcpci.0KM44w.img",
+        "boot/usb-media-dev-liber-tcpci.0KM44w.{key}.img",
+        "boot/fat-media-dev-liber-tcpci.0KM44w.{key}.img",
+    )
+
+    def test_another_development_states_set_is_admitted_and_its_own_is_not(self):
+        for name in self.DEV_STATE_SET:
+            with self.subTest(path=name):
+                self.assertEqual(self.exercise([(name, True)]), 0)
+                self.assertNotEqual(self.exercise([(name, True)], env={"LIBER_DEV_STATE": "/tmp/liber-tcpci.0KM44w"}), 0)
 
     def test_actual_read_only_shared_descriptors_are_safe(self):
         paths = [(name, False) for name in (
