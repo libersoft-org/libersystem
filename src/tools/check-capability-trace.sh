@@ -58,11 +58,27 @@ require_live=0
 # with a perfectly good trace in the log before it had none. What the milestone needs is a trace from
 # a kernel built from THESE sources, so the log is chosen for containing one and checked for being
 # newer than the kernel it must correspond to.
+#
+# INSIDE A RUN, THE TRACE THIS RUN'S SUITE KEPT. A release relinks the x86_64 kernel after its suite has run - an image
+# producer, a switch into the development profile - so in every release the tree's newest trace was older than the
+# kernel beside it however fresh it was: the sealed releases of 2026-10-29 and 2026-11-01 failed this gate on exactly
+# that. The suite boots its own copy of the TEST kernel, which that file is not, and a run's tree is fixed for the
+# run's life, so a log the run kept is a trace of these sources and is not held to the file's age.
 shopt -s nullglob
 logs=(.build/logs/test/x86_64-*-guest.log)
+kept=()
+[[ -z "${LIBER_VERIFY_RUN:-}" || ! -d "${LIBER_VERIFY_RUN:-}/logs" ]] || kept=("$LIBER_VERIFY_RUN"/logs/*/x86_64-*-guest.log)
 shopt -u nullglob
 latest=""
-if ((${#logs[@]})); then
+from_run=0
+if ((${#kept[@]})); then
+	# By the name, which carries the time the log was started, whichever key's directory keeps it.
+	readarray -t kept < <(printf '%s\n' "${kept[@]}" | awk -F/ '{print $NF "\t" $0}' | sort | cut -f2)
+	for candidate in "${kept[@]}"; do
+		grep -q "captrace: begin" "$candidate" && latest="$candidate" && from_run=1
+	done
+fi
+if [[ -z "$latest" ]] && ((${#logs[@]})); then
 	readarray -t logs < <(printf '%s\n' "${logs[@]}" | sort)
 	for candidate in "${logs[@]}"; do
 		grep -q "captrace: begin" "$candidate" && latest="$candidate"
@@ -79,7 +95,7 @@ fi
 # AND IT IS NOT OLDER THAN THE KERNEL. A trace from a kernel that has since been rebuilt is evidence
 # about a system that is no longer here, which is the same failure as no evidence dressed as some.
 kernel=".build/cargo/kernel/x86_64-unknown-none/debug/kernel"
-if [[ -f "$kernel" && "$kernel" -nt "$latest" ]]; then
+if ((from_run == 0)) && [[ -f "$kernel" && "$kernel" -nt "$latest" ]]; then
 	if ((require_live)); then
 		fail "the newest x86_64 trace is older than the kernel beside it - it is evidence about a kernel that has been rebuilt since. Run ./test.sh"
 	fi

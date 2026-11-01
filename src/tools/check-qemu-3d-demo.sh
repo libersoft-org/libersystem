@@ -100,7 +100,9 @@ if ! "$REPO_ROOT/lab.sh" sh uname >/dev/null 2>&1; then
 		VNC_DIR="$(mktemp -d /tmp/liber-3d-vnc.XXXXXX)"
 		printf '%s\n' "$VNC_DIR/display.sock" >"$FRAMES_DIR/vnc-endpoint.log"
 		boot_status=0
-		SMP=32 VNC_ADDR="unix:$VNC_DIR/display.sock" "$REPO_ROOT/lab.sh" boot --vnc >/dev/null || boot_status=$?
+		# IN THE DEVELOPMENT PROFILE THIS GATE DECLARES: `lab.sh boot` builds in its caller's, which under `verify.sh` is the
+		# shipping one - and rebuilt the shared staging under the development steps running beside it (2026-11-01).
+		LIBER_DEVELOPMENT=1 SMP=32 VNC_ADDR="unix:$VNC_DIR/display.sock" "$REPO_ROOT/lab.sh" boot --vnc >/dev/null || boot_status=$?
 		if python3 "$RESIZE" --socket "$VNC_DIR/display.sock" --owner-state "$LAB_STATE" >"$FRAMES_DIR/owned-guest.json" 2>"$FRAMES_DIR/owned-guest.log"; then
 			BOOTED=1
 			mkdir -p "$FRAMES_DIR/owned-state"
@@ -108,7 +110,7 @@ if ! "$REPO_ROOT/lab.sh" sh uname >/dev/null 2>&1; then
 		fi
 		((boot_status == 0 && BOOTED == 1)) || die "the guest did not boot with this invocation's proven private VNC ownership"
 	else
-		SMP=32 "$REPO_ROOT/lab.sh" boot >/dev/null || die "the guest did not boot"
+		LIBER_DEVELOPMENT=1 SMP=32 "$REPO_ROOT/lab.sh" boot >/dev/null || die "the guest did not boot"
 		BOOTED=1
 	fi
 elif [[ "$phase" == core ]]; then

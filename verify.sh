@@ -143,6 +143,21 @@ release_run_dir=""
 release_rehearsal=""
 release_clean_head=""
 release_main_root="$REPO_ROOT"
+release_free_start=""
+release_free_low=""
+release_room_watcher=""
+# WHERE A SEALED RELEASE'S SNAPSHOT OF REVISION LIVES: beside the repository, hidden, under a name as long as the
+# repository's own (`.r` and the revision's first digits), so every path in the snapshot is exactly as long as the same
+# path in the tree. A UNIX socket path has 107 bytes. Under `.build/release/<12 digits>` every path was 27 bytes longer,
+# and the sockets a nested tree or a log directory holds - the mutations' copy of the tree, the Bluetooth PAN's -
+# passed the limit in the sealed release of 2026-11-01 and nowhere else. (A name shorter than nine characters keeps
+# seven digits, and its snapshot's paths are that much longer than the tree's.)
+release_snapshot_path() {
+	local base="${release_main_root##*/}" digits
+	digits=$((${#base} - 2))
+	((digits >= 7)) || digits=7
+	echo "${release_main_root%/*}/.r${1:0:digits}"
+}
 level=""
 level_base=""
 inner_level=""
@@ -325,12 +340,11 @@ L3)
 	[[ "$mode" == for-change && -z "$merge_file" && "$release_in_place" == 0 ]] || die "--level L3 is the release over a sealed snapshot, and takes no change mode"
 	mode=release
 	# ROOM FOR A BUILD FROM NOTHING, checked before it starts: the snapshot's `.build` starts empty, and the size the
-	# last sealed build took is what this one needs.
+	# last sealed build took is what this one needs - where the snapshot will be, beside the repository.
 	if [[ -f "$RELEASE_BUILD_SIZE" ]]; then
 		needed="$(<"$RELEASE_BUILD_SIZE")"
-		mkdir -p "$BUILD_DIR"
-		available="$(df --output=avail -B1 "$BUILD_DIR" | tail -1 | tr -d ' ')"
-		((available >= needed)) || die "L3 refused: the last sealed build took $needed bytes and $BUILD_DIR has $available free"
+		available="$(df --output=avail -B1 "${release_main_root%/*}" | tail -1 | tr -d ' ')"
+		((available >= needed)) || die "L3 refused: the last sealed build took $needed bytes and ${release_main_root%/*} has $available free"
 		note "L3: $available bytes free, and the last sealed build took $needed"
 	else
 		note "L3: no sealed build has been measured yet - this one starts with the room there is and records its size"
@@ -428,13 +442,16 @@ fi
 #                    stale, altered or duplicated, and the tree compared against the identity it
 #                    started with; the run directory is then made read-only
 release_cleanup() {
+	[[ -z "$release_room_watcher" ]] || kill "$release_room_watcher" 2>/dev/null || true
+	[[ -z "$release_free_low" ]] || rm -f "$release_free_low"
 	if [[ -n "$release_snapshot" && "$release_snapshot" != "$release_main_root" ]]; then
 		(cd "$release_main_root" && src/tools/release-snapshot.sh remove "$release_snapshot")
 	fi
 }
 # THE PREPARED THIRD-PARTY INPUTS come from this tree. A person prepares them once - `bootstrap.sh` fetches the caches
-# `toolchain.lock` pins, and `prepare-bluetooth-oracles.py` the pinned codec archives and the radio peers' environment,
-# which only the network can install - and the gates read them offline, against their pins. A snapshot's `.build`
+# `toolchain.lock` pins, `prepare-bluetooth-oracles.py` the pinned codec archives and the radio peers' environment,
+# which only the network can install, and `build-aavmf-ahci.sh` aarch64's AHCI firmware - and the gates read them
+# offline, against their pins. A snapshot's `.build`
 # starts empty and a release fetches nothing, so every gate that reads them failed in a sealed release.
 release_seed_prepared() {
 	local cache
@@ -447,9 +464,33 @@ release_seed_prepared() {
 		mkdir -p "$release_snapshot/.build"
 		cp -a "$release_main_root/.build/bluetooth-oracles" "$release_snapshot/.build/"
 	fi
+	# AND THE AARCH64 FIRMWARE THAT DRIVES AN AHCI DISK, which `build-aavmf-ahci.sh` builds from Debian's edk2 source
+	# package, fetched once: in the sealed release of 2026-11-01 `boot-volume-controllers-aarch64` refused without it.
+	# Only the two flash images; the source tree beside them is the build's own.
+	local image
+	for image in AAVMF_CODE.ahci.fd AAVMF_VARS.ahci.fd; do
+		[[ -f "$release_main_root/.build/firmware/$image" ]] || continue
+		mkdir -p "$release_snapshot/.build/firmware"
+		cp -p --sparse=always "$release_main_root/.build/firmware/$image" "$release_snapshot/.build/firmware/$image"
+	done
+}
+# THE ROOM A SEALED RUN TOOK AT ITS FULLEST, for the next L3's check. The snapshot's `.build` at the end is not it:
+# guests' images and builds' temporary files come and go while the run goes - the fourth L3 ended with 47.7 GB in its
+# `.build` and had taken 48.8 GB of the disk at its fullest. `df` answers at once, so the free space is sampled every
+# two seconds, on the filesystem the snapshot is on, until the run ends (or the shell that started the sampling is
+# gone), and the lowest is kept in FILE.
+release_watch_room() {
+	local file="$1" parent="$2" where="$3" low free
+	low="$(<"$file")"
+	while kill -0 "$parent" 2>/dev/null && sleep 2; do
+		free="$(df --output=avail -B1 "$where" 2>/dev/null | tail -1 | tr -d ' ')" || continue
+		[[ "$free" =~ ^[0-9]+$ ]] && ((free < low)) || continue
+		low="$free"
+		echo "$low" >"$file.tmp" && mv -f "$file.tmp" "$file"
+	done
 }
 release_prepare() {
-	local revision out_root="${release_out_root:-$release_main_root/.build/runs}"
+	local revision snapshot out_root="${release_out_root:-$release_main_root/.build/runs}"
 	[[ "$out_root" == /* ]] || out_root="$PWD/$out_root"
 	if ((release_in_place == 1)); then
 		release_snapshot="$release_main_root"
@@ -458,12 +499,22 @@ release_prepare() {
 	else
 		[[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "the working tree is dirty; a release is cut from a revision, not from a desk (--in-place rehearses the release path over this tree and never produces a release)"
 		revision="$(git rev-parse HEAD)"
-		# NAMED BY A SHORT REVISION: the guests' UNIX sockets live under the snapshot's `.build` (the longest,
-		# `.build/boot/dev-channel-riscv64-test.PID.sock`, is 50 bytes past the root), and a socket path has 107 bytes.
-		# Under the full 40-digit revision every port's guest failed to start in a sealed release.
-		release_snapshot="$BUILD_DIR/release/${revision:0:12}"
-		[[ "$out_root" != "$release_snapshot"* ]] || die "--out-root must be OUTSIDE the snapshot, which is removed when the run ends"
+		snapshot="$(release_snapshot_path "$revision")"
+		[[ "$out_root" != "$snapshot"* ]] || die "--out-root must be OUTSIDE the snapshot, which is removed when the run ends"
+		# NOTHING OF ANYONE ELSE'S IS REPLACED: the snapshot lives beside the repository, and `create` replaces what is at
+		# its path - so only a worktree of this repository may be there. Named the run's own only after this, so no
+		# cleanup can remove what it found.
+		if [[ -e "$snapshot" ]] && ! git worktree list --porcelain | grep -qxF "worktree $snapshot"; then
+			die "$snapshot exists and is not a worktree of this repository - it is not replaced; move it away"
+		fi
+		release_snapshot="$snapshot"
 		note "release snapshot: $revision at $release_snapshot"
+		mkdir -p "$release_main_root/.build/state"
+		release_free_start="$(df --output=avail -B1 "${release_snapshot%/*}" | tail -1 | tr -d ' ')"
+		release_free_low="$release_main_root/.build/state/release-free-low.$$"
+		echo "$release_free_start" >"$release_free_low"
+		release_watch_room "$release_free_low" "$$" "${release_snapshot%/*}" </dev/null >/dev/null 2>&1 &
+		release_room_watcher=$!
 		src/tools/release-snapshot.sh create "$release_snapshot" "$revision" >/dev/null || die "could not create the snapshot"
 		# REGISTERED THE MOMENT THE SNAPSHOT EXISTS, so a failure between here and the rest of the
 		# release setup still removes it.
@@ -519,11 +570,12 @@ release_finish() {
 	# or incomplete run keeps its evidence with its state rather than losing it with the snapshot.
 	chmod -R a-w "$release_run_dir" 2>/dev/null || true
 	note "release: dossier $release_run_dir/dossier.md (state: ${state:-not rendered})"
-	# A SEALED BUILD'S SIZE, for the next L3's check: the snapshot's `.build`, built from nothing by this run - and
-	# only when every build step passed. The first L3 recorded 25.6 GB from a build that never built two of its three
-	# targets, less than the room a whole one needs. A step blocked by anything else - a failed suite blocks the steps
-	# that read its test kernel - builds nothing, so it does not stop the record: the third L3 lost its for that.
-	local id unbuilt=0
+	# A SEALED BUILD'S SIZE, for the next L3's check: the snapshot's `.build`, built from nothing by this run, or the room
+	# the run took of the disk at its fullest when that is more (`release_watch_room`) - and only when every build step
+	# passed. The first L3 recorded 25.6 GB from a build that never built two of its three targets, less than the room a
+	# whole one needs. A step blocked by anything else - a failed suite blocks the steps that read its test kernel -
+	# builds nothing, so it does not stop the record: the third L3 lost its for that.
+	local id unbuilt=0 sealed taken=0 needed
 	for id in "${step_ids[@]}"; do
 		if [[ "$id" == build:* && (-n "${failed_ids[$id]:-}" || -n "${blocked_ids[$id]:-}") ]]; then
 			unbuilt=$((unbuilt + 1))
@@ -533,8 +585,12 @@ release_finish() {
 		if ((unbuilt > 0)); then
 			note "release: the sealed build's size is not recorded - $unbuilt build step(s) failed or were blocked, so it did not build everything"
 		else
-			du -sb "$release_snapshot/.build" | cut -f1 >"$release_main_root/.build/state/release-build-size"
-			note "release: the sealed build from nothing took $(<"$release_main_root/.build/state/release-build-size") bytes"
+			[[ -z "$release_room_watcher" ]] || kill "$release_room_watcher" 2>/dev/null || true
+			[[ -z "$release_free_low" || ! -s "$release_free_low" ]] || taken=$((release_free_start - $(<"$release_free_low")))
+			sealed="$(du -sb "$release_snapshot/.build" | cut -f1)"
+			needed=$((taken > sealed ? taken : sealed))
+			echo "$needed" >"$release_main_root/.build/state/release-build-size"
+			note "release: the sealed build from nothing took $sealed bytes, and the run $taken bytes of the disk at its fullest - $needed recorded for the next L3"
 		fi
 	fi
 	if ((failures > 0 || status != 0)); then

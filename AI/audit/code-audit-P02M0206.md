@@ -1466,3 +1466,166 @@ The end-of-job runs (2026-10-26/27/28)
   and for A3's account, which now has the L3 figure; it does not ask an L3 to pass.
   FINAL STATE (2026-10-31, after this): unchanged - P02M0206 COMPLETE; the working tree also holds
   `src/tools/check-verify-scheduler.sh`.
+
+IMPLEMENTER'S FOURTH L3 AND WHAT IT FOUND ON P02M0206 (2026-11-01, appended; nothing above is changed)
+  THE RUN: `./verify.sh --level L3` at 0399f460, the committed tree that closed the milestone, started on the owner's
+  word ("Commitnul jsem, spusť L3") at 01:28:25Z under `/root/p0206-l3/run.sh`, with the disk watcher (stop below
+  10 GiB) and the `.build` sampler beside it; it ended at 10:26:33Z, exit 1, 32,288 s.
+  - The room check ran for the first time: "L3: 105852293120 bytes free, and the last sealed build took 50236422147".
+  - The build from nothing: 21 build steps, all passed, 3,326 s between them, the last ending 61 minutes in (the
+    history's `last_run`); the aarch64 suite started 22 minutes in.
+  - "measured: 32184 s wall clock over 4 guest slot(s); the steps took 68765 s between them"; the estimate was
+    75,659 s of priced steps and a floor of 20,666 s.
+  - The run recorded its size itself: "release: the sealed build from nothing took 47733479018 bytes". The sampler saw
+    the same `.build` reach 50,657,664,712 bytes (06:27:50Z), and the disk watcher saw /data's free space fall to
+    57,072,873,472 at 07:13:15Z, 48,779,419,648 below the 105,852,293,120 free at the start.
+  - 21 steps failed, none was blocked; the dossier "incomplete - 378 row(s), 378 required key(s), 25 refusal(s)".
+  WHAT IT VERIFIED OF THE THIRD L3'S FIXES: the riscv64 suite passed (the spool probe's reset); `qemu-modem-service`
+  passed beside development instances (the guard); the run wrote its size without a hand; nothing was blocked.
+  AGAINST THE THIRD L3: gone `bluetooth-input`, the riscv64 suite, `qemu-modem-service`, `soft2d-performance`; new
+  `capability-trace` (blocked in the third), `brightness-acpi`, `hibernate`, `targeted-cache`.
+  WHAT ITS LOGS SHOW, step by step (the run's kept logs; the snapshot's own logs went with it):
+  - `watchdog`, `typec-ucsi`, the development lifecycle: each instance's serial log has "dma: claim of
+    virtio-console at 00:1e.0 under entry `dev_channel` REFUSED - the named entry is not one this image declares" and
+    "DeviceManager: dev-channel did not bind (iommu-required)"; the L2's lifecycle log has "bind window dev_channel = 61
+    tick(s)" and no refusal, the third L3's has the same refusal. The kernel's DMA registry carries `dev_channel` only
+    when built with `LIBER_DEVELOPMENT=1` (`src/kernel/build.rs`), so these instances booted a shipping kernel. The
+    three booted one image (sha256 218e2349...), a `mkimage` cache hit whose key covers the kernel and the volume, so
+    the shipping kernel was in the shared staging when that image's inputs were snapshotted. Who put it there: the
+    runner's own lines in the development group - "needs stage:x86_64 in 'development', and it is in 'no recorded
+    state'" (parts in two profiles) and a volume "in 'shipping/harness'" - and the steps that write those states: the
+    development image's producer, declared `profile:shipping` like every producer (`resources::step_declaration`) and
+    run as `./image.sh --format iso --dma-mode harness`, which builds in its caller's profile; and five gates declared
+    `profile:development` that boot the lab's guest by `lab.sh boot` (`check-qemu-{pcie-hotplug,pcie-aer,2d-demo,
+    3d-demo,2d-account}.sh`), whose `cmd_boot` builds `image_command()` in the caller's environment - shipping under
+    `verify.sh`, which sets no profile. `qemu-pcie-hotplug` ran beside the three in this run. Only `audio-routing`
+    passed `LIBER_DEVELOPMENT=1`. The second L3's entry ("abiprobe is audit-produced and was not staged") and the
+    third's ("the development agent never answered" under load) named the wrong cause. NOT REPRODUCED: the race
+    itself; `bluetooth-input`'s "did not bind (iommu-required)" in the third L3 and `ipmi`/`sleep` in the L2 are likely
+    the same and not shown to be.
+  - `verify-evidence`: "evidence: this run produced no libersystem.iso". It ran at step 267, the shipping image's
+    producer at 287; the catalog's `GATE_IMAGE_INPUTS` did not list it although `check-verify-evidence.sh:129` reads
+    the run's image. The order had hidden that since 2cf1de38.
+  - `capability-trace`: "the newest x86_64 trace is older than the kernel beside it" (also the second L3). The suite
+    boots a staged copy of the TEST kernel; the check compares with `.build/cargo/kernel/x86_64-unknown-none/debug/
+    kernel`, which the shipping image's producer (step 287, "Compiling kernel" after "build.sh: kernel (x86_64)")
+    relinked after the suite (step 256). It did not run in the L2 (the plan's second-L3 list said it passed there).
+  - `boot-volume-controllers-aarch64`: "aarch64's AHCI boots need firmware with SATA drivers - build it:
+    src/tools/build-aavmf-ahci.sh" - `.build/firmware/AAVMF_{CODE,VARS}.ahci.fd` not in the snapshot.
+  - `boot-harness`: `test_every_shipped_scenario_still_validates` - "no such file .../.build/fixtures/x86_64/
+    {uname-shadow,fixture-text,process-proto-shadow}" for four scenarios; the set is made by `make-fixtures.py` in
+    development runs only.
+  - `implementation-mutations`: five of five "failed the suite, but not by the assertion"; the suite runs in
+    `.build/mutations/tree`, and under the snapshot its guest's channel socket
+    (`.../.build/mutations/tree/.build/boot/dev-channel-x86_64-test.PID.sock`) is 123 bytes, past the 107 a UNIX socket
+    path has (95 in place). Inferred from the path, not from the guest's log, which went with the snapshot.
+  - `bluetooth-independent`: "PAN network process exited"; the PAN socket under its log directory is 125 bytes sealed
+    (97 in place). Inferred the same way.
+  - `dynamic-report`: "docs/DYNAMIC_EXECUTABLES.tsv is stale", 276 rows: `undefined_imports` name the `rt` crate's
+    mangled hash `_RNvCscyLjaQ4FWMZ_2rt...` committed and `_RNvCsayKYdNeLnv3_2rt...` built, and `provider_bytes`
+    differ (451080 against 451216) - the report depends on where the tree is built. Not this milestone's.
+  - `qemu-pcie-hotplug`: run in place on 2026-11-01 with the development profile (below) it fails the same way, "the
+    slot was powered down at line 1, before the driver let go at line 2" - code, as recorded.
+  - `hibernate` (boot 13 "late-refusal: the instance did not come up"), `brightness-acpi` ("the region holds 70, not
+    60"), `targeted-cache` (rustc SIGILL in `system-manifest`): in the ledger, seen once.
+  FIXES (2026-11-01, after the run ended, nothing else running):
+  - `src/tools/verify-model/src/resources.rs` `step_declaration`: a producer's profile is the one its command builds in
+    (`LIBER_DEVELOPMENT=1` first); `catalog.rs` `IMAGE_PRODUCERS`: the development image's command is
+    `LIBER_DEVELOPMENT=1 ./image.sh --format iso --dma-mode harness`. `tests.rs` `a_steps_declaration_follows_from_
+    what_it_is` asserts its tokens; with the old catalog it failed with "stage:x86_64=w:shipping",
+    "volume:x86_64=w:shipping/harness" - the run's own "shipping/harness".
+  - `check-qemu-{pcie-hotplug,pcie-aer,2d-demo,3d-demo,2d-account}.sh`: `LIBER_DEVELOPMENT=1` on `lab.sh boot`, as
+    `check-audio-routing.sh` has it. `tests.rs` `a_development_gate_boots_the_labs_guest_in_the_development_profile`:
+    every non-comment `lab.sh boot` line in the scripts of a gate whose declaration names the development profile
+    carries it; with the hot-plug gate's prefix removed it failed naming that line.
+  - `catalog.rs` `GATE_IMAGE_INPUTS` lists `verify-evidence`; `tests.rs` `a_gate_that_reads_a_runs_image_requires_
+    the_producer_of_it` reads every `$(evidence_image NAME)` in the scripts a gate reaches and requires the producer of
+    NAME (the bootable volume's is the shipping image's); with the old list it failed: "gate `verify-evidence` reads
+    the run's `libersystem.iso` ... and does not require `image.libersystem-iso`: []".
+  - `src/tools/check-capability-trace.sh`: inside a run (`LIBER_VERIFY_RUN`) the newest x86_64 guest log the run
+    kept that carries "captrace: begin" is the trace, and it is not held to the kernel file's age; otherwise as
+    before. `LIBER_VERIFY_RUN=<the fourth L3's run> check-capability-trace.sh --require-live`: "the live trace matches
+    the reference and replays against the model"; outside a run, today's tree: "the newest x86_64 trace is older than
+    the kernel beside it", the release's failure.
+  - `verify.sh`: `release_seed_prepared` copies `.build/firmware/AAVMF_{CODE,VARS}.ahci.fd` (sparse); and the size:
+    `release_watch_room` samples `df` every 2 s from before the snapshot is made until the run's shell is gone, and
+    `release_finish` records the larger of the end's `du -sb` and the start's free space less the lowest. Case 13 of
+    `check-verify-scheduler.sh`, "the room recorded is the run's fullest, not its end" (a build holds 64 MiB of
+    `fallocate` for five seconds): passes; with `needed=$sealed` it failed ("expected '1', got '0'"), `verify.sh`
+    restored from a copy (`cmp`).
+  - `src/harness/scenarios/make-fixtures.py --names` prints the fixture names and builds nothing;
+    `harness-test.py` validates the shipped scenarios against those names in the test's own build root, with the
+    tree's staged image linked in. The 11 `FixtureSetTest` tests pass, and the one passes with `.build/fixtures` moved
+    aside; the old check with it moved aside refused exactly the four scenarios of the run.
+  - Plan order after the fixes (`./verify.sh --release --plan`): `verify-evidence` at 267 requires
+    `producer:x86_64:image.libersystem-iso` (240); the development image's producer moved from among the shipping
+    steps to 331, beside the development gates.
+  - Checks: `cargo test` in verify-model, 175 passed; `verify-model check`, "model is consistent"; `./check.sh --gate
+    verify-scheduler,boot-harness` RESULT ok (440 s); `shfmt -d` clean on every changed script.
+  - The five gates with the development profile, run in place one guest at a time (`/root/p0206-fix4`):
+    `qemu-pcie-aer` RESULT ok (142 s), `qemu-2d-demo` ok (149 s), `qemu-2d-account` ok (558 s), `qemu-3d-demo` ok
+    (191 s); `qemu-pcie-hotplug` failed on its removal order (223 s), as above.
+  - `./check.sh --gate source-hygiene,milestone-index` RESULT ok (103 s); `./format.sh --changed`: nothing to change.
+  NOT PERFORMED: a sealed run of these fixes - they need a commit, the owner's, and a fifth L3 on the owner's word;
+  the race that put a shipping kernel under the development instances, which is read from the logs and not
+  reproduced; any fix of the socket paths, which waits for the owner's choice (per site, or a snapshot beside the
+  repository whose root is as long as the tree's); the `ipmi`, `sleep` and `bluetooth-input` failures, which are
+  likely the same cause and not shown to be.
+  THE PLAN, TODO AND LEDGER: the status line IN PROGRESS (reopened 2026-11-01); A3 has the fourth L3; VERIFICATION has
+  it beside the third; OPEN has "Found by the fourth L3", which corrects the second and third L3's entries for
+  `capability-trace`, the development lifecycle, `watchdog` and `typec-ucsi`; TODO's line `[ ]` IN PROGRESS; the
+  ledger has `hibernate`, `brightness-acpi`, `targeted-cache`, and `watchdog`/`typec-ucsi` as not flakes.
+  FINAL STATE (2026-11-01): P02M0206 IN PROGRESS. The working tree holds, uncommitted: `verify.sh`,
+  `src/tools/verify-model/src/{catalog,resources,tests}.rs`, `src/tools/check-capability-trace.sh`,
+  `src/tools/check-verify-scheduler.sh`, `src/tools/check-qemu-{pcie-hotplug,pcie-aer,2d-demo,3d-demo,2d-account}.sh`,
+  `src/harness/scenarios/make-fixtures.py`, `src/harness/harness-test.py`, the plan, TODO, the ledger and this record.
+  THE SOCKET PATHS, ANSWERED (2026-11-01, after the record above): the owner chose "Snapshot vedle repa" (the snapshot
+  beside the repository), then "Commitnu, pak spusť L3".
+  - `verify.sh` `release_snapshot_path`: the snapshot of REVISION is `<the repository's parent>/.r<first digits>`, the
+    name as long as the repository's (eleven characters beside `libersystem`: `/data/yellow/.r0399f4606`, 24 bytes as
+    `/data/yellow/libersystem` is), so every path in a sealed release is as long as in the tree; a name shorter than
+    nine keeps seven digits. `release_prepare` refuses a directory at that path that `git worktree list` does not
+    name, before the path becomes the run's (so no cleanup removes it); the L3's room check and `release_watch_room`
+    read the free space of the snapshot's parent.
+  - `check-verify-scheduler.sh` case 13, its fixture tree renamed `sealed-tree` (eleven characters): "the snapshot is
+    beside the tree, its root as long as the tree's", "and is gone when the run ends", "a directory at the snapshot's
+    path that is not this repository's worktree is refused", "and left as it was". `./check.sh --gate
+    verify-scheduler` RESULT ok (364 s). Watched: with the old location (`$BUILD_DIR/release/<12>`) and no refusal
+    the gate failed - "expected '/tmp/tmp.Ppe2bpIjQL 31', got '/tmp/tmp.Ppe2bpIjQL/sealed-tree/.build/release 59'",
+    the foreign marker gone ("got ''") - and `verify.sh` was restored from a copy (`cmp`). `shfmt -d` clean.
+  - NOT PERFORMED: the two gates in a sealed run (the fifth L3 is that run).
+  FINAL STATE (2026-11-01, after this): P02M0206 IN PROGRESS; every finding of the fourth L3 that is this milestone's
+  or its sealed path's is fixed in the tree; the owner commits, and the fifth L3 verifies them.
+  - Then `source-hygiene` refused the fixture's `sed ... | head -1` (a pipefail script piping into a reader that stops
+    early); it reads the line with `awk ... {print $NF; exit}` now. `./check.sh --gate source-hygiene,milestone-index`
+    RESULT ok (102 s) and `--gate verify-scheduler` again RESULT ok (363 s), the four checks above among its passes.
+  THE DEVELOPMENT GROUP THROUGH THE SCHEDULER (2026-11-01 19:34-20:30Z, while the commit is the owner's): the release
+  plan's eleven development-group steps (`gate-guest` qemu-2d-account, qemu-3d-demo, serial-handoff, watchdog,
+  typec-ucsi, qemu-pcie-hotplug, qemu-2d-demo, qemu-pcie-aer, audio-routing; the development image's producer; the
+  lifecycle), keys and declarations kept, as a prepared plan (`LIBER_VERIFY_STEPS=/root/p0206-fix4/plan-devgroup.txt
+  ./verify.sh --jobs 4`, in place, the fixes in the tree; a `--release --in-place` run refuses `LIBER_VERIFY_STEPS` as
+  an undeclared override). 3,375 s; "measured: 3357 s wall clock over 4 guest slot(s); the steps took 4766 s".
+  - Passed: qemu-2d-account 560 s, qemu-3d-demo 184 s, serial-handoff 200 s, the producer, qemu-2d-demo 158 s,
+    qemu-pcie-aer, audio-routing, typec-ucsi 1,029 s ("PASS - UCSI 1.2 and 2.1 ..."), watchdog 1,819 s ("PASS - the
+    i6300esb, the TCO, a WDAT over the TCO and the BMC's ..."). The two that failed in the fourth L3 ran beside the
+    five `lab.sh boot` gates and passed.
+  - The staging: switched once into the development profile at the start (the tree had been left mixed by the gates
+    run before), then only between the development volume's modes; no "shipping/harness" and no "no recorded state"
+    inside the group.
+  - Failed: `qemu-pcie-hotplug` (its removal order, code); the lifecycle - its instance came up ("readiness: shell
+    prompt and agent handshake"), `dev.selftest` passed (25 s), `dev.proto-test` failed in its fuzz ("the guest never
+    completed a handshake", the code defect under OPEN since the L2), and `dev.perf-gate` and `dev.gpu-restart` then
+    found "the development instance is starting".
+  - The run's end put the staging back in the shipping profile and the volume `enforcing-required`.
+  NOT PERFORMED: the same in a sealed run - the fifth L3, after the owner's commit.
+  THE ROOM FOR THE NEXT L3: `.build/state/release-build-size` was 47,733,479,018 (the fourth run's end, by the old
+  rule) and holds 48,779,419,648 now, written by hand: what the changed rule takes from that run - the larger of the
+  end's `.build` and the disk it took at its fullest, here by the disk watcher's one-minute samples.
+  FINAL STATE (2026-11-01, last): P02M0206 COMPLETE again. Every finding of the fourth L3 that is this milestone's or its
+  sealed path's is fixed and verified by its oracle, watched failing first, and by the gates it changes; the
+  development group passed through the scheduler but for `qemu-pcie-hotplug`'s removal order and the lifecycle's
+  protocol fuzz, code defects recorded under OPEN for milestones of their own (A3's rule). The plan's VERIFICATION does
+  not require an L3 to pass; the fifth sealed run, which the owner asked for after committing, is NOT PERFORMED - the
+  tree is uncommitted, and a sealed release refuses a dirty tree. The plan's status line, its OPEN and TODO's line say
+  so. The working tree holds, uncommitted, the 13 source and script files listed above, the plan, TODO, the ledger and
+  this record.

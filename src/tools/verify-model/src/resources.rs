@@ -385,9 +385,10 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 
 // WHAT A STEP OF A PLAN USES, from what the step is: a gate's own declaration, or the union of its gates'; a build
 // writes its architecture's staging in the shipping profile; a kernel suite reads it and boots the test media; an image
-// producer writes the staging and the bootable volume it signs; a host suite and a conformance suite share nothing; the
-// development lifecycle is a gate; and a development check uses the persistent instance. `None` for a step a gate of
-// which declares nothing - `verify-model check` refuses that - and the runner keeps such a step apart from everything.
+// producer writes the staging and the bootable volume it signs, in the profile its command builds in; a host suite and a
+// conformance suite share nothing; the development lifecycle is a gate; and a development check uses the persistent
+// instance. `None` for a step a gate of which declares nothing - `verify-model check` refuses that - and the runner keeps
+// such a step apart from everything.
 pub fn step_declaration(step: &crate::commands::Step) -> Option<Declaration> {
 	let (kind, rest) = step.id.split_once(':')?;
 	let arch = rest.split(':').next()?;
@@ -397,7 +398,12 @@ pub fn step_declaration(step: &crate::commands::Step) -> Option<Declaration> {
 		"guest" => parse(&format!("guest stage:{arch}:r profile:shipping media")).ok(),
 		"producer" => {
 			let mode = step.command.split_whitespace().skip_while(|word| *word != "--dma-mode").nth(1)?;
-			parse(&format!("host stage:{arch}:w profile:shipping volume:{arch}:{mode}:w media")).ok()
+			// THE DEVELOPMENT IMAGE IS BUILT IN THE DEVELOPMENT PROFILE. Every producer was declared `shipping`, so the
+			// runner brought the staging to the shipping profile before the development image's producer, which then
+			// assembled a "development" image of the shipping staging: in the sealed releases of 2026-10-31 and
+			// 2026-11-01 it left the volume `shipping/harness`. The profile is the one the command builds in.
+			let profile = if step.command.split_whitespace().next() == Some("LIBER_DEVELOPMENT=1") { "development" } else { "shipping" };
+			parse(&format!("host stage:{arch}:w profile:{profile} volume:{arch}:{mode}:w media")).ok()
 		}
 		"dev" if rest == "lifecycle" => declaration(crate::catalog::DEV_LIFECYCLE_GATE),
 		"dev" => parse("guest lab:dev-instance").ok(),

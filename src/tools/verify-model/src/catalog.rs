@@ -185,10 +185,14 @@ impl Check {
 // a gate that assembles a medium of its own from that volume consumes it - `perf-anchor`, whose
 // direct `qemu-run.sh` boot pairs it with an `enforcing-required` medium and had no declared producer
 // for it.
+//
+// THE DEVELOPMENT IMAGE IN THE DEVELOPMENT PROFILE, as the lab builds it: `image.sh` builds in its
+// caller's profile, and the development image of a shipping staging lacks every development-only
+// program the instance needs.
 pub const IMAGE_PRODUCERS: [(&str, &str, &str, &str); 3] = [
 	("image.libersystem-iso", "./image.sh --format iso --dma-mode enforcing-required", "artifact:libersystem.iso", "artifact:system-volume-bootable-x86_64.enforcing-required"),
 	("image.libersystem-no-iommu-iso", "./image.sh --format iso --dma-mode no-iommu", "artifact:libersystem-no-iommu.iso", "artifact:system-volume-bootable-x86_64.no-iommu"),
-	("image.libersystem-dev-iso", "./image.sh --format iso --dma-mode harness", "artifact:libersystem-dev.iso", "artifact:system-volume-bootable-x86_64.harness"),
+	("image.libersystem-dev-iso", "LIBER_DEVELOPMENT=1 ./image.sh --format iso --dma-mode harness", "artifact:libersystem-dev.iso", "artifact:system-volume-bootable-x86_64.harness"),
 ];
 
 // Which gates consume which image. A gate not listed here reads no shipping image.
@@ -198,10 +202,15 @@ pub const IMAGE_PRODUCERS: [(&str, &str, &str, &str); 3] = [
 // `rollback-floor-x86_64` builds four media at three generations, and `qemu-virtio-iommu-x86_64`
 // assembles the degraded image itself after its traffic phase. What they CONSUME from the release
 // run is the shipping image the traffic half boots, and only that.
-pub const GATE_IMAGE_INPUTS: [(&str, &[&str]); 4] = [
+//
+// HELD TO THE SCRIPTS: a gate whose scripts read a run's image (`evidence_image`) is listed with it.
+// `verify-evidence` was not, and ran before the shipping image's producer in the sealed release of
+// 2026-11-01, where it found no image; the order had hidden it before.
+pub const GATE_IMAGE_INPUTS: [(&str, &[&str]); 5] = [
 	("secure-boot", &["artifact:libersystem.iso"]),
 	("signed-boot", &["artifact:libersystem.iso"]),
 	("qemu-virtio-iommu-x86_64", &["artifact:libersystem.iso"]),
+	("verify-evidence", &["artifact:libersystem.iso"]),
 	("perf-anchor", &["artifact:system-volume-bootable-x86_64.enforcing-required"]),
 ];
 

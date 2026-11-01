@@ -149,9 +149,14 @@ def fixture_text():
 	return b'fixture-content-marker\n'
 
 
-os.makedirs(OUT, exist_ok=True)
 fixtures = [('uname-shadow', shadowed_uname), ('process-proto-shadow', shadowed_process_proto), ('process-proto-incompatible', incompatible_process_proto), ('fixture-text', fixture_text)]
 fixtures += [(f'uname-generation{index}', lambda index=index: generation_uname(index)) for index in (1, 2, 3)]
+# THE NAMES ALONE, with nothing read or built: what a scenario may publish from `{fixtures}`, for the check that every
+# shipped scenario names one - which a tree built from nothing, with no set made yet, can run as well.
+if sys.argv[1:] == ['--names']:
+	print('\n'.join(name for name, _ in fixtures))
+	sys.exit(0)
+os.makedirs(OUT, exist_ok=True)
 
 # BUILT ENTIRELY, THEN PUBLISHED ENTIRELY.
 #

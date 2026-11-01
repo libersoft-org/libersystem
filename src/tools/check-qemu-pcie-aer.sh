@@ -42,7 +42,9 @@ trap cleanup EXIT
 
 if ! "$REPO_ROOT/lab.sh" sh uname >/dev/null 2>&1; then
 	note "no instance is up - booting one"
-	"$REPO_ROOT/lab.sh" boot >/dev/null || die "the guest did not boot"
+	# IN THE DEVELOPMENT PROFILE THIS GATE DECLARES: `lab.sh boot` builds in its caller's, which under `verify.sh` is the
+	# shipping one - and rebuilt the shared staging under the development steps running beside it (2026-11-01).
+	LIBER_DEVELOPMENT=1 "$REPO_ROOT/lab.sh" boot >/dev/null || die "the guest did not boot"
 	BOOTED=1
 fi
 

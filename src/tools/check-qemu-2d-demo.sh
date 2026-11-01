@@ -47,7 +47,9 @@ python3 "$REPO_ROOT/src/tools/check-2d-demo-package.py" || die "the demo's packa
 # the cheapest question this system answers.
 if ! "$REPO_ROOT/lab.sh" sh uname >/dev/null 2>&1; then
 	note "no instance is up - booting one"
-	"$REPO_ROOT/lab.sh" boot >/dev/null || die "the guest did not boot"
+	# IN THE DEVELOPMENT PROFILE THIS GATE DECLARES: `lab.sh boot` builds in its caller's, which under `verify.sh` is the
+	# shipping one - and rebuilt the shared staging under the development steps running beside it (2026-11-01).
+	LIBER_DEVELOPMENT=1 "$REPO_ROOT/lab.sh" boot >/dev/null || die "the guest did not boot"
 	BOOTED=1
 fi
 

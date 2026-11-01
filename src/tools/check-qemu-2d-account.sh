@@ -202,7 +202,9 @@ boot() {
 	# Headless and four cores, whatever the caller's environment says - and the profile and the scanout each boot names
 	# itself, never inherited: an exported `LIBER_BOOT_PROFILE=development-trace` made the dormant boot a trace boot, and
 	# an exported `GPU_SIZE` moved the default scanout of the first and the last.
-	env -u DISPLAYS -u LIBER_BOOT_PROFILE -u GPU_SIZE "$@" SMP=4 "$REPO_ROOT/lab.sh" boot >"$RESULTS/boot-$name.log" 2>&1 || die "boot $name failed - see $RESULTS/boot-$name.log"
+	# IN THE DEVELOPMENT PROFILE THIS GATE DECLARES: `lab.sh boot` builds in its caller's, which under `verify.sh` is the
+	# shipping one - and rebuilt the shared staging under the development steps running beside it (2026-11-01).
+	env -u DISPLAYS -u LIBER_BOOT_PROFILE -u GPU_SIZE "$@" LIBER_DEVELOPMENT=1 SMP=4 "$REPO_ROOT/lab.sh" boot >"$RESULTS/boot-$name.log" 2>&1 || die "boot $name failed - see $RESULTS/boot-$name.log"
 	record_conditions "$name"
 }
 

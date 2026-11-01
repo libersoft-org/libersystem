@@ -1274,8 +1274,17 @@ class FixtureSetTest(unittest.TestCase):
 					run.assert_not_called()
 
 	# And every shipped scenario has to load under the new vocabulary.
+	#
+	# AGAINST THE SET THE RECIPE MAKES, not one a run left behind. The fixtures are made from a staged image, by the runs
+	# that publish them, and a tree built from nothing has none: in the sealed release of 2026-11-01 four scenarios failed
+	# this test on that alone. A scenario must name a fixture the recipe makes, and a staged file this tree has.
 	def test_every_shipped_scenario_still_validates(self):
-		lab.BUILD_ROOT = os.path.abspath(os.path.join(HERE, '..', '..', '.build'))
+		names = subprocess.run([sys.executable, os.path.join(HERE, 'scenarios', 'make-fixtures.py'), '--names'], capture_output=True, text=True, check=True).stdout.split()
+		self.assertIn('uname-shadow', names)
+		for fixture in names:
+			self.write(os.path.join(self.fixtures, fixture), b'')
+		shutil.rmtree(self.staged)
+		os.symlink(os.path.abspath(os.path.join(HERE, '..', '..', '.build', 'image', 'x86_64-unknown-none')), self.staged)
 		for name in sorted(os.listdir(os.path.join(HERE, 'scenarios'))):
 			if not name.endswith('.toml'):
 				continue

@@ -2999,10 +2999,70 @@ fn a_steps_declaration_follows_from_what_it_is() {
 	assert_eq!(tokens("build:x86_64:libs", "./build.sh --arch x86_64 --part libs"), Some(vec![String::from("stage:x86_64=w:shipping")]));
 	assert_eq!(tokens("guest:aarch64:all", "./test.sh --arch aarch64"), Some(vec![String::from("stage:aarch64=r:shipping"), String::from("media=r:-")]));
 	assert_eq!(tokens("producer:x86_64:image.libersystem-iso", "./image.sh --format iso --dma-mode enforcing-required"), Some(vec![String::from("stage:x86_64=w:shipping"), String::from("volume:x86_64=w:shipping/enforcing-required"), String::from("media=r:-")]));
+	// The development image's producer builds in the development profile, as its command says: declared `shipping`,
+	// the runner switched the staging to shipping before it and the image lacked the development-only programs.
+	let (_, development_command, _, _) = crate::catalog::IMAGE_PRODUCERS.iter().find(|(id, _, _, _)| *id == "image.libersystem-dev-iso").expect("the development image's producer");
+	assert_eq!(tokens("producer:x86_64:image.libersystem-dev-iso", development_command), Some(vec![String::from("stage:x86_64=w:development"), String::from("volume:x86_64=w:development/harness"), String::from("media=r:-")]));
 	assert_eq!(tokens("host:abi:default", "cargo test"), Some(Vec::new()));
 	assert_eq!(tokens("dev:dev.selftest", "(cd src && harness/dev-selftest.py)"), Some(vec![String::from("lab:dev-instance=x:-")]));
 	assert_eq!(tokens("gate-guest:host:usb-release", "./check.sh --gate usb-release"), Some(vec![String::from("stage:x86_64=r:development"), String::from("media=r:-"), String::from("volume:x86_64=r:development/harness")]));
 	assert_eq!(tokens("gate:host:nonexistent", "./check.sh --gate nonexistent"), None, "a gate that declares nothing has no declaration, and runs alone");
+}
+
+// A GATE THAT READS A RUN'S IMAGE WAITS FOR ITS PRODUCER: every `evidence_image NAME` in the scripts a gate runs names an
+// image whose producer is one of the gate's prerequisites. `verify-evidence` read the shipping image and named no producer,
+// so in the sealed release of 2026-11-01 it ran before that producer and found no image.
+#[test]
+fn a_gate_that_reads_a_runs_image_requires_the_producer_of_it() {
+	let root = repo_root();
+	let model = model();
+	// The bootable volume is stored by the shipping image's producer, beside its image (`image.sh`).
+	let producer_of = |name: &str| -> Option<String> {
+		if name == "system-volume-bootable-x86_64.img" {
+			return Some(String::from("image.libersystem-iso"));
+		}
+		crate::catalog::IMAGE_PRODUCERS.iter().find(|(_, _, artifact, _)| *artifact == format!("artifact:{name}")).map(|(id, _, _, _)| id.to_string())
+	};
+	let mut readers = BTreeSet::new();
+	for (gate, command) in crate::resources::gate_commands_in_check_sh(&root).expect("check.sh's gates") {
+		for script in crate::resources::reach(&root, &command).scripts {
+			let Some(path) = ["", "src/tools", "src/harness", "src"].iter().map(|directory| root.join(directory).join(&script)).find(|path| path.is_file()) else { continue };
+			let text = std::fs::read_to_string(&path).unwrap_or_default();
+			for name in text.split("$(evidence_image ").skip(1).filter_map(|rest| rest.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))).next()) {
+				let producer = producer_of(name).unwrap_or_else(|| panic!("{} reads `{name}`, which no image producer makes", path.display()));
+				let check = model.catalog.get(&format!("gate.{gate}")).unwrap_or_else(|| panic!("gate.{gate} is not in the catalog"));
+				assert!(check.prerequisites.contains(&producer), "gate `{gate}` reads the run's `{name}` ({}) and does not require `{producer}`: {:?}", path.display(), check.prerequisites);
+				readers.insert(gate.clone());
+			}
+		}
+	}
+	assert!(readers.contains("verify-evidence") && readers.contains("signed-boot"), "the scan found the gates that read a run's image: {readers:?}");
+}
+
+// A GATE THAT DECLARES THE DEVELOPMENT PROFILE BOOTS THE LAB'S GUEST IN IT. `lab.sh boot` builds its image in its caller's
+// profile, which under `verify.sh` is the shipping one: five such gates rebuilt the shared staging in the shipping profile
+// while development instances beside them built theirs, and those booted a shipping kernel whose DMA registry has no
+// development channel - "the guest reached a shell but its development agent never answered" in the sealed releases.
+#[test]
+fn a_development_gate_boots_the_labs_guest_in_the_development_profile() {
+	let root = repo_root();
+	let mut booting = BTreeSet::new();
+	for (gate, command) in crate::resources::gate_commands_in_check_sh(&root).expect("check.sh's gates") {
+		let Some(declared) = crate::resources::declaration(&gate) else { continue };
+		if !declared.tokens().iter().any(|token| token.ends_with(":development")) {
+			continue;
+		}
+		// The gate's own scripts: the runners it reaches are where `lab.sh boot` is defined, not called.
+		for script in crate::resources::reach(&root, &command).scripts.into_iter().filter(|script| !["lab.sh", "dev.sh", "run.sh", "test.sh", "qemu-run.sh", "test-kernel.sh"].contains(&script.as_str())) {
+			let Some(path) = ["", "src/tools", "src/harness", "src"].iter().map(|directory| root.join(directory).join(&script)).find(|path| path.is_file() && path.extension().is_some_and(|extension| extension == "sh")) else { continue };
+			let text = std::fs::read_to_string(&path).unwrap_or_default();
+			for line in text.lines().map(str::trim_start).filter(|line| !line.starts_with('#') && (line.contains("lab.sh\" boot") || line.contains("lab.sh boot"))) {
+				assert!(line.contains("LIBER_DEVELOPMENT=1"), "gate `{gate}` declares the development profile and boots the lab's guest in its caller's ({}): {line}", path.display());
+				booting.insert(gate.clone());
+			}
+		}
+	}
+	assert!(booting.contains("qemu-pcie-hotplug") && booting.contains("audio-routing"), "the scan found the gates that boot the lab's guest: {booting:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
