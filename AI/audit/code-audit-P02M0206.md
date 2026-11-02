@@ -1713,3 +1713,58 @@ IMPLEMENTER'S FIFTH L3 AND WHAT IT FOUND ON P02M0206 (2026-11-02, appended; noth
   FINAL STATE (2026-11-02): P02M0206 COMPLETE again. The fifth L3's one finding of this milestone is fixed and verified
   by its oracle, watched failing first, and the gate it changes. The working tree holds, uncommitted: `test.sh`,
   `src/tools/check-guest-verdict.py`, the plan, TODO, the ledger and this record.
+
+IMPLEMENTER'S RECORD: A FAILED STEP'S LOGS KEPT IN THE RUN (2026-11-02, appended; nothing above is changed)
+  ASKED: after the fifth L3 the implementer proposed that a sealed run keep the guest logs of its failed steps before its
+  tree is removed, two of its failures having been unreadable; the owner answered "OK, udelej to". Implemented over
+  5edc358a (the owner's commit of the C4 guard fix and the fifth L3's record).
+  CORRECTION of the fifth L3's record above: `balloon`'s logs were not removed by its trap - `check-balloon.sh:43-53`
+  copies them from its private state to `.build/logs/balloon` in its EXIT trap; in the sealed run that directory was in
+  the snapshot and went with it, as `virtio-gpu-edid-aarch64`'s did. The plan's OPEN and the ledger say so now.
+  WHAT WAS BUILT:
+  - `verify.sh` `run_one_step` writes the wall clock it began at as a third field of its outcome file
+    (`printf -v began '%(%s)T' -1`); `record_one_step` reads it, and on a failed step inside a run calls
+    `keep_failed_step_logs` before `release_publish_fallback` removes the step's output.
+  - `keep_failed_step_logs INDEX KEYS_FILE BEGAN`: under the step's first key, through `evidence_keep` (the model's
+    `keep-log`), it keeps (1) for a step `./check.sh --gate NAME`, the directories `.build/logs/NAME`, `NAME.*`,
+    `NAME-{x86_64,aarch64,riscv64}`, and NAME without an architecture suffix (`BASE`, `BASE.*`) - only their files
+    newer than BEGAN (`find -newermt`); (2) every path the step's output names that contains `.build`, resolved
+    (`realpath -m`; a relative one against `src/` and then the tree root) inside the tree's `.build` and outside
+    `.build/runs`: a directory under `.build/logs` other than `.build/logs/test`, the same way; a regular file under
+    `.build/logs` or ending in `.log`. Deduplicated; each passed to `keep-log` as a symlink named by its path under
+    `.build` with `/` as `+`, so the copy carries the path; at most `FAILED_STEP_LOG_BYTES` (64 MiB) a step in path
+    order, the rest named in a note ("not kept, past the ... bytes a failed step keeps: ..."). It says what it kept:
+    "kept N log file(s) this failed step wrote or named, B bytes, under 'KEY'".
+  - Not added: `NAME-*` in general - `ipmi-admin` beside `ipmi` and `hibernate-ports` beside `hibernate` are other
+    gates' directories, and gates overlap.
+  - For a gate the envelope is published by `check.sh` before the runner keeps these, so it does not name them; they
+    sit in the same `logs/<key>/` directory. For a step the runner publishes for, `kept_logs` names them.
+  ORACLE: `src/tools/check-verify-scheduler.sh` case 14 - a sealed release over the committed fixture tree of case 13,
+  whose `check.sh` writes `.build/logs/NAME/serial.log`, a 65 MiB `huge.log` (sparse), an `old.log` dated an hour back,
+  `.build/boot/fixture-boot.log` and `.build/state/fixture.elf`, names the last two, and fails for `fixture-gate` and
+  passes for `passing-gate`. Checked after the run, with the snapshot gone: the run holds
+  `logs+fixture-gate+serial.log` and `boot+fixture-boot.log` with their contents, and not `state+fixture.elf`,
+  `logs+fixture-gate+old.log`, `logs+fixture-gate+huge.log` (named in the note instead) or `logs+passing-gate+
+  serial.log`; and the note "kept 2 log file(s) ... under 'gate.fixture-gate / host / host / default'". The fixture's
+  `cargo` (case 11's recorder, which case 13 copies) learned `keep-log` as a copy of each `--log` by its name.
+  - The first fixture run put `keep-log` in case 10's recorder, which case 11 overwrites before case 13 copies it: the
+    positive checks failed with the new runner too, so the first watch-fail proved nothing and was discarded. Moved to
+    case 11's recorder; then, in this order: with the new `verify.sh` the whole gate passed (rc 0, every case); with
+    `verify.sh` from HEAD (copy kept, restored, `cmp` equal) it failed exactly the four checks that need the feature -
+    "a failed gate's own log is in the run - expected 'fixture-gate serial', got ''", "and a log its output names",
+    "nor a file past the bound, which is named instead - expected 'absent 1', got 'absent 0'", "and the run says what
+    it kept".
+  - The real `keep-log` (`cargo run -- keep-log`, scratch run directory, two path-named symlinks): two regular files
+    `logs/gate.balloon+host+host+default/logs+virtio-gpu-edid-aarch64+guest` and `.../logs+balloon+serial.log`, each
+    holding the target's bytes, not links.
+  - The extraction over the fifth L3's kept step logs reads: `virtio-gpu-edid-aarch64` - `/data/yellow/.rdf0cfad1e/
+    src/../.build/logs/virtio-gpu-edid-aarch64`; the IOMMU gicv2-hostile profile - its four `.build/logs/test/
+    aarch64-...` logs and `.build/state/kernel-test-aarch64.1025785.elf` (dropped: no log); `tickless-idle` -
+    `../.build/boot/tickless-{aarch64,riscv64,x86_64}.log`; `smp-core-cap` - the nested tree's run log; `balloon` -
+    nothing named (its directory by name). The run's own evidence paths are under `.build/runs` or outside the
+    sealed tree and are dropped.
+  CHECKS: `shfmt -d verify.sh src/tools/check-verify-scheduler.sh` clean; `bash -n verify.sh`. `./verify.sh --plan`
+  for this change selects 87 % of a full run (a harness change selects everything); not run - the sixth L3 is the run
+  for it, on the owner's word.
+  NOT PERFORMED: a real failed step in a real run keeping real logs (the sixth L3 will show it, or not if nothing
+  fails); the 64 MiB bound against a real failure's logs.

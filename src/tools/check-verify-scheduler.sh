@@ -584,6 +584,13 @@ case " $* " in
 	;;
 *" continue-run "*) printf 'COVERED\t0\tthe-earlier-run\n' ;;
 *" dossier "*) printf '# Release dossier - run fixture (rehearsal (in place))\n' >"$RELEASE_RUN/dossier.md" ;;
+*" keep-log "*)
+	# Kept as the model keeps them, by the name given: the copies are what is left once the tree is gone.
+	while (($#)); do
+		[[ "$1" != --log ]] || cp -L "$2" "$RELEASE_RUN/logs/"
+		shift
+	done
+	;;
 esac
 exit 0
 RECORDER
@@ -633,6 +640,20 @@ cp "$repo/src/tools/result-logs.sh" "$repo/src/tools/evidence.sh" "$repo/src/too
 : >"$sealed/src/tools/verify-model/Cargo.toml"
 : >"$sealed/toolchain.lock"
 printf '%s\n' '/.build/' '/run*/' '/*.log' '/calls' '/plan*' >"$sealed/.gitignore"
+# A GATE THAT KEEPS ITS LOGS UNDER `.build/logs/NAME`, as the real ones do, names one elsewhere and fails when asked.
+cat >"$sealed/check.sh" <<'GATE'
+#!/usr/bin/env bash
+name="$2"
+mkdir -p ".build/logs/$name" .build/boot .build/state
+touch -d '1 hour ago' ".build/logs/$name/old.log"
+echo "$name serial" >".build/logs/$name/serial.log"
+truncate -s 65M ".build/logs/$name/huge.log"
+echo "$name boot" >.build/boot/fixture-boot.log
+echo "$name image" >.build/state/fixture.elf
+echo "$name: failed (see .build/boot/fixture-boot.log and $PWD/.build/state/fixture.elf)"
+[[ "$name" == passing-gate ]]
+GATE
+chmod +x "$sealed/check.sh"
 cp "$release/bin/cargo" "$work/sealed-bin/cargo"
 git -C "$sealed" init -q
 git -C "$sealed" add -A
@@ -673,6 +694,29 @@ sealed_release foreign true
 check "a directory at the snapshot's path that is not this repository's worktree is refused" 1 "$(grep -c 'is not a worktree of this repository - it is not replaced' "$sealed/foreign.log" || true)"
 check "and left as it was" someone-elses "$(cat "$snapshot/marker" 2>/dev/null)"
 rm -rf "$snapshot"
+
+# 14. A FAILED STEP'S LOGS OUTLIVE THE SEALED TREE. A gate keeps its guest's logs under `.build/logs/NAME`, which goes
+#     with the snapshot: the fifth L3's `balloon` and `virtio-gpu-edid-aarch64` could not be read afterwards. Kept in
+#     the run: what the failed gate wrote there since it began and the logs its output names - not a named file that
+#     is no log, not an earlier run's log beside them, not a file past the bound, and nothing of a gate that passed.
+{
+	printf 'STATUS\tfull\tprepared\n'
+	printf 'STEP\t0\t1\tfixture-gate gate\t./check.sh --gate fixture-gate\t\n'
+	printf 'STEPID\t0\tgate:host:fixture-gate\nSTEPCOST\t0\t1\nSTEPGUESTS\t0\t0\nKEY\t0\tgate.fixture-gate / host / host / default\n'
+	printf 'STEP\t1\t1\tpassing-gate gate\t./check.sh --gate passing-gate\t\n'
+	printf 'STEPID\t1\tgate:host:passing-gate\nSTEPCOST\t1\t1\nSTEPGUESTS\t1\t0\nKEY\t1\tgate.passing-gate / host / host / default\n'
+} >"$sealed/plan-kept"
+(cd "$sealed" && PATH="$work/sealed-bin:$PATH" CARGO_CALLS="$sealed/calls" RELEASE_RUN="$sealed/run-kept" LIBER_VERIFY_STEPS="$sealed/plan-kept" ./verify.sh --release --jobs 1) >"$sealed/kept.log" 2>&1 || true
+out="$sealed/kept.log"
+kept="$sealed/run-kept/logs"
+check "the sealed tree is gone" absent "$(snapshot="$(awk '/^verify\.sh: release snapshot: / {print $NF; exit}' "$out")" && [[ -n "$snapshot" && -e "$snapshot" ]] && echo present || echo absent)"
+check "a failed gate's own log is in the run" "fixture-gate serial" "$(cat "$kept/logs+fixture-gate+serial.log" 2>/dev/null)"
+check "and a log its output names" "fixture-gate boot" "$(cat "$kept/boot+fixture-boot.log" 2>/dev/null)"
+check "but not a named file that is no log" absent "$([[ -e "$kept/state+fixture.elf" ]] && echo present || echo absent)"
+check "nor an earlier run's log beside them" absent "$([[ -e "$kept/logs+fixture-gate+old.log" ]] && echo present || echo absent)"
+check "nor a file past the bound, which is named instead" "absent 1" "$([[ -e "$kept/logs+fixture-gate+huge.log" ]] && echo present || echo absent) $(grep -c 'not kept, past the .*logs/fixture-gate/huge.log' "$out" || true)"
+check "nor anything of a gate that passed" absent "$([[ -e "$kept/logs+passing-gate+serial.log" ]] && echo present || echo absent)"
+check "and the run says what it kept, under which key" 1 "$(grep -c "kept 2 log file(s) this failed step wrote or named, .* under 'gate.fixture-gate / host / host / default'" "$out" || true)"
 
 if ((failed != 0)); then
 	echo "verify-scheduler: the shell scheduler did not behave as the milestone requires" >&2

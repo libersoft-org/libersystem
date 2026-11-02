@@ -1301,7 +1301,9 @@ restore_staging() {
 # written by ONE writer, and parallel steps updating it concurrently is a lost-update race in the
 # file the estimator reads.
 run_one_step() {
-	local index="$1" label="$2" command="$3" outfile="$4" started=$SECONDS status=0 elapsed
+	local index="$1" label="$2" command="$3" outfile="$4" started=$SECONDS status=0 elapsed began
+	# THE WALL CLOCK IT BEGAN AT, for `keep_failed_step_logs`: what a failed step wrote is what changed since.
+	printf -v began '%(%s)T' -1
 	if [[ -n "${LIBER_VERIFY_RUN:-}" ]]; then
 		# INSIDE A RUN THE STEP'S OUTPUT IS ITS RESULT LOG: streamed as before, through `tee`, and
 		# copied into the run by the envelope `record_one_step` publishes for a producer that did not
@@ -1320,7 +1322,7 @@ run_one_step() {
 	# The clock has whole-second resolution. Round an observed successful sub-second run up,
 	# so unbudgeted execution can measure fast host work without inventing a cold-start seed.
 	if ((status == 0 && elapsed == 0)); then elapsed=1; fi
-	printf '%s\t%s\n' "$status" "$elapsed" >"$outfile"
+	printf '%s\t%s\t%s\n' "$status" "$elapsed" "$began" >"$outfile"
 	return 0
 }
 
@@ -1334,8 +1336,8 @@ run_one_step() {
 # THE PARENT DOES THIS, ALWAYS. It is the single writer, and it is why `run_one_step` reports through
 # a file instead of recording for itself.
 record_one_step() {
-	local index="$1" label="$2" outfile="$3" status seconds outcome keys_file
-	IFS=$'\t' read -r status seconds <"$outfile"
+	local index="$1" label="$2" outfile="$3" status seconds began outcome keys_file
+	IFS=$'\t' read -r status seconds began <"$outfile"
 	# A REFUSED STEP RAN NOTHING (`staging-state.sh`): what it boots was not in the state it needs, and
 	# it said so before it tested anything. So it publishes no envelope and records no history - its
 	# outcome is that of its next run, in the state it needs. The first refusal of a step that named
@@ -1372,6 +1374,7 @@ record_one_step() {
 	keys_file="$(mktemp)"
 	awk -v want="$index" -F'\t' '$1 == "KEY" && $2 == want { print $3 }' "$steps_file" >"$keys_file"
 	if [[ -n "${LIBER_VERIFY_RUN:-}" ]]; then
+		[[ "$outcome" != --failed ]] || keep_failed_step_logs "$index" "$keys_file" "${began:-}"
 		release_publish_fallback "$index" "${outcome#--}" "$seconds" "$keys_file"
 	fi
 	if [[ -s "$keys_file" ]]; then
@@ -1382,6 +1385,78 @@ record_one_step() {
 		(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- record --step-id "${step_ids[$index]:-}" --command "${step_commands[$index]:-}" --keys-file "$keys_file" "$outcome" --seconds "$seconds") || note "        (the run happened; recording it did not)"
 	fi
 	rm -f "$keys_file" "$outfile"
+}
+
+# THE LOGS A FAILED STEP LEFT IN THE TREE, KEPT IN THE RUN (2026-11-02). A sealed run's tree is removed when the run
+# ends, and with it every log its gates keep under `.build/logs`: the fifth sealed release's `balloon` and
+# `virtio-gpu-edid-aarch64` failures could not be read afterwards. So a step that failed keeps, under its first key and
+# beside its envelope, what it wrote there and what it named:
+#   - a gate's own directory under `.build/logs` - its name, its name without the architecture, either with a
+#     `mktemp` suffix, or its name with an architecture - and of it only the files changed since the step began, so an
+#     earlier run's logs beside them are not taken for this one's;
+#   - every path its output names under `.build`: a directory under `.build/logs` the same way, and a file when it is
+#     under `.build/logs` or is a `.log` - a suite's `RESULT-LOGS`, a gate's "see ...".
+# Each copy is named by its path under `.build`, `/` read as `+` (`logs+balloon+serial.log`); at most
+# FAILED_STEP_LOG_BYTES a step, and what did not fit is named instead. A step that passed keeps nothing.
+FAILED_STEP_LOG_BYTES=$((64 << 20))
+keep_failed_step_logs() {
+	local index="$1" keys_file="$2" began="$3" step_log="$LIBER_VERIFY_RUN/logs/.step-$index.log"
+	local key build name base entry token path size total=0 links
+	key="$(head -n 1 "$keys_file")"
+	[[ -n "$key" && -s "$step_log" && "$began" =~ ^[0-9]+$ ]] || return 0
+	build="$(realpath -m -- "$BUILD_DIR")"
+	local -a dirs=() files=() candidates=() kept=() over=()
+	local -A seen=()
+	if [[ "${step_commands[$index]:-}" =~ ^\./check\.sh\ --gate\ ([A-Za-z0-9_.-]+)$ ]]; then
+		name="${BASH_REMATCH[1]}"
+		base="$name"
+		[[ "$name" =~ ^(.+)-(x86_64|aarch64|riscv64)$ ]] && base="${BASH_REMATCH[1]}"
+		for entry in "$build/logs/$name" "$build/logs/$name".* "$build/logs/$name"-{x86_64,aarch64,riscv64} "$build/logs/$base" "$build/logs/$base".*; do
+			[[ -d "$entry" ]] && dirs+=("$entry")
+		done
+	fi
+	while IFS= read -r token; do
+		case "$token" in
+		/*) candidates=("$token") ;;
+		*) candidates=("$SRC_DIR/$token" "$REPO_ROOT/$token") ;;
+		esac
+		for path in "${candidates[@]}"; do
+			path="$(realpath -m -- "$path")"
+			[[ "$path" == "$build/"* && "$path" != "$build/runs/"* ]] || continue
+			if [[ -d "$path" && "$path" == "$build/logs/"?* && "$path" != "$build/logs/test" ]]; then
+				dirs+=("$path")
+				break
+			elif [[ -f "$path" && ("$path" == "$build/logs/"* || "$path" == *.log) ]]; then
+				files+=("$path")
+				break
+			fi
+		done
+	done < <(grep -aoE '(/|\.\./|\./|\.build/)[^][:space:]"'\''<>(),;]+' "$step_log" | grep -F '.build' | sed 's/[.:]*$//' | sort -u)
+	for entry in "${dirs[@]}"; do
+		while IFS= read -r -d '' path; do
+			files+=("$path")
+		done < <(find "$entry" -type f -newermt "@$began" -print0 | sort -z)
+	done
+	links="$(mktemp -d)"
+	for path in "${files[@]}"; do
+		[[ -z "${seen[$path]:-}" ]] || continue
+		seen[$path]=1
+		size="$(stat -c %s -- "$path" 2>/dev/null)" || continue
+		if ((total + size > FAILED_STEP_LOG_BYTES)); then
+			over+=("${path#"$build/"} ($size bytes)")
+			continue
+		fi
+		entry="$links/$(printf '%s' "${path#"$build/"}" | tr / +)"
+		ln -s "$path" "$entry" 2>/dev/null || continue
+		total=$((total + size))
+		kept+=("$entry")
+	done
+	if ((${#kept[@]})); then
+		evidence_keep "$key" "${kept[@]}"
+		note "kept ${#kept[@]} log file(s) this failed step wrote or named, $total bytes, under '$key'"
+	fi
+	((${#over[@]} == 0)) || note "not kept, past the $FAILED_STEP_LOG_BYTES bytes a failed step keeps: ${over[*]}"
+	rm -rf "$links"
 }
 
 # THE RUNNER'S OWN ENVELOPE FOR A REQUIRED KEY WHOSE PRODUCER PUBLISHED NONE.
