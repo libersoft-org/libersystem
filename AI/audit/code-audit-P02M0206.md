@@ -1629,3 +1629,6 @@ IMPLEMENTER'S FOURTH L3 AND WHAT IT FOUND ON P02M0206 (2026-11-01, appended; not
   tree is uncommitted, and a sealed release refuses a dirty tree. The plan's status line, its OPEN and TODO's line say
   so. The working tree holds, uncommitted, the 13 source and script files listed above, the plan, TODO, the ledger and
   this record.
+  ANSWERED (2026-11-01): asked whether P02M0206 stays COMPLETE or goes back to IN PROGRESS until the fifth sealed run,
+  the owner chose "Nechat COMPLETE, commitnu" - it stays COMPLETE, the owner commits, and the fifth L3 follows as the
+  confirmation; a finding of it that is this milestone's reopens it. Recorded in the plan's status.
