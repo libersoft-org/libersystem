@@ -128,6 +128,10 @@ class ExistingQemuAdmission(unittest.TestCase):
             exemption = '\t\t\t[[ -n "$owner" && "$parents" == *" $owner "* ]] && continue\n'
             self.assertEqual(guard.count(exemption), 1)
             guard = guard.replace(exemption, "")
+        elif mutation == "nested_tree_is_ours":
+            exemption = '\t\t\t[[ "$relative" == */.build/* ]] && continue\n'
+            self.assertEqual(guard.count(exemption), 1)
+            guard = guard.replace(exemption, "")
         elif mutation == "trust_fixture_name":
             anchor = '\t\t\t[[ "$target" == "$build/"* ]] || continue\n'
             self.assertEqual(guard.count(anchor), 1)
@@ -237,6 +241,22 @@ note() { printf '%s\n' "$*" >&2; }
             with self.subTest(path=name):
                 self.assertEqual(self.exercise([(name, True)]), 0)
                 self.assertNotEqual(self.exercise([(name, True)], env={"LIBER_DEV_STATE": "/tmp/liber-tcpci.0KM44w"}), 0)
+
+    # ANOTHER TREE'S BUILD, NESTED IN THIS ONE'S: the mutation gates run their suite in a copy of the tree under
+    # `.build/mutations/`, whose guest holds the copy's own `.build`. Refused, a guest gate beside the mutation suite
+    # failed in one second (the fifth sealed release, 2026-11-02). A file of this tree held beside them still refuses.
+    NESTED_TREE = (
+        "mutations/tree/.build/logs/test/x86_64-20261102T010409Z-{wrong_owner}-restart1-run.log",
+        "mutations/tree/.build/boot/virtio-blk-test.{key}.{wrong_owner}.img",
+        "mutations/drivers/.build/boot/libersystem.iso",
+    )
+
+    def test_another_trees_build_nested_in_this_one_is_admitted(self):
+        for name in self.NESTED_TREE:
+            with self.subTest(path=name):
+                self.assertEqual(self.exercise([(name, True)]), 0)
+                self.assertNotEqual(self.exercise([(name, True), ("boot/libersystem.iso", True)]), 0)
+                self.assertNotEqual(self.exercise([(name, True)], mutation="nested_tree_is_ours"), 0)
 
     def test_actual_read_only_shared_descriptors_are_safe(self):
         paths = [(name, False) for name in (

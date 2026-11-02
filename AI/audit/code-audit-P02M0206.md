@@ -1632,3 +1632,84 @@ IMPLEMENTER'S FOURTH L3 AND WHAT IT FOUND ON P02M0206 (2026-11-01, appended; not
   ANSWERED (2026-11-01): asked whether P02M0206 stays COMPLETE or goes back to IN PROGRESS until the fifth sealed run,
   the owner chose "Nechat COMPLETE, commitnu" - it stays COMPLETE, the owner commits, and the fifth L3 follows as the
   confirmation; a finding of it that is this milestone's reopens it. Recorded in the plan's status.
+
+IMPLEMENTER'S FIFTH L3 AND WHAT IT FOUND ON P02M0206 (2026-11-02, appended; nothing above is changed)
+  THE RUN: `./verify.sh --level L3` at df0cfad1, the owner's commit of the fourth L3's fixes (the owner's record of the
+  answer above followed as dc6d9b94 while it ran), started at 22:42:06Z on 2026-11-01 under `/root/p0206-l3/run.sh`,
+  with the disk watcher and the `.build` sampler beside it; it ended at 07:10:09Z, exit 1, 30,483 s.
+  - The room check: "L3: 104879861760 bytes free, and the last sealed build took 48779419648". The snapshot beside the
+    repository: "release snapshot: df0cfad1... at /data/yellow/.rdf0cfad1e".
+  - The build from nothing: 21 build steps, all passed, 3,326 s between them, the last published at 23:43:24Z, 61
+    minutes after the run's start (22:42:45Z).
+  - "measured: 30379 s wall clock over 4 guest slot(s); the steps took 72052 s between them"; the estimate was 74,960 s
+    of priced steps and a floor of 20,541 s.
+  - The size, by the changed rule: "release: the sealed build from nothing took 48522143005 bytes, and the run
+    49633091584 bytes of the disk at its fullest - 49633091584 recorded for the next L3"; `.build/state/
+    release-build-size` holds 49633091584. The external disk watcher's lowest free space, 55,354,019,840, is the
+    run's own low (start 104,987,111,424 less 49,633,091,584). The sampler's largest apparent `.build`,
+    51,591,602,024 at 04:11Z, counts sparse images whole.
+  - 14 steps failed, none was blocked; the dossier "incomplete - 378 row(s), 378 required key(s), 17 refusal(s)".
+  WHAT IT VERIFIED OF THE FOURTH L3'S FIXES (the run's envelopes): `watchdog` passed (1,850 s), `typec-ucsi` (1,000 s),
+  `verify-evidence` (489 s), `capability-trace` ("the live trace matches the reference and replays against the
+  model"), `boot-harness` (78 s), `boot-volume-controllers-aarch64` (1,647 s), `implementation-mutations` ("5
+  deliberate kernel defects, each caught by the assertion written against it"), `bluetooth-independent` (1,228 s); the
+  lifecycle's instance: "bind window dev_channel = 60 tick(s) from BIND to READY", "readiness: shell prompt and agent
+  handshake", `dev.selftest` passed; the five `lab.sh boot` gates passed but `qemu-pcie-hotplug` (code); the
+  run recorded its room at its fullest. Also passed: `hibernate`, `brightness-acpi`, `targeted-cache` (each seen once
+  in the fourth), `ipmi` and `sleep`.
+  AGAINST THE FOURTH L3: gone the eleven above (`watchdog`, `typec-ucsi`, `verify-evidence`, the gates that read a guest
+  run, `boot-volume-controllers-aarch64`, `boot-harness`, `implementation-mutations`, `bluetooth-independent`,
+  `hibernate`, `brightness-acpi`, `targeted-cache`); still the code defects (`arch-profile-{aarch64,riscv64}-no-dt-
+  absent-1`, three IOMMU profiles, `dynamic-report`, `system-suspend-riscv64`, `tickless-idle`, `qemu-pcie-hotplug`,
+  the lifecycle's development checks); new `smp-core-cap`, `virtio-gpu-edid-aarch64`, `typec-tcpci-riscv64`, `balloon`.
+  WHAT ITS LOGS SHOW (the run's kept logs):
+  - `smp-core-cap` (step 288, 2 s): "test.sh: a qemu-system-x86_64 already holds this tree's disk images: 1266901
+    (/data/yellow/.rdf0cfad1e/.build/mutations/tree/.build/logs/test/x86_64-20261102T010409Z-1250280-restart1-run.log)".
+    The holder was the mutation suite's resumed boot, running in `check-implementation-mutations.sh`'s copy of the
+    tree (`WORK="$REPO/.build/mutations/tree"`, filled by `rsync`, no links) in another guest slot. `test.sh`'s
+    `require_no_stray_qemu` reads every writable descriptor under the tree's `.build/`, and the copy's own `.build` is
+    under it; no rule admitted it. In place the copy is under `.build` too, so the overlap, not the snapshot, made it:
+    in the fourth L3 the mutation suite failed on its socket path before it booted a guest. THIS MILESTONE'S (C4, the
+    guard, under C2's overlap) - the third L3's `qemu-modem-service` refusal was the same class.
+  - `typec-tcpci-riscv64`: "vbus-stays-off: detached after 1240 ms, before tSrcRecover and tSrcTurnOn (1275 ms) had
+    passed" - the step that fails alone (the ledger's "not a flake"); passed in the third and fourth. Code.
+  - The lifecycle: `dev.proto-test` passed its taxonomy, publication, terminal, registry and launch sections ("restarting
+    the agent, so nothing is launched..." then ten "ok"), then "FAIL 16 pipelined requests are answered in order, 32768
+    B each: (1, {(4, 0)}, False, True) expected (16, {(4, 0)}, True, True)", "round trip for the whole burst: 90026 ms",
+    and "-- fuzz / proto-test: the guest never completed a handshake"; the instance's `dev-serial.log` ends with
+    "agent.dev: online (registry)", "DeviceManager: a provider-catalogue client closed its connection; the slot is given
+    back" and a bare "system_manager". The 2026-11-01 rehearsal had the pipeline pass (287 ms) and the fuzz fail. The
+    protocol defect under OPEN since the L2, one section earlier; cause NOT ESTABLISHED.
+  - `balloon`: "the program that needed 768 MiB did not get it (... launched memhog as koid 3126 memhog: an object could
+    not be mapped ...)", after the first two stages passed as before (512 MiB given; stopped at 1219 MiB with 229 MiB
+    free). The instance's serial log was in its private state under `/tmp`, removed by its trap. Passed in the third and
+    fourth.
+  - `virtio-gpu-edid-aarch64`: "edid-oracle: FAIL no acknowledged provider-backed presentation followed discovery",
+    "EDID on failed on aarch64 (see /data/yellow/.rdf0cfad1e/src/../.build/logs/virtio-gpu-edid-aarch64)" - gone with
+    the snapshot. Nothing rebuilt the aarch64 staging while it ran (the runner's lines in that window are x86_64's);
+    `hibernate-ports-aarch64` ran beside it. Passed in the third and fourth.
+  - `dynamic-report`, the IOMMU and `arch-profile` profiles, `system-suspend-riscv64`, `tickless-idle`,
+    `qemu-pcie-hotplug`: as recorded for the fourth.
+  FIX (2026-11-02, after the run ended, nothing else running):
+  - `test.sh` `require_no_stray_qemu`: after `relative="${target#"$build/"}"`, `[[ "$relative" == */.build/* ]] &&
+    continue` - a file under another tree's `.build` nested in this one's is that tree's; the copy's own guard answers
+    for it. Only that descriptor is skipped; a file of this tree the same process holds still refuses.
+  - `src/tools/check-guest-verdict.py` `ExistingQemuAdmission.test_another_trees_build_nested_in_this_one_is_admitted`:
+    three nested files (the run's own holder's log name, a nested virtio-blk image, a nested `libersystem.iso`, each
+    writable, with another owner's pid) admitted; each beside a writable `boot/libersystem.iso` of this tree refused;
+    each refused with the exemption removed (`mutation="nested_tree_is_ours"`, which asserts the line is there once).
+  - Watched failing: with `test.sh` from HEAD (copy kept, restored, `cmp` equal) the test failed on all three subtests,
+    "AssertionError: 23 != 0" at its first assertion - the guard's refusal.
+  - Checks: `check-guest-verdict.py ExistingQemuAdmission` 7 tests OK; `./check.sh --gate guest-verdict` RESULT ok
+    (132 s, 116 tests); `shfmt -d test.sh` clean.
+  NOT PERFORMED: the fix in a sealed run (a sixth L3, after the owner's commit); a live reproduction with two guests -
+  the fixture runs the guard's own text against real descriptors with `pgrep` stubbed; the causes of `balloon`'s and
+  `virtio-gpu-edid-aarch64`'s failures, whose guest logs are gone; the cause of the lifecycle's protocol failure.
+  THE PLAN, TODO AND LEDGER: the status line COMPLETE (2026-11-02, reopened the same day), the sixth sealed run named as
+  not performed; C4 has the nested tree; A3 has the fifth L3; VERIFICATION has it beside the fourth; OPEN has "Found by
+  the fifth L3"; TODO's line says the same; the ledger has `balloon` and `virtio-gpu-edid-aarch64` (seen once), the
+  fifth's passes of `hibernate`, `brightness-acpi`, `targeted-cache`, `ipmi`, `sleep`, and `typec-tcpci-riscv64`'s
+  failure again.
+  FINAL STATE (2026-11-02): P02M0206 COMPLETE again. The fifth L3's one finding of this milestone is fixed and verified
+  by its oracle, watched failing first, and the gate it changes. The working tree holds, uncommitted: `test.sh`,
+  `src/tools/check-guest-verdict.py`, the plan, TODO, the ledger and this record.

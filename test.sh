@@ -240,6 +240,11 @@ require_no_stray_qemu() {
 			# that run's and an ancestor of the boot): a suite split across guests had every later part of
 			# the same target refused while one part's resumed boot ran.
 			relative="${target#"$build/"}"
+			# ANOTHER TREE'S BUILD, NESTED IN THIS ONE'S: the mutation gates copy the tree under `.build/mutations/`
+			# and run its suite there, so that copy's guest holds the copy's own `.build` - never this tree's images -
+			# and the copy's guard answers for it. Refused, a guest gate beside the mutation suite failed in one second
+			# once steps overlapped (the fifth sealed release, 2026-11-02); a file of this tree it holds still refuses.
+			[[ "$relative" == */.build/* ]] && continue
 			owner=""
 			if [[ "$relative" =~ ^boot/(virtio-blk|usb-media)[a-z0-9_-]*\.[0-9a-f]{64}\.([0-9]+)\.img$ ]]; then
 				owner="${BASH_REMATCH[2]}"
