@@ -467,7 +467,10 @@ pub fn release_steps(catalog: &crate::catalog::Catalog, registry: &crate::regist
 			}
 			let mut requires: Vec<String> = build_last.get(&variant.architecture).cloned().into_iter().collect();
 			requires.extend(lifecycle.prerequisites.iter().filter_map(|id| producer_ids.get(id).cloned()));
-			steps.push(Step { id: scoped_id("dev", "lifecycle", &[]), requires, label: String::from("development lifecycle (image, boot, readiness, the development checks, teardown)"), command: item(lifecycle, variant).command, keys, note: Some(String::from("one self-contained step owns the development guest: the four development checks run against the instance it brought up and publish their own envelopes")), guests: 1, exclusive_guests: false });
+			// IT RUNS ALONE, as it did before 2026-10-26, when that was dropped unrecorded (found 2026-11-03): its
+			// `dev.perf-gate` measures a warm loop against budgets set on an idle host (C5's timing-sensitive gates), and
+			// edits a source every target's digest covers while it rebuilds the staging.
+			steps.push(Step { id: scoped_id("dev", "lifecycle", &[]), requires, label: String::from("development lifecycle (image, boot, readiness, the development checks, teardown)"), command: item(lifecycle, variant).command, keys, note: Some(String::from("one self-contained step owns the development guest: the four development checks run against the instance it brought up and publish their own envelopes")), guests: 1, exclusive_guests: true });
 		}
 	}
 	// The catalog's prerequisite edges - a gate that reads an image requires the step that built
@@ -670,8 +673,12 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 			step.requires.sort();
 			step.requires.dedup();
 		}
+		// IN A TIER'S PLAN, x86_64's SUITE ONLY (2026-11-03): the ports' suites are the merge's, and a step that waited
+		// for them was deferred with them - the planner's own tests left L0 for every change that selects everything. In
+		// place an earlier run's test kernel is there for each port; a release, built from nothing, waits for every
+		// suite (`release_steps`).
 		if reads_the_test_kernels(step) {
-			step.requires.extend(suite_ids.iter().cloned());
+			step.requires.extend(suite_ids.iter().filter(|id| id.starts_with("guest:x86_64:")).cloned());
 			step.requires.sort();
 			step.requires.dedup();
 		}

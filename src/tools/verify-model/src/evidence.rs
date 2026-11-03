@@ -182,10 +182,11 @@ impl Run {
 	}
 
 	// A RUN CONTINUES WHAT AN IDENTICAL ONE LEFT: every PASSED envelope of `earlier` this run has none for is taken
-	// over - its logs copied into this run under the same names and digests, the envelope republished as this run's
-	// and marked with the run that produced it - when the two identity blocks agree on the tree, every tool's and
-	// firmware image's digest, the configurations and the environment (`identity::continuation_differences`). What
-	// failed or never ran is left for this run. Refused, naming what moved, when they do not agree.
+	// over - its logs copied into this run under the same names and digests, the artifacts it produced linked into
+	// this run's store (`take_artifact`), the envelope republished as this run's and marked with the run that produced
+	// it - when the two identity blocks agree on the tree, every tool's and firmware image's digest, the configurations
+	// and the environment (`identity::continuation_differences`). What failed or never ran is left for this run.
+	// Refused, naming what moved, when they do not agree.
 	pub fn continue_from(&self, earlier: &Run) -> Result<Vec<String>, String> {
 		let differences = crate::identity::continuation_differences(&self.identity_block()?, &earlier.identity_block()?);
 		if !differences.is_empty() {
@@ -207,16 +208,51 @@ impl Run {
 				}
 				std::fs::copy(&from, &to).map_err(|error| format!("{}: {error}", to.display()))?;
 			}
+			let outputs = envelope.outputs.iter().map(|output| self.take_artifact(earlier, output)).collect::<Result<Vec<_>, _>>()?;
 			let producer_run = envelope.continued_from.clone().unwrap_or_else(|| envelope.run.clone());
 			let key = envelope.key.clone();
-			self.publish(&Envelope { run: run.clone(), identity: identity.clone(), continued_from: Some(producer_run), ..envelope })?;
+			self.publish(&Envelope { run: run.clone(), identity: identity.clone(), outputs, continued_from: Some(producer_run), ..envelope })?;
 			taken.push(key);
 		}
 		write_atomically(&self.root.join("continued-from"), format!("{}\n", earlier.root.display()).as_bytes())?;
 		Ok(taken)
 	}
 
-	// Withdraw a taken-over envelope this run is going to produce again, and the logs it named.
+	// AN ARTIFACT A TAKEN-OVER PRODUCER STORED COMES WITH ITS ENVELOPE (2026-11-03): a gate this run starts again reads
+	// its image from this run's store and from nowhere else (`evidence_image`), and the producer is not run again to put
+	// it there - so an L2 continued after its image producer had passed failed every gate that boots that image. An
+	// output in the earlier run's store is linked into this one's under its name, with the receipts stored beside it
+	// (`NAME.build-key`, ...), its digest checked as a log's is; an output outside the store is named as it was.
+	fn take_artifact(&self, earlier: &Run, output: &Artifact) -> Result<Artifact, String> {
+		let from = PathBuf::from(&output.path);
+		let Ok(earlier_store) = std::fs::canonicalize(earlier.root.join("artifacts")) else { return Ok(output.clone()) };
+		let (Some(name), Some(parent)) = (from.file_name().and_then(|name| name.to_str()), from.parent()) else { return Ok(output.clone()) };
+		if std::fs::canonicalize(parent).ok().as_ref() != Some(&earlier_store) {
+			return Ok(output.clone());
+		}
+		if sha256_file(&from)? != output.sha256 {
+			return Err(format!("run {}'s artifact {} is not the one its envelope recorded", earlier.id()?, output.path));
+		}
+		let store = self.root.join("artifacts");
+		std::fs::create_dir_all(&store).map_err(|error| format!("{}: {error}", store.display()))?;
+		let store = std::fs::canonicalize(&store).map_err(|error| format!("{}: {error}", store.display()))?;
+		let entries = std::fs::read_dir(&earlier_store).map_err(|error| format!("{}: {error}", earlier_store.display()))?;
+		for entry in entries.flatten() {
+			let stored = entry.file_name().to_string_lossy().into_owned();
+			let to = store.join(&stored);
+			if (stored != name && !stored.starts_with(&format!("{name}."))) || to.exists() {
+				continue;
+			}
+			// Linked, not copied: a stored artifact is immutable, and an image is a hundred megabytes.
+			if std::fs::hard_link(entry.path(), &to).is_err() {
+				std::fs::copy(entry.path(), &to).map_err(|error| format!("{}: {error}", to.display()))?;
+			}
+		}
+		Ok(Artifact { path: store.join(name).display().to_string(), sha256: output.sha256.clone() })
+	}
+
+	// Withdraw a taken-over envelope this run is going to produce again, the logs it named and the artifacts it brought
+	// into this run's store, so the producer run again stores its own.
 	pub fn withdraw(&self, key: &str) -> Result<(), String> {
 		let path = self.root.join("evidence").join(key_file_name(key));
 		let Ok(text) = std::fs::read_to_string(&path) else { return Ok(()) };
@@ -226,6 +262,20 @@ impl Run {
 		}
 		for log in &envelope.logs {
 			let _ = std::fs::remove_file(self.root.join(&log.path));
+		}
+		let store = std::fs::canonicalize(self.root.join("artifacts")).ok();
+		for output in &envelope.outputs {
+			let output = PathBuf::from(&output.path);
+			let (Some(name), Some(parent)) = (output.file_name().and_then(|name| name.to_str()), output.parent()) else { continue };
+			if store.is_none() || std::fs::canonicalize(parent).ok() != store {
+				continue;
+			}
+			for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+				let stored = entry.file_name().to_string_lossy().into_owned();
+				if stored == name || stored.starts_with(&format!("{name}.")) {
+					let _ = std::fs::remove_file(entry.path());
+				}
+			}
 		}
 		std::fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))
 	}

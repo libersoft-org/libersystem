@@ -924,5 +924,9 @@ else
 	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
 	echo "[test-$ARCH] FAIL (exit $status, ${elapsed}s); logs: $RUN_LOG $GUEST_LOG" >&2
 	resume_after "$(failed_test)"
+	# AND THE LAST `RESULT-LOGS` IS THIS BOOT'S AGAIN (2026-11-03): the boot that resumes after a failure prints its
+	# own, and a reader takes the last - so a shadow sweep read only the boot after the failure, in which every test
+	# passed, and graded a failed sweep consistent. Named again after it, the last line names the boot that failed.
+	echo "[test-$ARCH] RESULT-LOGS $RUN_LOG $GUEST_LOG"
 fi
 exit "$status"

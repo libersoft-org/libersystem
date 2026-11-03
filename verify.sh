@@ -75,7 +75,8 @@ Commit exactly the tested content, then complete verification with --merge FILE.
                    is how a narrowing earns the evidence its activation demands.
   --level L0..L3   a preset: L0 the inner tier over the working tree's change; L1 the inner tier over BASE..HEAD
                    on a clean tree, with the whole x86_64 suite and every port test added, then its merge at the
-                   same HEAD (BASE: --base REV, or the revision the last passed L1 or L2 ran at); L2 --release
+                   same HEAD (BASE: --base REV, or the revision the last passed L1 or L2 ran at; an inner half
+                   that ends STALE or SHADOW stops it before the merge, and --allow-shadow accepts that); L2 --release
                    --in-place; L3 --release, refused when the disk has less room than the last sealed build took
   --jobs N         guest slots (inner default 1, merge and release default 4; explicit values override them)
   --budget N       estimated seconds the inner run may start, including prerequisites
@@ -324,6 +325,15 @@ L1)
 	"$0" --for-range "$base..$head" --l1-suites ${forward[@]+"${forward[@]}"} 2>&1 | tee "$inner_log" || inner_status=$?
 	handoff="$(sed -n 's/^verify.sh: inner handoff: //p' "$inner_log" | tail -1)"
 	rm -f "$inner_log"
+	# AN INNER HALF THAT PASSED CAN STILL END THE PRESET (corrected 2026-11-03): with every step passed and its handoff
+	# written, it ends STALE (5) or SHADOW (4) when the level it is worth is not one to record BASE on - in this tree,
+	# whose age window holds keys no run records, every time - and the preset said "did not end with a handoff". BASE
+	# is still recorded only at a level the run may stand on, so it stops here, before the merge's hours, and says so.
+	if [[ -n "$handoff" ]] && ((inner_status == 4 || inner_status == 5)); then
+		note "L1: the inner half passed and wrote its handoff ($handoff), but ended at a level BASE is not recorded on (exit $inner_status, above)"
+		note "     ./verify.sh --level L1 --allow-shadow  accepts that level: it runs the merge and records BASE when it passes"
+		exit "$inner_status"
+	fi
 	((inner_status == 6)) && [[ -n "$handoff" ]] || die "L1: the inner tier did not end with a handoff (status $inner_status)"
 	note "L1: the merge of $handoff at the same HEAD"
 	"$0" --merge "$handoff" ${forward[@]+"${forward[@]}"} || die "L1: the merge did not pass"

@@ -21,7 +21,8 @@
 #      envelope for the host suite, the gate runner publishes the gates', the dossier renders in a
 #      `rehearsal` state and never `complete`.
 #   5. A RUN CONTINUES WHAT AN IDENTICAL ONE LEFT. An L2's passed envelope is taken over by a later run of the same
-#      identity, which runs only what failed, and its dossier names the run each envelope came from; a run whose QEMU
+#      identity, which runs only what failed, and its dossier names the run each envelope came from; a passed image
+#      producer's artifact comes with its envelope, so a gate run again reads it from the later run; a run whose QEMU
 #      digest moved is refused, at the takeover and in the dossier.
 #
 # Minutes: one short x86_64 boot to the loader's marker, one worktree, one rehearsal.
@@ -283,7 +284,9 @@ echo "verify-evidence:   run $(basename "$rehearsal_run"): three envelopes, two 
 # 5. A RUN CONTINUES WHAT AN IDENTICAL ONE LEFT, AND NOTHING WHOSE QEMU MOVED. An earlier L2 that passed one key and
 #    failed another; a run of the same identity continues it - taking over the passed envelope with its log, the
 #    plan's step for it covered and the failed one's left to run - and its dossier names the run each envelope came
-#    from. A run whose QEMU is another binary is refused, and so is a dossier whose source run's QEMU moved after.
+#    from. An image producer that passed stored its image in the earlier run; it is covered too, and the image and its
+#    receipt are in the later run's store, where `evidence_image` finds them. A run whose QEMU is another binary is
+#    refused, and so is a dossier whose source run's QEMU moved after.
 echo "verify-evidence: 5. a run continues what an identical one left, and refuses one whose QEMU digest moved"
 passed_key="gate.volume-layout / host / host / default"
 failed_key="gate.dma-mode-carrier / host / host / default"
@@ -292,22 +295,41 @@ echo L2 >"$earlier/level"
 echo "the earlier run's own log" >"$work/earlier.log"
 LIBER_VERIFY_RUN="$earlier" evidence_publish "$passed_key" "check.sh gate volume-layout" passed 4 --log "$work/earlier.log"
 LIBER_VERIFY_RUN="$earlier" evidence_publish "$failed_key" "check.sh gate dma-mode-carrier" failed 2
-printf 'STATUS\tfull\tprepared\nSTEP\t0\t1\tvolume-layout gate\ttrue\t\nKEY\t0\t%s\nSTEP\t1\t1\tdma-mode-carrier gate\ttrue\t\nKEY\t1\t%s\n' "$passed_key" "$failed_key" >"$work/continued-plan"
+producer_key="image.libersystem-iso / x86_64 / host / shared-image"
+echo "the earlier run's image" >"$work/libersystem.iso"
+echo "its receipt" >"$work/libersystem.iso.build-key"
+stored="$(LIBER_VERIFY_RUN="$earlier" evidence_store_artifact libersystem.iso "$work/libersystem.iso" "$work/libersystem.iso.build-key")"
+LIBER_VERIFY_RUN="$earlier" evidence_publish "$producer_key" "image.sh" passed 5 --output "$stored"
+printf 'STATUS\tfull\tprepared\nSTEP\t0\t1\tvolume-layout gate\ttrue\t\nKEY\t0\t%s\nSTEP\t1\t1\tdma-mode-carrier gate\ttrue\t\nKEY\t1\t%s\nSTEP\t2\t1\tthe image producer\ttrue\t\nKEY\t2\t%s\n' "$passed_key" "$failed_key" "$producer_key" >"$work/continued-plan"
 later="$(model run-start --out-root "$work/continued")" || fail "run-start refused the later run"
 echo L2 >"$later/level"
 model continue-run --run "$later" --steps "$work/continued-plan" >"$work/covered" 2>"$work/continue.err" || fail "the identical run could not be continued: $(tail -2 "$work/continue.err")"
-[[ "$(cat "$work/covered")" == "COVERED	0	$(<"$earlier/run-id")" ]] || fail "the passed key's step was not reported covered by the earlier run: $(cat "$work/covered")"
+[[ "$(cat "$work/covered")" == "COVERED	0	$(<"$earlier/run-id")"$'\n'"COVERED	2	$(<"$earlier/run-id")" ]] || fail "the passed keys' steps were not reported covered by the earlier run: $(cat "$work/covered")"
 taken="$later/evidence/gate.volume-layout+host+host+default.json"
 [[ -f "$taken" ]] || fail "the passed envelope was not taken over"
 grep -q "\"continued_from\": \"$(<"$earlier/run-id")\"" "$taken" || fail "the taken-over envelope does not name the run that produced it"
 [[ ! -f "$later/evidence/gate.dma-mode-carrier+host+host+default.json" ]] || fail "a failed envelope was taken over"
+image="$(LIBER_VERIFY_RUN="$later" evidence_image libersystem.iso 2>"$work/image.err")" || fail "a gate run again found no image in the continued run: $(<"$work/image.err")"
+cmp -s "$image" "$work/libersystem.iso" || fail "the continued run's image is not the earlier run's"
+cmp -s "$image.build-key" "$work/libersystem.iso.build-key" || fail "the image's receipt did not come with it"
+grep -q "\"$(realpath "$later")/artifacts/libersystem.iso\"" "$later/evidence/image.libersystem-iso+x86_64+host+shared-image.json" || fail "the taken-over producer's envelope does not name the image in this run"
 LIBER_VERIFY_RUN="$later" evidence_publish "$failed_key" "check.sh gate dma-mode-carrier" passed 2
 printf 'schema = 1\nkeys = ["%s", "%s"]\n' "$passed_key" "$failed_key" >"$work/required-continued.toml"
 model dossier --run "$later" --required "$work/required-continued.toml" >"$work/dossier-5.out" 2>&1 || fail "the continued run's dossier was refused: $(tail -3 "$work/dossier-5.out")"
-grep -q "^Continued: 1 envelope(s) taken over from run(s) $(<"$earlier/run-id")" "$later/dossier.md" || fail "the dossier does not say what it continued"
+grep -q "^Continued: 2 envelope(s) taken over from run(s) $(<"$earlier/run-id")" "$later/dossier.md" || fail "the dossier does not say what it continued"
 grep -q "| \`$passed_key\` | yes | passed | 4 | check.sh gate volume-layout | $(<"$earlier/run-id") |" "$later/dossier.md" || fail "the dossier does not name the run the taken-over envelope came from"
 grep -q "| \`$failed_key\` | yes | passed | 2 | check.sh gate dma-mode-carrier | this run |" "$later/dossier.md" || fail "the dossier does not name this run for what ran here"
-echo "verify-evidence:   continued: the passed key taken over with its log and named by its run, the failed one run here"
+echo "verify-evidence:   continued: the passed key taken over with its log and named by its run, the image producer with its image, the failed one run here"
+# A step only part of whose keys passed is run whole: the producer's envelope taken over is withdrawn, and the image it
+# brought with it, so the producer run again stores its own rather than being told one is already stored.
+printf 'STATUS\tfull\tprepared\nSTEP\t0\t2\tthe image producer and a gate\ttrue\t\nKEY\t0\t%s\nKEY\t0\t%s\n' "$producer_key" "$failed_key" >"$work/partial-plan"
+partial="$(model run-start --out-root "$work/continued")" || fail "run-start refused the partial run"
+echo L2 >"$partial/level"
+model continue-run --run "$partial" --from "$earlier" --steps "$work/partial-plan" >"$work/partial-covered" 2>"$work/partial.err" || fail "the partial run could not be continued: $(tail -2 "$work/partial.err")"
+[[ ! -s "$work/partial-covered" ]] || fail "a step with a key that failed was covered: $(cat "$work/partial-covered")"
+[[ ! -f "$partial/evidence/image.libersystem-iso+x86_64+host+shared-image.json" ]] || fail "the producer's taken-over envelope was not withdrawn"
+[[ -z "$(ls -A "$partial/artifacts" 2>/dev/null)" ]] || fail "the withdrawn producer's image stayed in the run: $(ls "$partial/artifacts")"
+echo "verify-evidence:   a step only part of whose keys passed runs whole, its producer's image withdrawn with its envelope"
 # Another QEMU on PATH: another identity, which may not continue the earlier run.
 mkdir -p "$work/moved-bin"
 cp "$(command -v qemu-system-x86_64)" "$work/moved-bin/qemu-system-x86_64"

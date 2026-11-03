@@ -613,10 +613,59 @@ check "and the run says where its envelope came from" 1 "$(grep -c 'CONTINUED: t
 check "and finishes" 0 "$rc"
 
 # 12. THE LEVELS' OWN REFUSALS: L1 starts from the revision the last passed L1 or L2 ran at and says how to give it when
-#     none has passed; L3 needs the room the last sealed build took and refuses before it builds anything.
+#     none has passed, stops before its merge when its inner half ended at a level it records no BASE on, and records
+#     BASE when its merge passes; L3 needs the room the last sealed build took and refuses before it builds anything.
 rc=0
 (cd "$release" && PATH="$release/bin:$PATH" CARGO_CALLS="$release/calls" ./verify.sh --level L1) >"$release/l1.log" 2>&1 || rc=$?
 check "an L1 with no base and no passed run before it is refused, naming --base" 1 "$(grep -c 'none has passed yet - give it this once:  --base REV' "$release/l1.log" || true)"
+# AND WHAT L1 DOES WITH ITS HALVES' ENDS, over a committed fixture tree whose `verify.sh` stands in for the two tiers -
+# it answers `--for-range` and `--merge` with the status each case gives it - while the preset runs under its name, so
+# its `$0` calls reach the stand-in: an inner half that passed and wrote its handoff but ended STALE stops before the
+# merge, saying how to accept that level; with it accepted the merge runs and BASE is recorded; a failed merge records
+# nothing.
+l1="$work/l1"
+mkdir -p "$l1/src/tools/verify-model" "$l1/.build/state"
+cp "$repo/verify.sh" "$l1/verify-preset.sh"
+cp "$repo/lib.sh" "$l1/"
+cp "$repo/src/tools/result-logs.sh" "$repo/src/tools/evidence.sh" "$repo/src/tools/staging-state.sh" "$l1/src/tools/"
+: >"$l1/src/tools/verify-model/Cargo.toml"
+cat >"$l1/verify.sh" <<'HALVES'
+#!/usr/bin/env bash
+echo "$*" >>"$L1_CALLS"
+case "$1" in
+--for-range)
+	[[ -z "$L1_HANDOFF" ]] || echo "verify.sh: inner handoff: $L1_HANDOFF"
+	exit "$L1_INNER"
+	;;
+--merge) exit "$L1_MERGE" ;;
+esac
+exit 99
+HALVES
+chmod +x "$l1/verify.sh"
+printf '/.build/\n' >"$l1/.gitignore"
+git -C "$l1" init -q
+git -C "$l1" add -A
+git -C "$l1" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
+l1_level() {
+	local inner="$1" merge="$2" handoff="$3"
+	shift 3
+	rm -f "$work/l1-calls" "$l1/.build/state/verify-last-passed"
+	touch "$work/l1-calls"
+	rc=0
+	(cd "$l1" && PATH="$release/bin:$PATH" CARGO_CALLS="$release/calls" L1_CALLS="$work/l1-calls" L1_INNER="$inner" L1_MERGE="$merge" L1_HANDOFF="$handoff" bash -c 'source ./verify-preset.sh "$@"' ./verify.sh --level L1 --base HEAD "$@") >"$work/l1-out.log" 2>&1 || rc=$?
+}
+l1_head="$(git -C "$l1" rev-parse HEAD)"
+l1_level 5 0 /fixture/handoff
+check "an L1 whose inner half passed but ended STALE stops with its status" 5 "$rc"
+check "before the merge, and records no BASE" "0 absent" "$(grep -c -- '--merge' "$work/l1-calls") $([[ -e "$l1/.build/state/verify-last-passed" ]] && echo present || echo absent)"
+check "naming the handoff it wrote and how to accept the level" "1 1" "$(grep -c 'passed and wrote its handoff (/fixture/handoff)' "$work/l1-out.log") $(grep -c -- '--level L1 --allow-shadow  accepts that level' "$work/l1-out.log")"
+l1_level 6 0 /fixture/handoff --allow-shadow
+check "with the level accepted, the merge of the handoff runs and BASE is recorded" "0 1 $l1_head" "$rc $(grep -c -- '^--merge /fixture/handoff --allow-shadow$' "$work/l1-calls") $(cat "$l1/.build/state/verify-last-passed" 2>/dev/null)"
+check "both halves are given the acceptance" 2 "$(grep -c -- '--allow-shadow' "$work/l1-calls")"
+l1_level 6 1 /fixture/handoff
+check "a merge that fails records no BASE" "1 absent" "$rc $([[ -e "$l1/.build/state/verify-last-passed" ]] && echo present || echo absent)"
+l1_level 1 0 ""
+check "an inner half that failed runs no merge" "1 0 1" "$rc $(grep -c -- '--merge' "$work/l1-calls") $(grep -c 'did not end with a handoff (status 1)' "$work/l1-out.log")"
 mkdir -p "$release/.build/state"
 echo 1000000000000000000 >"$release/.build/state/release-build-size"
 : >"$release/calls"

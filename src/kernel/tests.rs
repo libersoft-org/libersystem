@@ -3658,7 +3658,10 @@ pub(crate) fn test_runner(all: &[&dyn Testable]) {
 			}
 		}
 	}
-	if selected_non_smoke == 0 {
+	// A RESUMED RUN IS PAST ITS CHECK (2026-11-03): the filter's tags were held to it over the whole suite in the boot
+	// that failed, and the tests after a failure may be smoke tests alone - refused here, they never ran.
+	let resumed = option_env!("TEST_AFTER").is_some_and(|value| !value.trim().is_empty());
+	if selected_non_smoke == 0 && !resumed {
 		serial_println!("test filter error: requested tags selected no non-smoke tests");
 		arch::exit_qemu(false);
 	}

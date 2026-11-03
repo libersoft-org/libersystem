@@ -2266,21 +2266,28 @@ fn five_different_changes_are_five_pieces_of_evidence_even_when_the_decision_is_
 }
 
 // AND IN A PLAN FOR A CHANGE: a change that selects everything boots every target and runs the planner's own tests,
-// which read the test kernels those suites compile.
+// which read the test kernels. They wait for x86_64's suite, the inner tier's, and not for the ports', which the merge
+// runs: waiting for those deferred them, and an L0 of such a change ran none of them (2026-11-03). In place an earlier
+// run's port kernels are there; a release, built from nothing, waits for every suite (`release_steps`, below).
 #[test]
-fn a_check_that_reads_the_test_kernels_waits_for_the_suites_of_its_plan() {
+fn a_check_that_reads_the_test_kernels_waits_for_its_tiers_suite_and_stays_inner() {
 	let model = model();
 	let plan = plan_for(&model, &["src/harness/test-kernel.sh"]);
 	let per_target: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
 	let steps = crate::commands::steps(&plan, &per_target, &model.registry);
 	let suites: Vec<&String> = steps.iter().filter(|step| step.id.starts_with("guest:")).map(|step| &step.id).collect();
-	assert!(!suites.is_empty(), "a harness change boots the targets, or this fixture proves nothing");
+	assert!(suites.iter().any(|id| id.starts_with("guest:aarch64:")) && suites.iter().any(|id| id.starts_with("guest:x86_64:")), "a harness change boots every target, or this fixture proves nothing: {suites:?}");
 	let readers: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.keys.iter().any(|key| crate::catalog::CHECKS_THAT_READ_THE_TEST_KERNELS.contains(&key.check.as_str()))).collect();
 	assert!(!readers.is_empty(), "a harness change selects the planner's own tests, or this fixture proves nothing");
-	for step in readers {
+	for step in &readers {
 		for suite in &suites {
-			assert!(step.requires.contains(suite), "{} waits for {suite}: {:?}", step.id, step.requires);
+			assert_eq!(step.requires.contains(suite), suite.starts_with("guest:x86_64:"), "{} waits for x86_64's suite and no port's: {:?}", step.id, step.requires);
 		}
+	}
+	let original = plan.items.iter().map(|item| item.key.clone()).collect();
+	let (inner, _) = crate::tier::partition(&steps, &original).unwrap();
+	for step in readers {
+		assert!(step.keys.iter().all(|key| inner.contains(key)), "{} stays in the inner tier", step.id);
 	}
 }
 
@@ -2918,13 +2925,21 @@ fn the_gates_that_run_alone_keep_their_keys_and_slots_and_every_other_step_decla
 		assert_eq!(selected[0].guests, if crate::catalog::gate_schedules_a_guest(gate) { crate::catalog::gate_concurrent_guests(gate) } else { 0 });
 	}
 	for step in &steps {
-		let alone = step.command.strip_prefix("./check.sh --gate ").is_some_and(|gate| crate::catalog::ALONE_GATES.contains(&gate));
-		assert_eq!(step.exclusive_guests, alone, "only the gates listed run alone: {}", step.id);
+		let alone = step.id == "dev:lifecycle" || step.command.strip_prefix("./check.sh --gate ").is_some_and(|gate| crate::catalog::ALONE_GATES.contains(&gate));
+		assert_eq!(step.exclusive_guests, alone, "only the gates listed and the development lifecycle run alone: {}", step.id);
 		assert!(crate::resources::step_declaration(step).is_some(), "the release step {} declares what it uses", step.id);
 	}
 	let lifecycle = steps.iter().find(|step| step.id == "dev:lifecycle").unwrap();
-	assert!(!lifecycle.exclusive_guests, "the lifecycle's instance is its own, with its own port");
+	assert!(lifecycle.exclusive_guests, "the lifecycle runs alone: its perf-gate measures time, and it edits a source every target's digest covers");
 	assert_eq!(lifecycle.guests, 1);
+	// WHAT TWO HOST GATES TOUCH BESIDE THE GUESTS (2026-11-03): `targeted-cache` edits a source every target's digest
+	// covers, which a suite of any target holds its build to when it starts; `boot-harness` reads the real x86_64 staging.
+	let declared = |gate: &str| crate::resources::declaration(gate).unwrap();
+	for architecture in crate::registry::ARCHITECTURES {
+		let suite = steps.iter().find(|step| step.id == format!("guest:{architecture}:all")).and_then(crate::resources::step_declaration).unwrap();
+		assert!(declared("targeted-cache").conflicts_with(&suite), "targeted-cache does not run beside the {architecture} suite");
+	}
+	assert!(declared("boot-harness").conflicts_with(&declared("build-order")), "boot-harness does not run beside a step that writes the x86_64 staging");
 	let overlap = steps.iter().find(|step| step.keys.iter().any(|key| key.check == "gate.concurrent-selection")).unwrap();
 	assert_eq!(overlap.guests, 2, "running alone must not trim the two actual concurrent guests");
 }

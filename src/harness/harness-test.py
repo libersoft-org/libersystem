@@ -1821,15 +1821,23 @@ class LogsRulesTest(unittest.TestCase):
 		self.suite('x86_64', '20261002T000000Z', 102)
 		self.assertEqual(self.removed(), {path for path in traced if path.endswith('-run.log')})
 
-	def test_a_failed_run_is_kept_until_a_later_run_of_its_target_passes(self):
+	def test_a_failed_run_is_kept_until_a_later_whole_run_of_its_target_passes(self):
 		passed = self.suite('aarch64', '20261001T000000Z', 101)
 		failed = self.suite('aarch64', '20261002T000000Z', 102, passed=False) | self.suite('aarch64', '20261003T000000Z', 103, passed=False)
 		self.assertEqual(self.removed(), passed)
-		self.suite('aarch64', '20261004T000000Z', 104)
+		self.suite('aarch64', '20261004T000000Z', 104, whole=True)
 		self.assertEqual(self.removed(), passed | failed)
 
+	# A SPLIT SUITE'S PARTS (D1) are selections of one target, started one after another: a part that failed is kept
+	# beside the later parts that passed, which ran other tests, until a whole run of its target passes.
+	def test_a_failed_part_of_a_split_suite_is_kept_beside_the_later_parts_that_passed(self):
+		parts = [self.suite('aarch64', f'20261002T00000{part}Z', 200 + part, passed=part != 2) for part in range(1, 5)]
+		self.assertEqual(self.removed(), parts[0] | parts[2], 'the failed part 2 and the newest part stay')
+		self.suite('aarch64', '20261003T000000Z', 300, whole=True)
+		self.assertEqual(self.removed(), set().union(*parts), 'and go once a whole run of the target has passed')
+
 	# A RUN THAT HAD TO RESUME FAILED, though its last resumed boot printed the pass line: it is kept like any failed
-	# run, with its resumed boots' logs, until a later run of its target passes.
+	# run, with its resumed boots' logs, until a later whole run of its target passes.
 	def test_a_resumed_run_is_a_failed_run(self):
 		resumed = self.suite('x86_64', '20261002T000000Z', 102, passed=False)
 		for half in ('run', 'guest'):
@@ -1839,8 +1847,8 @@ class LogsRulesTest(unittest.TestCase):
 			resumed.add(name)
 		self.suite('x86_64', '20261003T000000Z', 103, passed=False)
 		self.assertEqual(self.removed(), set(), 'a resumed run is kept as a failed one, its resumed boots with it')
-		self.suite('x86_64', '20261004T000000Z', 104)
-		self.assertTrue(resumed <= self.removed(), 'and goes, whole, once a later run of its target passes')
+		self.suite('x86_64', '20261004T000000Z', 104, whole=True)
+		self.assertTrue(resumed <= self.removed(), 'and goes, whole, once a later whole run of its target passes')
 
 	# THE PLANNER'S DURATIONS: a port's suite is split across guests by each test's measured duration in the newest
 	# whole run, which a later selection does not replace - so that run stays beside the newer one, and goes once a newer

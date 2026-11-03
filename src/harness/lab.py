@@ -2690,7 +2690,10 @@ def suite_logs_kept(directory, alive):
 			passed = not resumed and any(SUITE_PASSED.search(read_bytes(path)) for path in runs[run] if path.endswith(('-run.log', '-guest.log')))
 			if newest == 0 or not passed:
 				kept.update(runs[run])
-			if passed:
+			# ONLY A WHOLE RUN THAT PASSED supersedes the failures before it (2026-11-03): a passed part of a split suite
+			# or a passed selection ran other tests than the failed one, whose logs went when the run that made them
+			# ended - a port's part that failed in an L1 was gone before anyone read it.
+			if passed and any(WHOLE_RUN in read_bytes(path) for path in runs[run]):
 				break
 		# The newest whole run, chosen as the planner chooses it.
 		for run in reversed(ended):

@@ -1317,6 +1317,16 @@ print(json.dumps({"reason": "compiler-artifact", "executable": str(out), "target
         self.assertEqual(compiles, ["-", "kernel.fixture.t3"], "one more compile for the resumed boot")
         self.assertEqual(len([name for name in logs if "-restart1-" in name]), 2, "the resumed boot's run and guest logs, named after the suite's run")
 
+    def test_the_last_result_logs_line_names_the_boot_that_failed(self):
+        # A reader takes the last `RESULT-LOGS` line (`result_logs`), and the shadow sweep grades only that log: it
+        # named the resumed boot, whose tests all passed, so a failed sweep read as clean.
+        for fail_at in (["kernel.fixture.t3"], ["kernel.fixture.t2", "kernel.fixture.t5"]):
+            result, _, _, _ = self.run_suite(fail_at)
+            lines = [line.split("RESULT-LOGS ", 1)[1].split() for line in result.stdout.splitlines() if "] RESULT-LOGS " in line]
+            self.assertTrue(lines, result.stdout)
+            self.assertFalse(any("-restart" in path for path in lines[-1]), f"the last line names a resumed boot: {lines[-1]}")
+            self.assertEqual(lines[-1], lines[0], "it names the suite's first boot, the one the first failure ended")
+
     def test_every_failure_of_the_suite_is_reported(self):
         result, ran, compiles, _ = self.run_suite(["kernel.fixture.t2", "kernel.fixture.t5"])
         self.assertNotEqual(result.returncode, 0)

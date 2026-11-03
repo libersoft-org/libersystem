@@ -213,7 +213,9 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("bluetooth-le-audio", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("bluetooth-service", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("bluetooth-transfer", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
-	("boot-harness", "host"),
+	// The shipped scenarios are validated against the real x86_64 staging since 2026-11-01, so a staging switch beside it
+	// is a read from under it (2026-11-03).
+	("boot-harness", "host stage:x86_64:r profile:shipping"),
 	("boot-manifest", "host stage:x86_64:r profile:shipping"),
 	("boot-volume-controllers", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("boot-volume-controllers-aarch64", "guest stage:aarch64:r profile:shipping media volume:aarch64:harness:r"),
@@ -234,7 +236,9 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("dependency-policy", "host"),
 	("development-build", "host"),
 	("development-gate", "host stage:x86_64:r profile:shipping"),
-	("development-lifecycle", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
+	// Its `dev.perf-gate` edits a source and rebuilds the staged `uname` through `dev-build.sh` (2026-11-03); the step
+	// runs alone as well (`commands::release_steps`).
+	("development-lifecycle", "guest stage:x86_64:w profile:development media volume:x86_64:harness:r"),
 	("dma-mode-aarch64", "guest stage:aarch64:r profile:shipping media"),
 	("dma-mode-carrier", "host"),
 	("dma-mode-ports", "guest stage:aarch64:r stage:riscv64:r profile:shipping media"),
@@ -355,7 +359,9 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("static-image", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
 	("supervisor-waits", "host"),
 	("system-suspend-riscv64", "guest stage:riscv64:r profile:development media"),
-	("targeted-cache", "host stage:x86_64:w profile:shipping"),
+	// IT EDITS `src/abi` across a build, and `abi` is in every target's source digest, which `test.sh` holds its build
+	// to when it starts - a suite of any target started in that span fails on the harness (2026-11-03).
+	("targeted-cache", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping"),
 	("test-tags", "host"),
 	("text-corpus", "host"),
 	("text-limits", "host"),
@@ -427,13 +433,14 @@ pub fn step_declaration(step: &crate::commands::Step) -> Option<Declaration> {
 // THE GATES WHOSE SCRIPTS DO NOT SHOW WHAT THEY DO, and why: ones that name a runner or a build they do not run, and
 // ones that write a staging without a build - they mutate the staged tree in place and put it back, which no build
 // call shows. Each is held to its declaration on the other half only. `(gate, "guest" | "staging" | "both", reason)`.
-pub const NOT_HELD_TO_ITS_SCRIPTS: [(&str, &str, &str); 14] = [
-	("boot-harness", "both", "host tests of lab.py and the scenario runner, against fakes and copies in temporary trees"),
+pub const NOT_HELD_TO_ITS_SCRIPTS: [(&str, &str, &str); 15] = [
+	("boot-harness", "both", "host tests of lab.py and the scenario runner, against fakes and copies in temporary trees; the shipped scenarios read the real staging, which is declared"),
 	("guest-verdict", "both", "host tests of the guest runners, with stand-in QEMU, runners and builds in temporary trees"),
 	("run-verdict", "guest", "copies of the entry scripts in private trees, with stub runners; its one real build is declared"),
 	("test-tags", "guest", "asks test.sh for the tags it accepts, which boots nothing"),
 	("dma-mode-carrier", "both", "reads the runners' sources for the run-mode carrier, and runs none of them"),
 	("gate-result-logs", "both", "reads the gate scripts' sources for how they find their logs, and runs none of them"),
+	("development-lifecycle", "staging", "its `dev.perf-gate` rebuilds the staged `uname` through `dev-build.sh`, which no build call shows"),
 	("verify-scheduler", "staging", "drives the runner over prepared plans in a private tree, with a `build.sh` stand-in it writes there"),
 	// FOUND BESIDE ANOTHER STEP (2026-10-26): `build-order`, run beside `staged-consistency`, failed its bootable volume
 	// build and passed alone - the gate mutates the real staged tree and restores it. They write, and are declared so.
