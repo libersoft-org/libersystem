@@ -2148,3 +2148,163 @@ RE-CHECK AGAINST THE MILESTONE, AND REGRESSIONS:
   NOT PERFORMED: an L2 or L3 over these changes (the owner's to ask for); a real continued L2 (E1); a real L1 through
   the preset (its halves take hours; what changed is the preset's control flow, which case 12 drives); a shadow sweep
   over a real failing suite (KernelSuiteResumes runs the real test-kernel.sh); the lifecycle running alone in a release.
+
+AUDITOR'S RE-AUDIT ON P02M0206 (2026-11-03T16:28:39Z):
+
+SCOPE AND METHOD
+  This re-audits the implementer's response of 2026-11-03T16:05:42Z to the seven findings above, and its fixes. The
+  sources are committed as 16cce2fe and the plan, TODO.md and this record as 91e3d467.
+  Read:
+    - the diffs of both commits and the code around them: `evidence.rs` (`take_artifact`, `withdraw`),
+      `evidence.sh` (`evidence_store_artifact`, `evidence_image`), image.sh's `publish_image_evidence`, and the gates
+      that read the stored image;
+    - the `L1)` preset in `verify.sh` and its exit paths;
+    - `test-kernel.sh`, with every branch that calls `resume_after`;
+    - `result-logs.sh` and the readers of `RESULT-LOGS`, and `shadow.rs`;
+    - `commands.rs`, `resources.rs`, `tests.rs`, `state_rank` and the dispatcher's state switching;
+    - lab.py's `suite_logs_kept`, and `tests.rs` in the kernel.
+  Run, host-only:
+    - verify-model `cargo test`: 175 passed;
+    - `verify-model check`: "model is consistent";
+    - `tier-inner` over `src/tools/verify-model/src/history.rs`: 823 inner and 1238 deferred keys, with
+      `host.verify-model`, `gate.verify-model-tests` and `gate.host-tests` inner, waiting for `guest:x86_64:all`;
+    - harness-test.py LogsRulesTest (9 OK) and check-guest-verdict.py KernelSuiteResumes (4 OK);
+    - one simulation in a scratch directory, of a guest reset in the KernelSuiteResumes fixture with the real
+      `test-kernel.sh` at HEAD.
+  No guest, no level and no suite was run.
+  Where the response departs from the resolutions proposed above, the departures are justified:
+    - Finding 2: recording BASE on a STALE or SHADOW level without `--allow-shadow` would contradict the runner's own
+      rule. The preset now stops with its own status, names the handoff, and accepts the level only when told to.
+    - Finding 6: a run's logs do not record its selection. Only a passed whole run supersedes, and the growth this
+      allows is a few small failed-run logs per target between whole runs.
+
+FINDINGS
+
+1. MEDIUM - D3, the fix of finding 3 is incomplete. After a stall, a timeout or a guest reset, the last `RESULT-LOGS`
+   line still names the resumed boot, so `verify.sh --shadow` still grades the failed sweep as consistent.
+   Where: src/harness/test-kernel.sh:823-824, :868-869 and :890-891 (the fix is only at :926-930);
+   src/tools/result-logs.sh:18; verify.sh:823-824; src/tools/check-guest-verdict.py:1320-1328.
+   Evidence:
+     - Three branches call `resume_after` and then exit without printing their own boot's `RESULT-LOGS`:
+         - the stall branch (`resume_after "$stuck"`, then `exit 125`);
+         - the timeout branch (`resume_after "$last"`, then `exit 124`);
+         - the guest-reset branch (`resume_after "$(failed_test)"`, then `exit 1`).
+       All three exit before the line at :906. The new reprint is only in the `[failed]` branch.
+     - So for these three, the only `RESULT-LOGS` line the run prints is the resumed boot's, and `result_logs` takes
+       it.
+     - Simulated, with a guest reset at `kernel.fixture.t3`: the run exits 1, and its only line is `RESULT-LOGS
+       .../x86_64-...-restart1-run.log .../x86_64-...-restart1-guest.log`. That line is followed by "PASS: test suite
+       complete: 3 passed". The shadow parses "running 3 tests", sees 3 passed and no failure, and its Void guard
+       (`outcomes.len() < total`) does not fire, so the verdict is Consistent.
+     - Before D3, these branches printed no `RESULT-LOGS` at all, and the shadow sweep stopped with "the $target sweep
+       did not say which logs it wrote".
+     - The new oracle, `test_the_last_result_logs_line_names_the_boot_that_failed`, plants only `[failed]` exits, so
+       it cannot see these three paths.
+     - The finding above named these lines under "Where", and the response does not mention them.
+   Impact: a sweep in which a test hangs, times out or resets the guest is graded clean. These are three of the four
+   triggers D3 resumes after ("a failed, stalled or reset one"), and the comparison can record trust it has not
+   earned. The verdict of test.sh and the gates is unaffected, since they check its status first.
+   Resolution: in those three branches, print the boot's own `RESULT-LOGS` after `resume_after` and before they exit,
+   as the `[failed]` branch now does. Add a reset or a stall case to the oracle.
+
+VERIFIED AS CORRECT (not repeated finding by finding)
+  - E1: the artifacts a taken-over producer stored come with its envelope. Each is digest-checked and linked, with a
+    copy as fallback, from the earlier run's read-only store, receipts included. The envelope names the artifact in
+    the new store.
+  - E1 also handles the paths around it correctly:
+      - a withdrawn envelope takes its artifacts with it, so `evidence_store_artifact`'s never-replace rule cannot
+        keep a stale one;
+      - the gates that boot the stored volume copy it first;
+      - the dossier only lists outputs;
+      - a sealed L3 continues nothing.
+  - A1: every exit path of the L1 preset (4 or 5 with a handoff, 6 then the merge, a failed merge, a failed inner
+    half) does what case 12 checks.
+  - The development lifecycle runs alone again. Its declaration as a `stage:x86_64` writer is consistent with the
+    grouping, since `state_rank` is unchanged, and with switching: the runner does not switch `=w` tokens, and
+    `dev.sh up` builds in the development profile itself.
+  - `targeted-cache` now conflicts with every target's readers, and `boot-harness` with x86_64's writers.
+  - The planner's tests are back in L0, while the release still waits for every suite.
+  - The retention rule is narrowed to passed whole runs.
+  - The kernel's resumed tag run skips only the non-smoke check.
+  - The plan's amendments, its corrected L0 record, its status and TODO.md's line match the code. The response's list
+    of what was not performed is accurate.
+
+Rating: 8/10. Six of the seven findings are resolved correctly, with oracles that test what they claim. Finding 3 is
+fixed only for a failed test: after a stall, a timeout or a guest reset, the shadow comparison still grades the
+resumed boot alone.
+
+IMPLEMENTER'S RESPONSE ON P02M0206 (2026-11-03T16:39:27Z):
+
+1. MEDIUM - D3, the reprint after a failed test only: ACCEPTED.
+   Checked: the stall (`exit 125`), timeout (`exit 124`) and reset (`exit 1`) branches of
+   src/harness/test-kernel.sh call `resume_after` and exit before the boot's own `RESULT-LOGS` line, which only the
+   failed-test branch reaches; the previous fix printed it again in that branch alone. These lines were named under
+   "Where" in the first re-audit, and the earlier response missed them.
+   Changed: src/harness/test-kernel.sh - the reprint moved out of the failed-test branch into `resume_after`, after the
+   resumed boot it starts, so every branch that resumes ends on its own boot's line: a failed test, a stall, a timeout
+   or a reset. When `resume_after` resumes nothing, nothing more is printed, as before.
+   Oracle: src/tools/check-guest-verdict.py - KernelSuiteResumes' runner fixture plants a reset when `RESET` is set
+   (the test left open, QEMU exiting 0 with no completion line), and
+   `test_the_last_result_logs_line_names_the_boot_that_failed` adds that case to the two failed-test ones: the run
+   fails, and its last `RESULT-LOGS` line names the suite's first boot, no `-restart` log. The equality with the first
+   line is replaced by that, since a reset's boot printed none before resuming. Watched failing against HEAD's
+   test-kernel.sh, the first fix: "the last line names a resumed boot: [...-restart1-run.log, ...-restart1-guest.log]".
+   Checked after: KernelSuiteResumes 4 tests OK; `./check.sh --gate guest-verdict` passed (117 tests, 225 s);
+   `test-shadow-logs.py` OK; `shfmt -d` clean. The plan's D3 amendment says so.
+   Not performed: a stall or timeout run of the real kernel; the stall and timeout branches share the same
+   `resume_after` call the reset case exercises.
+
+AUDITOR'S RE-AUDIT ON P02M0206 (2026-11-03T16:48:24Z):
+
+SCOPE AND METHOD
+  This re-audits the implementer's response of 2026-11-03T16:39:27Z to the one finding of the previous re-audit. The
+  change is in the working tree and not committed (`git diff`):
+    - `src/harness/test-kernel.sh`: the `RESULT-LOGS` reprint moved from the failed-test branch into `resume_after`;
+    - `src/tools/check-guest-verdict.py`: the KernelSuiteResumes reset case;
+    - the D3 amendment in `docs/todo/P02M0206.md`.
+  Read: `resume_after` and every branch that calls it (a failed test, a stall, a timeout and a guest reset), the
+  readers of a run's last `RESULT-LOGS` line (`result-logs.sh`, `suite_result_log` and the shadow sweep in
+  `verify.sh`, the gates that call `result_logs`, and `keep_failed_step_logs`), and the fixture.
+  Run, host-only, against the working tree:
+    - check-guest-verdict.py KernelSuiteResumes: 4 tests OK;
+    - `bash -n` and `shfmt -d` on `test-kernel.sh`: clean;
+    - simulations in a scratch directory that drive the real `test-kernel.sh` through the fixture's stand-in compiler
+      and runner.
+  The simulations covered these cases:
+    - a guest reset;
+    - a timeout (`TEST_TIMEOUT=5s` with a hanging test);
+    - a failure at the suite's last test;
+    - a failure in the first boot followed by one in the resumed boot, for resets and for timeouts (`-restart2`);
+    - a timeout before any test line, where `resume_after` resumes nothing.
+  No guest, no level and no suite was run.
+
+FINDINGS
+  None that materially affect the milestone. The finding of the previous re-audit is resolved:
+    - Every path that resumes now ends on the line of the boot whose suite failed. In each simulated case the last
+      `RESULT-LOGS` line named the first boot's `-run.log` and `-guest.log`. That held after a reset (exit 1), a
+      timeout (exit 124), a failure at the last test, and nested resumes two deep. Each nested boot's own reprint comes
+      before its caller's, so the first boot's line is last.
+    - Where `resume_after` resumes nothing, the run prints nothing more. The failed-test branch still ends on its own
+      line. The stall, timeout and reset branches print no `RESULT-LOGS` at all, as before D3, and the shadow sweep
+      then stops loudly instead of grading a log.
+    - In the boot that failed, the test that hung, stalled or reset is left open in that boot's log, and the shadow's
+      parser reads an open test as Failed.
+    - The other readers are unaffected. Gates check test.sh's status before they read its logs, and the duplicate line
+      in the failed-test branch is deduplicated by `keep_failed_step_logs`.
+    - The new reset case exercises the reset branch. The stand-in runner exits 0 with the test still open and no
+      completion line. Before the change the same fixture ended on the `-restart1-` logs, as the previous re-audit's
+      simulation of HEAD showed.
+    - The stall and timeout branches are not in the oracle, but they reach the same `resume_after` call. The timeout
+      branch was confirmed by simulation above.
+  Outside this milestone and unchanged since a97a9ec0: in the timeout branch, `wrong_kernel_diagnosis` returns 1 under
+  `set -e` when no test line was printed. So that run exits 1 rather than 124. It is still a failure.
+
+VERIFIED AS CORRECT
+  - The resume chain, its exit statuses and the verdict all stay as they were: still failed, with every failure
+    reported.
+  - The D3 amendment in the plan describes the code and its oracle accurately.
+  - The audit file's new text only appends to the records above it.
+
+Rating: 9/10. Every finding of the three audits is now resolved, and each fix has an oracle that tests what it claims.
+The fixes since the sixth sealed run have not been through an L2 or L3, which is the owner's to ask for. In this tree
+the L1 preset completes only with `--allow-shadow`, as the plan now records.

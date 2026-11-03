@@ -1268,6 +1268,10 @@ with open(os.environ["SERIAL"].removeprefix("file:"), "w") as log:
         with open(root / "ran", "a") as ran:
             ran.write(test + "\\n")
         if test in fail:
+            if os.environ.get("RESET"):
+                # A reset: QEMU ends with no debug-exit status, the test it happened in left open.
+                log.write(f"{test}...\\n")
+                sys.exit(0)
             log.write(f"{test}...\\t[failed]\\npanicked at the planted failure\\n")
             sys.exit(1)
         log.write(f"{test}...\\t[ok]\\n")
@@ -1284,7 +1288,7 @@ with open(root / "compiles", "a") as handle:
 print(json.dumps({"reason": "compiler-artifact", "executable": str(out), "target": {"name": "kernel"}}))
 """
 
-    def run_suite(self, fail_at, source=None):
+    def run_suite(self, fail_at, source=None, reset=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             harness = root / "src/harness"
@@ -1299,7 +1303,7 @@ print(json.dumps({"reason": "compiler-artifact", "executable": str(out), "target
             for path, text in ((harness / "qemu-run.sh", self.RUNNER), (root / "bin/cargo", self.CARGO)):
                 path.write_text(text)
                 path.chmod(0o755)
-            env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}", FIXTURE_ROOT=str(root), FAIL_AT=" ".join(fail_at), TEST_STALL="600")
+            env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}", FIXTURE_ROOT=str(root), FAIL_AT=" ".join(fail_at), TEST_STALL="600", RESET="1" if reset else "")
             for name in ("TEST_SELECTION", "TEST_AFTER", "TEST_FAILED_LIST", "TEST_RESTART_STEM", "TEST_RESTART_INDEX", "LIBER_VERIFY_RUN"):
                 env.pop(name, None)
             result = subprocess.run(["bash", str(harness / "test-kernel.sh"), "x86_64"], env=env, capture_output=True, text=True, timeout=120)
@@ -1319,13 +1323,15 @@ print(json.dumps({"reason": "compiler-artifact", "executable": str(out), "target
 
     def test_the_last_result_logs_line_names_the_boot_that_failed(self):
         # A reader takes the last `RESULT-LOGS` line (`result_logs`), and the shadow sweep grades only that log: it
-        # named the resumed boot, whose tests all passed, so a failed sweep read as clean.
-        for fail_at in (["kernel.fixture.t3"], ["kernel.fixture.t2", "kernel.fixture.t5"]):
-            result, _, _, _ = self.run_suite(fail_at)
+        # named the resumed boot, whose tests all passed, so a failed sweep read as clean - after a failed test, and
+        # after a reset, which ends its boot before that boot names its own logs.
+        for fail_at, reset in ((["kernel.fixture.t3"], False), (["kernel.fixture.t2", "kernel.fixture.t5"], False), (["kernel.fixture.t3"], True)):
+            result, _, _, _ = self.run_suite(fail_at, reset=reset)
+            self.assertNotEqual(result.returncode, 0, "the verdict stays failed")
             lines = [line.split("RESULT-LOGS ", 1)[1].split() for line in result.stdout.splitlines() if "] RESULT-LOGS " in line]
             self.assertTrue(lines, result.stdout)
             self.assertFalse(any("-restart" in path for path in lines[-1]), f"the last line names a resumed boot: {lines[-1]}")
-            self.assertEqual(lines[-1], lines[0], "it names the suite's first boot, the one the first failure ended")
+            self.assertEqual(len(lines[-1]), 2, f"the suite's first boot, its run and guest logs: {lines[-1]}")
 
     def test_every_failure_of_the_suite_is_reported(self):
         result, ran, compiles, _ = self.run_suite(["kernel.fixture.t2", "kernel.fixture.t5"])
