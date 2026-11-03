@@ -1768,3 +1768,68 @@ IMPLEMENTER'S RECORD: A FAILED STEP'S LOGS KEPT IN THE RUN (2026-11-02, appended
   for it, on the owner's word.
   NOT PERFORMED: a real failed step in a real run keeping real logs (the sixth L3 will show it, or not if nothing
   fails); the 64 MiB bound against a real failure's logs.
+
+IMPLEMENTER'S SIXTH L3 AND WHAT IT FOUND ON P02M0206 (2026-11-03, appended; nothing above is changed)
+  THE RUN: `./verify.sh --level L3` at f5296c8e, the owner's commit of the kept failed-step logs (5edc358a, C4's
+  nested-tree guard, before it), started at 22:31:36Z on 2026-11-02 under `/root/p0206-l3/run.sh`, with the disk
+  watcher and the `.build` sampler beside it; it ended at 07:12:17Z, exit 1, 31,241 s.
+  - The room check: "L3: 104203849728 bytes free, and the last sealed build took 49633091584". The snapshot: "release
+    snapshot: f5296c8e... at /data/yellow/.rf5296c8e4"; it is gone after the run.
+  - The build from nothing: 21 build steps, all passed, 3,303 s between them, the first published at 22:32:42Z and
+    the last at 23:32:34Z.
+  - "measured: 31138 s wall clock over 4 guest slot(s); the steps took 72891 s between them"; the estimate was 75,224 s
+    of priced steps and a floor of 20,572 s.
+  - The size: "release: the sealed build from nothing took 48268338924 bytes, and the run 49517023232 bytes of the disk
+    at its fullest - 49517023232 recorded for the next L3"; `.build/state/release-build-size` holds 49517023232. The
+    external watcher, sampling each minute, saw 54,925,316,096 free at its lowest; the sampler's largest apparent
+    `.build`, 51,527,505,285 at 04:03Z.
+  - 11 steps failed, none was blocked; the dossier "incomplete - 378 row(s), 378 required key(s), 14 refusal(s)"
+    (the lifecycle's step carries four of the keys).
+  WHAT IT VERIFIED OF THE TWO COMMITTED CHANGES:
+  - C4's nested tree: `smp-core-cap` passed in 41 s ("a machine past the supported count boots on 64 cores, says so,
+    and loses nothing"); it started at step 262 while `implementation-mutations` (step 257) was between its catches,
+    and that gate passed too ("5 deliberate kernel defects, each caught by the assertion written against it").
+  - The kept logs: five failed steps printed the note - the three IOMMU profiles "kept 4 log file(s) ..., 14372 /
+    14518 / 18579 bytes", `system-suspend-riscv64` 4 files, 183,515 bytes, `tickless-idle` 3 files, 578,778 bytes;
+    no "not kept" note. In the run, `logs/gate.iommu-aarch64-direct-gicv2-hostile+.../logs+test+aarch64-...-guest.log`
+    holds "not confirmed detached"; `logs/gate.system-suspend-riscv64+.../logs+system-suspend-riscv64+unsupported-
+    serial.log` holds "the SBI System Suspend extension is not offered by this firmware"; `logs/gate.tickless-idle+.../
+    boot+tickless-{x86_64,aarch64,riscv64}.log`. No kernel `.elf` was copied.
+  - The six failed steps that kept nothing, and why: `arch-profile-{aarch64,riscv64}-no-dt-absent-1` (the gate keeps
+    its own `<profile>.log` with its envelope, and the output names no `.build` log); `dynamic-report` and
+    `soft2d-performance` (host gates; the output is the evidence); the development lifecycle (keeps `dev-serial.log`,
+    `dev-qemu.log`, `up.log`, `down.log` and each check's log itself, as in every run since 2026-10-26);
+    `qemu-pcie-hotplug` (its lab state is `mktemp -d "${TMPDIR:-/tmp}/liber-lab.XXXXXX"`, removed by its `cleanup` on
+    EXIT; nothing under `.build`). `grep` over `src/tools/check-*.sh` for that `mktemp` and a later `.build/logs` copy
+    finds four more with no copy: `check-audio-routing.sh`, `check-dfu-tool.sh`, `check-qemu-pcie-aer.sh`,
+    `check-tpm-tool.sh`. Recorded as a limit under OPEN, not changed.
+  THE ELEVEN FAILURES, each against the fifth's `l3.out` (`/root/p0206-l3/fifth`, the sixth's in `.../sixth`), the same
+  message the same number of times in both: "loaded a kernel after refusing the DMA mode" (2 and 2), "was not confirmed
+  detached" (3, 3), "SBI System Suspend extension is not offered" (2, 2), "an idle core woke" (3, 3), "the slot was
+  powered down at line 1" (1, 1), "DYNAMIC_EXECUTABLES.tsv is stale" (both). Then:
+  - `soft2d-performance`: "image-convert ... 16.386 ... 16.063 ... OVER", running alone (`ALONE_GATES`); the third L3's
+    line was "16.119 ... 16.063 ... OVER". Passed in the fourth and fifth. FLAKES.md now has it as not a flake.
+  - The development lifecycle: `dev.selftest` passed; `dev.proto-test` "FAIL 16 pipelined requests are answered in
+    order, 32768 B each: (1, {(4, 0)}, False, True)", "round trip for the whole burst: 90030 ms", then "proto-test: the
+    guest never completed a handshake"; `dev.perf-gate` and `dev.gpu-restart` "the development instance is starting".
+    The fifth's kept logs (its run directory, `20261101T224245Z-df0cfad1-...`) show the same: 90,026 ms, the same
+    tuple. Both serial logs: no panic (`grep -ciE "panic|fault at|oops"` 0), "agent.dev: online (registry)" twice -
+    the boot's and the restart `proto-test` asks for before its launch section ("restarting the agent, so nothing is
+    launched..."), so the fifth's record "ends mid-line after the agent's restart" read that restart as more than it
+    was. `lab.py` names an instance "starting" when its broker holds the lock and `WAIT 3` on the control socket
+    sees no prompt (`dev_state`, `dev_ready`).
+  THE LIFECYCLE ALONE (the oracle for load against code): `./check.sh --gate development-lifecycle` in the tree at
+  f5296c8e (only FLAKES.md changed, under docs/), no other guest on the machine (`ps -eo comm` showed no qemu), output
+  in `/root/p0206-fix5/lifecycle-alone.log`: up, `dev.selftest` passed (24 s), `dev.proto-test` FAILED (exit 1, 69 s)
+  with a traceback ending in `group_fuzz` -> `fuzz_rounds` -> `Peer.send` -> `sendall` "TimeoutError: timed out";
+  `dev.perf-gate` and `dev.gpu-restart` "the development instance is starting"; "3 of 4 development checks failed";
+  `RESULT failed exit=1 seconds=327`. In place there is no run directory, so only the tail of `proto-test`'s output is
+  printed and whether its pipeline line passed is not shown; 69 s is less than the pipeline group's 60 s send window
+  plus a 30 s read that a stall costs, so it did not stall there. The in-place rehearsal of 2026-11-01
+  (`/root/p0206-fix4/rehearsal.out`): "ok 16 pipelined requests ... 287 ms", then "the guest never completed a
+  handshake". So it fails with nothing beside it, one group later than under load: not load, not a flake, not this
+  milestone's - the protocol defect listed since 2026-10-20/21.
+  RECORDED: P02M0206.md - the status's last sentence, A3 (THE SIXTH L3), G1 (as a release sees it), VERIFICATION,
+  OPEN ("Found by the sixth L3"); TODO.md's line; FLAKES.md (`soft2d-performance` not a flake; the passes of the
+  sixth beside each entry seen). Outputs archived in `/root/p0206-l3/sixth`.
+  NOT PERFORMED: the 64 MiB bound against a real failure (the largest step kept 578,778 bytes); a seventh L3.
