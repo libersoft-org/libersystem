@@ -2021,3 +2021,130 @@ Rating: 7/10. Most of the milestone is carefully implemented and verified by ora
 sealed runs. Against that: E1's continuation fails the image gates in its main case, the L1 preset cannot complete
 in this tree, D3 silently weakens the shadow comparison, and several overlap declarations understate what their
 steps write.
+
+IMPLEMENTER'S RESPONSE ON P02M0206 (2026-11-03T16:05:42Z):
+
+Each finding was checked against the code before anything was changed. All seven hold, and each is fixed within the
+milestone's own items; every fix has an oracle that was watched failing against the code as it stood, then passing.
+
+1. HIGH - E1, a continued L2 loses its producers' images: ACCEPTED.
+   Checked: `Run::continue_from` copied only `envelope.logs`; `image.sh` stores `libersystem.iso` with its
+   `.build-key`/`.build-digest` receipts in `$LIBER_VERIFY_RUN/artifacts` and names it in `outputs` by absolute path;
+   `evidence_image` reads only that store. The extended oracle reproduced it against the old runner: "a gate run again
+   found no image in the continued run: evidence: this run produced no libersystem.iso ...".
+   Changed:
+   - src/tools/verify-model/src/evidence.rs: new `Run::take_artifact`. For each output of a taken-over envelope that
+     lies in the earlier run's `artifacts/` (compared canonically) it checks the sha256 the envelope recorded, links the
+     file into this run's `artifacts/` (a copy if the hard link fails) with every receipt stored beside it (`NAME.*`),
+     and names the output there; `continue_from` republishes the envelope with those outputs. An output outside the
+     store is named as it was.
+   - `Run::withdraw` also removes the artifacts and receipts a withdrawn taken-over envelope brought into this run's
+     store, so its producer, run again, stores its own rather than being told one is already stored.
+   - src/tools/check-verify-evidence.sh section 5: the earlier run also has a passed image producer
+     (`image.libersystem-iso`) with a stored image and receipt. The continued run covers its step; `evidence_image`
+     finds the image there, same bytes and same receipt; the envelope names the image in the continued run; the dossier
+     says two envelopes were taken over. A second continued run, whose plan step carries the producer's key and a failed
+     one: the step is not covered, the producer's envelope is withdrawn, and no image is left in the run.
+   Watched failing: section 5 against HEAD's evidence.rs failed with the message above; with `take_artifact` and without
+   the withdrawal, "the withdrawn producer's image stayed in the run: libersystem.iso". The whole `verify-evidence` gate
+   passed afterwards (492 s).
+
+2. MEDIUM - A1, the L1 preset stops after its inner half: ACCEPTED, by the second resolution, not the first.
+   Checked: the inner half prints its handoff after `tier-inner-finish` and only then judges its level - STALE exits 5,
+   SHADOW 4 - while the preset required 6 and said "did not end with a handoff", which was false. `./verify.sh --age`:
+   "292 of 2074 keys are stale against a 30-day window (292 have never run)": the five `dev.*` keys (the lifecycle step
+   has failed in every run, so they were never recorded passed), the ten umbrella gates, the `guest.boot-smoke` and
+   `guest.whole-suite` fallback rows, and per-test kernel keys. The implementer's record of the L0s, "until a full run
+   records them", was wrong, and is corrected in the plan.
+   Not taken: accepting 4 and 5 and recording BASE. `evidence_level` judges STALE before SHADOW, so a STALE level hides
+   whether the changed components are trusted, and the runner's rule is that a scoped green is not read as a
+   verification without `--allow-shadow`; recording BASE on it would mark the range verified on a level the tree says
+   is not.
+   Changed:
+   - verify.sh, the `L1)` preset: an inner half that printed its handoff and ended 4 or 5 stops before the merge with
+     its own status, names the handoff and says `./verify.sh --level L1 --allow-shadow` accepts the level (the merge
+     runs, and BASE is recorded when it passes). Any other status keeps the old refusal. The `--level` help says so.
+   - src/tools/check-verify-scheduler.sh case 12: a committed fixture tree whose `verify.sh` stands in for the two
+     halves while the preset runs under that name (`bash -c 'source ./verify-preset.sh "$@"' ./verify.sh ...`). Inner 5
+     with a handoff: exit 5, no merge, no BASE, the message. Inner 6 and merge 0 with `--allow-shadow`: the merge of the
+     handoff with the acceptance, both halves given it, BASE = HEAD. Merge 1: no BASE. Inner 1: no merge, the refusal.
+   Watched failing: HEAD's verify.sh failed "an L1 whose inner half passed but ended STALE stops with its status -
+   expected '5', got '1'" and the message check. The passing path passed with both - it was untested, not broken.
+
+3. MEDIUM - D3, a shadow sweep after a resumed suite grades only the boot after the failure: ACCEPTED.
+   Checked: `test-kernel.sh` prints `RESULT-LOGS` before its verdict and `resume_after`, the resumed boot prints its
+   own after it, `result_logs` takes the last, and `verify.sh --shadow` ignores test.sh's status and parses only that.
+   Changed: src/harness/test-kernel.sh - after `resume_after`, in the failure branch, the boot prints its
+   `RESULT-LOGS` line again, so the last line names the boot whose suite failed, and the shadow parses the failed test
+   as Failed, as before D3. The gates that read `result_logs` check test.sh's status first, and now get the failed
+   boot's logs, which carry the failure.
+   Oracle: src/tools/check-guest-verdict.py, KernelSuiteResumes
+   `test_the_last_result_logs_line_names_the_boot_that_failed` - with one planted failure and with two, the last line
+   names no `-restart` log and is the first boot's. Watched failing against HEAD's test-kernel.sh ("the last line names
+   a resumed boot: [...-restart1-run.log, ...-restart1-guest.log]"). The class's other three tests and
+   `test-shadow-logs.py` pass. On the real x86_64 kernel the resumed tag run of finding 7 printed the line twice.
+
+4. MEDIUM - C1/C2/C5, steps that write what they are declared to read: ACCEPTED, all four parts.
+   Checked: ccccea4e changed the lifecycle step's `exclusive_guests` from true to false, and nothing records it;
+   `perf-gate.py` appends a probe to `user/apps/tools/src/uname.rs` and runs `dev-build.sh uname x86_64`;
+   `check-shared-cache.sh` appends to `src/abi/src/lib.rs` around `targeted_decision`; `abi` and `user` are in
+   `VOLUME_SOURCES`, and test.sh dies on a mismatch ("the build does not match the sources"); harness-test.py's
+   `test_every_shipped_scenario_still_validates` links the real `.build/image/x86_64-unknown-none`.
+   Changed:
+   - src/tools/verify-model/src/commands.rs, `release_steps`: the development lifecycle's step runs alone
+     (`exclusive_guests: true`), with the reason.
+   - src/tools/verify-model/src/resources.rs: `targeted-cache` "host stage:x86_64:w stage:aarch64:w stage:riscv64:w
+     profile:shipping"; `boot-harness` "host stage:x86_64:r profile:shipping", its exemption's reason updated;
+     `development-lifecycle` writes `stage:x86_64`, and is listed in `NOT_HELD_TO_ITS_SCRIPTS` for the staging half
+     (`dev-build.sh` is no build call the check sees).
+   - src/tools/verify-model/src/tests.rs: the run-alone test requires the lifecycle to run alone, and only it and
+     `ALONE_GATES`; `targeted-cache` conflicts with every target's `guest:ARCH:all` step; `boot-harness` conflicts
+     with `build-order`, a writer of the x86_64 staging.
+   Watched failing: each part separately, against HEAD's commands.rs and resources.rs (tests.rs:2922, :2933, :2935).
+   `verify-model check`: "model is consistent". The cost: the lifecycle (about 7.5 minutes alone) and
+   `targeted-cache` no longer overlap other work.
+
+5. LOW - the planner's own tests left L0: ACCEPTED.
+   Checked: `tier-inner` over `src/tools/verify-model/src/history.rs` - 820 inner keys, 1,241 deferred, the three
+   (`host.verify-model`, `gate.verify-model-tests`, `gate.host-tests`) among the deferred.
+   Changed: src/tools/verify-model/src/commands.rs, `steps_for_items`: a step that reads the test kernels requires only
+   the `guest:x86_64:` steps of its plan. `release_steps` still adds every suite; the release plan's
+   `host.verify-model` step still requires `guest:{aarch64,riscv64,x86_64}:all`, so the first L3's class 6 stays fixed.
+   Oracle: tests.rs `a_check_that_reads_the_test_kernels_waits_for_its_tiers_suite_and_stays_inner` replaces
+   `a_check_that_reads_the_test_kernels_waits_for_the_suites_of_its_plan`, which asserted the behaviour found: the
+   three wait for x86_64's suite and no port's, and `tier::partition` keeps them inner. Watched failing against the old
+   rule ("waits for x86_64's suite and no port's: [guest:aarch64:all, guest:riscv64:all, guest:x86_64:all]"). After:
+   823 inner keys, 1,238 deferred, the three waiting for `guest:x86_64:all`.
+
+6. LOW - G1 with D1, a failed part's logs swept when its run ends: ACCEPTED, the first resolution narrowed to whole runs.
+   Checked: `suite_logs_kept` stopped at the first passed run, newest first, whatever it ran; `logs_hold` sweeps once
+   more when its owner ends.
+   Changed: src/harness/lab.py, `suite_logs_kept`: only a passed run that ran the whole suite (`WHOLE_RUN`) ends the
+   walk, so a failed run before a passed part or selection stays. "Or the same selection" is not taken: a run's logs do
+   not carry its selection, matching one would be a new mechanism, and whole runs come with every L1, L2 and L3.
+   Oracle: src/harness/harness-test.py, LogsRulesTest
+   `test_a_failed_part_of_a_split_suite_is_kept_beside_the_later_parts_that_passed` - four parts, the second failed: it
+   stays beside the later parts that passed, and goes once a whole run passes. Watched failing against HEAD's lab.py.
+   Two existing tests now pass their superseding run as a whole one, which the rule requires.
+
+7. LOW - D3 in a tag run, the kernel's filter check after the resume point: ACCEPTED.
+   Checked on the real x86_64 kernel, after `./build.sh --arch x86_64`:
+   `TEST_AFTER=kernel.arch.x86_64.apic.timer_ticks_advance ./test.sh --arch x86_64 --tags apic` (`apic`'s only test,
+   the 55th of the suite, with all seven smoke tests after it) printed "resuming after ...", then "test filter error:
+   requested tags selected no non-smoke tests", and exited 35.
+   Changed: src/kernel/tests.rs, `test_runner`: the `selected_non_smoke == 0` refusal is skipped when `TEST_AFTER` is
+   set; the boot that failed held the tags to it over the whole suite.
+   After: the same command printed "running 7 tests (523 skipped, 530 total)", the seven smoke tests [ok] and "test
+   suite complete: 7 passed", exit 0; `--tags apic` alone passed (8); `TEST=1 TEST_TAGS="" cargo build --tests` in
+   src/kernel built.
+
+RE-CHECK AGAINST THE MILESTONE, AND REGRESSIONS:
+  - `./check.sh --gate verify-model,verify-model-tests,boot-harness,guest-verdict,verify-scheduler`: all passed, 769 s
+    (verify-model 175 tests, "model is consistent"; harness 128; guest runners 117; the scheduler's cases 1-14).
+  - `./check.sh --gate verify-evidence`: passed, 492 s, one x86_64 boot, sections 1-5.
+  - `shfmt -d` clean on verify.sh, test-kernel.sh, check-verify-evidence.sh and check-verify-scheduler.sh.
+  - The plan's items A1, C1, C5, D3, E1 and G1 are amended with what changed and its oracle, the L0 record corrected,
+    the status and TODO.md's line updated.
+  NOT PERFORMED: an L2 or L3 over these changes (the owner's to ask for); a real continued L2 (E1); a real L1 through
+  the preset (its halves take hours; what changed is the preset's control flow, which case 12 drives); a shadow sweep
+  over a real failing suite (KernelSuiteResumes runs the real test-kernel.sh); the lifecycle running alone in a release.
