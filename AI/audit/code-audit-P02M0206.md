@@ -1833,3 +1833,191 @@ IMPLEMENTER'S SIXTH L3 AND WHAT IT FOUND ON P02M0206 (2026-11-03, appended; noth
   OPEN ("Found by the sixth L3"); TODO.md's line; FLAKES.md (`soft2d-performance` not a flake; the passes of the
   sixth beside each entry seen). Outputs archived in `/root/p0206-l3/sixth`.
   NOT PERFORMED: the 64 MiB bound against a real failure (the largest step kept 578,778 bytes); a seventh L3.
+
+AUDITOR'S RE-AUDIT ON P02M0206 (2026-11-03T13:10:51Z):
+
+SCOPE AND METHOD
+  This file has no earlier auditor's section, so this is the first audit of the implementation. It is checked against
+  `docs/todo/P02M0206.md` (items A to G, VERIFICATION, EXCLUDES, the owner's decisions and OPEN), the plan's line in
+  TODO.md and `docs/verification/FLAKES.md`, by reading the code the records name at HEAD 6f5b200d (`git diff a97a9ec0
+  HEAD`). The code read: `verify.sh`, `test.sh`, `lib.sh`, `build.sh`, `src/tools/staging-state.sh`, `guest-gate.sh`,
+  `evidence.sh`, `result-logs.sh`, `check-shared-cache.sh`; the verify model (`resources.rs`, `commands.rs`,
+  `catalog.rs`, `history.rs`, `evidence.rs`, `identity.rs`, `tier.rs`, `shadow.rs`, `main.rs`); `src/harness/`
+  (`lab.py`, `guest-console.py`, `test-kernel.sh`, `perf-gate.py`); and `src/kernel/tests.rs`.
+  Run, host-only, all passed:
+    - verify-model `cargo test` (175 passed), `verify-model check` ("model is consistent"), `verify-model release-plan`
+      (374 steps, 11 that run alone), `tier-inner` over a planner change, `./verify.sh --age`;
+    - harness-test.py LogsRulesTest, LogsLockTest, GuestConsoleTest and CompletionLineTest;
+    - check-guest-verdict.py KernelSuiteResumes and GuestGateStopsWithItsDriver.
+  Simulated in a scratch directory: `suite_logs_kept`, the resume in `test-kernel.sh`, and `guest-console.py`.
+  No guest, no level and no suite was run.
+
+FINDINGS
+
+1. HIGH - E1: a continued L2 does not carry the earlier run's image artifacts, so every image-reading gate it runs
+   again fails.
+   Where: src/tools/verify-model/src/evidence.rs:189-215 (`Run::continue_from`); src/tools/evidence.sh:103-112
+   (`evidence_image`); verify.sh:1773-1810; src/tools/verify-model/src/main.rs:2118-2120.
+   Evidence:
+     - `continue_from` copies only each passed envelope's `logs` (`for log in &envelope.logs`, :200) and republishes
+       the envelope (:212). Nothing copies the earlier run's `artifacts/`.
+     - A step all of whose keys were taken over is printed `COVERED` (main.rs:2120) and decided "CONTINUED" without
+       running (verify.sh:1805). That includes the image producers.
+     - Inside a run, `evidence_image` reads only `$LIBER_VERIFY_RUN/artifacts/NAME`. Otherwise it fails with
+       "evidence: this run produced no $name ... a gate does not take one from the tree instead" (evidence.sh:110).
+   Impact:
+     - Take E1's own case: an earlier L2 whose image producer passed early, and whose later steps failed or never
+       ran. In the run that continues it, four gates fail because of the harness, not the code: `signed-boot`,
+       `secure-boot`, `qemu-virtio-iommu-x86_64` and `verify-evidence`. These are the four scripts that call
+       `evidence_image`.
+     - The dossier of the continued run also names producer outputs that its run does not hold.
+     - The L2 of 2026-10-26 is an example: `signed-boot` failed there after its producer had passed.
+     - The oracles cannot see this. `check-verify-evidence.sh` section 5 continues a plan of two gates with no
+       producer, and `check-verify-scheduler.sh` case 11 stands in for `continue-run` (:585).
+   Resolution: when a producer's envelope is taken over, take the earlier run's `artifacts/` files with it, digests
+   checked as for logs. Alternatively, never cover a producer step whose artifact a pending step reads. Add that case
+   to section 5.
+
+2. MEDIUM - A1: the L1 preset stops after its inner half whenever the tier ends STALE or SHADOW, which today is every
+   run in this tree. Its passing path was never run or tested.
+   Where: verify.sh:312-333; src/tools/verify-model/src/tier.rs:535-560; verify.sh:1925-1941.
+   Evidence:
+     - The preset requires `((inner_status == 6)) && [[ -n "$handoff" ]] || die "L1: the inner tier did not end with
+       a handoff (status $inner_status)"` (:327). It then requires `"$0" --merge ... || die "L1: the merge did not
+       pass"` (:329) before it writes `verify-last-passed`.
+     - An inner run exits 6 only at INCOMPLETE. `evidence_level` returns STALE first whenever a key of the catalogue
+       is past the age window and not selected (tier.rs:553-555). The runner then exits 5 (4 for SHADOW) after it
+       has printed the handoff, unless `--allow-shadow` is given.
+     - `./verify.sh --age` here says "292 of 2074 keys are stale ... (292 have never run)". They include the ten
+       umbrella gates (`gate.hibernate-ports`, `gate.iommu-ports`, ...), which the catalogue says nothing can select
+       (catalog.rs:924), so no level ever clears them.
+     - The records agree. All three L0s and both runs of the L1's inner half ended "exit 5, STALE".
+     - The L1 was run as two halves started by hand, and `--merge` never ran. `check-verify-scheduler.sh` case 12
+       tests only the preset's refusals. `.build/state/verify-last-passed` does not exist.
+   Impact:
+     - The working rule "at a milestone's end L1" cannot be followed with `./verify.sh --level L1`.
+     - The preset stops after the inner half with a message that is false, since the handoff was written. It never
+       runs the merge and never records BASE.
+     - The records' "until a full run records them" (VERIFICATION, the L0s) does not hold either: six L3s later,
+       the 292 keys still say "never".
+   Resolution: let the preset accept 4 or 5 from the inner half when it printed its handoff, run the merge, and
+   record BASE when the merge's steps all passed, saying which level it ended at. Or state in the preset that L1
+   needs `--allow-shadow`. Either way, add the preset's passing path to case 12.
+
+3. MEDIUM - D3 regression: after a resumed suite, `verify.sh --shadow` grades only the last resumed boot, so a failed
+   sweep can be recorded as consistent.
+   Where: src/harness/test-kernel.sh:906 and :926 (and :823, :868, :890); src/tools/result-logs.sh:18;
+   verify.sh:39-47 and :823-824; src/tools/verify-model/src/shadow.rs:56-99 and :462-467.
+   Evidence:
+     - The first boot prints `RESULT-LOGS` (:906). `resume_after` (:926) then starts a nested `test-kernel.sh`,
+       whose own `RESULT-LOGS` line comes after it. `result_logs` takes `... | tail -1`, the last line.
+     - The shadow sweep ignores test.sh's status (`./test.sh --arch "$target" 2>&1 | tee "$sweep_capture" || true`)
+       and parses only that last log.
+     - The resumed boot prints "running K tests (all tags)" and "test suite complete: K passed" for the tests after
+       the failure. So `total_declared` is K, every outcome passed, and the Void guard (`outcomes.len() < total`)
+       does not fire. The failed test appears only in the first boot's log.
+     - Simulated with the real `test-kernel.sh` in the KernelSuiteResumes fixture: the last line names
+       `...-restart1-guest.log` and is followed by "PASS: test suite complete".
+     - Before D3, the log ended with the failing test still open and parsed as Failed.
+   Impact: a sweep with a failing test reads as clean. The shadow comparison then misses a candidate miss and can
+   record trust it has not earned. The gates that call `result_logs` check test.sh's status first, so they are not
+   affected.
+   Resolution: print the first boot's `RESULT-LOGS` last, after `resume_after`. Alternatively, make the shadow read
+   every boot of the run, or refuse a sweep whose status is not zero.
+
+4. MEDIUM - C1/C2/C5: some steps write what their declarations say they only read, and they now overlap guests that
+   check it.
+   Where: src/tools/verify-model/src/commands.rs:470 (at a97a9ec0, :275 had `exclusive_guests: true`) and
+   tests.rs:2926; src/harness/perf-gate.py:52, :61-83 and :124-163; resources.rs:216, :237, :358 and :431;
+   src/tools/check-shared-cache.sh:222-224; test.sh:313; lib.sh:466.
+   Evidence:
+     - The development lifecycle lost its run-alone flag in this milestone. It is now `exclusive_guests: false`,
+       locked by the test "the lifecycle's instance is its own, with its own port", and no record says so.
+     - Its step runs `dev.perf-gate`, a wall-clock gate measured "on an idle host": `NO_CHANGE_BUDGET = 1.0` and
+       `PHASE_BUDGETS = {'build': 3.6, 'publish': 0.6, 'run': 2.6}`. C5 says timing-sensitive gates run alone.
+     - perf-gate also appends a probe to `src/user/apps/tools/src/uname.rs` and rebuilds the staged `uname` with
+       `dev-build.sh`. Yet the step is declared `stage:x86_64:r` (resources.rs:237).
+     - `targeted-cache` appends to `src/abi/src/lib.rs` across a `dev-build.sh` call (check-shared-cache.sh:222-224).
+       It is declared `host stage:x86_64:w` only.
+     - `abi` and `user` are both in `VOLUME_SOURCES` (lib.sh:466). On every architecture `test.sh` compares that
+       digest when it starts, and on a mismatch it dies with exit 1 ("the build does not match the sources",
+       test.sh:313). That is a failure, not a refusal.
+     - Since the fourth L3's fix, `boot-harness` validates the shipped scenarios against the tree's real
+       `.build/image/x86_64-unknown-none` (harness-test.py:1286-1287). It is still declared plain `host`, and its
+       exemption still says "against fakes and copies in temporary trees" (resources.rs:431).
+   Impact:
+     - Before this milestone, the barrier and the lifecycle's run-alone flag kept these steps apart. Three things
+       can now happen:
+         - an aarch64 or riscv64 `test.sh` that starts inside either source edit fails for the harness (a suite, a
+           part, an IOMMU row or an arch-profile row);
+         - the lifecycle's timing budgets are measured beside up to three guests;
+         - a staging switch can run under `boot-harness`.
+     - This is latent so far. In every run since 2026-10-26, perf-gate found the instance "starting" and measured
+       nothing, and no such failure is in the kept logs.
+     - These are the false failures C1 and C2 exist to prevent. C1's check cannot see them, because it counts only
+       `build.sh` and `image.sh` as writers.
+   Resolution:
+     - Run the lifecycle alone again, or record the decision not to.
+     - Declare `targeted-cache` a writer of every architecture's staging.
+     - Declare the lifecycle a writer of `stage:x86_64`.
+     - Declare `boot-harness` a reader of `stage:x86_64`.
+
+5. LOW - A1 and the first L3's class 6: L0 no longer runs the planner's own tests for a change that selects
+   everything.
+   Where: src/tools/verify-model/src/commands.rs:481 and :673; tier.rs:162-176.
+   Evidence:
+     - `host.verify-model`, `gate.verify-model-tests` and `gate.host-tests` now require every kernel suite of their
+       plan, the ports' suites included. The inner tier defers whatever requires a deferred step.
+     - `tier-inner` over `src/tools/verify-model/src/history.rs` gives 820 inner keys and 1241 deferred. All three
+       of these are deferred; only `gate.verify-model` (`check`) stays inner.
+     - A1 lists what L0 sets aside: the ports, the development guests and the guest-booting gates. Host tests are
+       not on that list.
+     - A3's L0 figures (2026-10-28) predate this change.
+   Impact: an L0 of a change to the planner, the harness, the kernel or `rt` does not run the planner's unit tests;
+   they wait for L1.
+   Resolution: require only the suites that a step of the same tier runs (in place, one test kernel is always
+   there), or require them only in a sealed tree.
+
+6. LOW - G1 with D1: a failed part's or selection's logs are removed the moment the run that made them ends.
+   Where: src/harness/lab.py:2687-2694 (`suite_logs_kept`) and :2804-2823 (`logs_hold`).
+   Evidence:
+     - For each target, `suite_logs_kept` walks the runs newest first and stops at the first passed run.
+     - A part of the same split that started later and passed counts as "a later run of that target".
+     - The holder sweeps once more after its owner exits, which is the implementer's addition beyond the plan. That
+       sweep applies the rule at once.
+     - Simulated: four aarch64 parts with part 2 failed. Part 2's run and guest logs are removed.
+     - The implementer met this in the first L1. The parts' logs were "kept as hard links in `.build/tmp/d1-logs`,
+       since G1's sweep keeps only a target's newest runs" (this file, line 1082).
+   Impact: an L1 or an L0 has no run directory, and `keep_failed_step_logs` needs one. So the guest log of a failed
+   part is gone before anyone reads it, which is the opposite of "keeps what a person reads".
+   Resolution: count a run as superseded only by a later passing run that covers it (a whole run, or the same
+   selection). Alternatively, keep a failed run's logs until the start sweep of the next top-level run.
+
+7. LOW - D3 in a tag run: resuming after the last requested non-smoke test stops on the kernel's filter check.
+   Where: src/kernel/tests.rs:3661-3663, applied to the tests after `TEST_AFTER`.
+   Evidence:
+     - The check `if selected_non_smoke == 0 { serial_println!("test filter error: requested tags selected no
+       non-smoke tests"); arch::exit_qemu(false); }` is evaluated over the remaining tests only.
+     - So the resumed boot fails at once and prints a second FAIL with its log tail.
+     - Any smoke tests after the resume point never run.
+   Impact: D3's oracle, "runs every later test", is met only for whole runs and selections. The verdict stays
+   failed.
+   Resolution: skip that check on a resumed run.
+
+VERIFIED AS CORRECT (not repeated item by item)
+  - These items do what the plan and the records say: B1, B2, B5, B6, B7, C3, C4 (with its nested-tree and
+    development-state exemptions), C6, C7, C8, D1, D2, E2, F1, F2 and F3.
+  - The declarations cover all 198 gates and the release plan's 374 steps.
+  - The dispatcher overlaps only steps whose declarations do not conflict, and switches each staging state once per
+    group.
+  - A refused step publishes no envelope and is retried once.
+  - The room rule records the run at its fullest.
+  - A release run keeps its failed steps' logs, within the 64 MiB bound.
+  - The owner's decisions are followed: no time figures, D4 at the end, the snapshot beside the repository, and
+    failed-step logs kept in the run. D4's "not adopted" follows its own rule.
+  - The plan's status, TODO.md's line and the ledger agree with each other and with the records.
+
+Rating: 7/10. Most of the milestone is carefully implemented and verified by oracles watched failing and by six
+sealed runs. Against that: E1's continuation fails the image gates in its main case, the L1 preset cannot complete
+in this tree, D3 silently weakens the shadow comparison, and several overlap declarations understate what their
+steps write.
