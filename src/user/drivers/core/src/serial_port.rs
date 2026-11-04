@@ -329,10 +329,22 @@ fn serve_receive<W: Wire>(end: u64, state: &mut Attachment, port: &mut W, bind: 
 // discarded and the buffer is recycled. Both halves matter. Discarding is right because the bytes
 // belong to a session nobody is holding; recycling is right because eight buffers is all the device
 // has, and stopping here would leave it with nowhere to put what a host is still writing.
-fn drain_receive(bind: &common::Bind, bootstrap: u64, rx: &mut Queue, rx_virt: u64, rx_phys: &[u64], state: &mut Attachment, frame: &mut [u8]) -> bool {
+//
+// A CONSUMER THAT IS BEHIND HAS ITS CHUNK HELD, NOT WAITED FOR (2026-11-03). This waited a full
+// stream out, serving nothing meanwhile - and the development agent writes its answers to this same
+// port and waits for each `write` to be answered without reading its stream. A host that pipelined
+// requests, or fuzzed the agent into answering each bad frame, filled the stream while the agent
+// was answering: the driver waited on the agent's stream, the agent on the driver's answer, both for
+// ever, and the channel was dead for the rest of the boot with every ping still answered. The chunk
+// is now offered once and, when the stream is full, kept in its buffer with the buffer NOT given
+// back: the device runs out of places to put bytes, QEMU stops reading the host's socket, and the
+// host is held back where it writes - the backpressure a byte stream is owed - while the pump goes
+// on serving the write after which the consumer reads. `Session::offer` is the same answer for a
+// transport that keeps its own bytes.
+fn drain_receive(rx: &mut Queue, rx_virt: u64, rx_phys: &[u64], state: &mut Attachment, held: &mut Option<(u16, u32)>, frame: &mut [u8]) -> bool {
 	let mut worked: bool = false;
 	for _ in 0..RX_SLOTS {
-		let Some((id, len)) = rx.take_used() else { break };
+		let Some((id, len)) = held.take().or_else(|| rx.take_used()) else { break };
 		if id >= RX_SLOTS {
 			continue;
 		}
@@ -341,7 +353,10 @@ fn drain_receive(bind: &common::Bind, bootstrap: u64, rx: &mut Queue, rx_virt: u
 			// SAFETY: the slot is this driver's DMA mapping, `n` is bounded by the slot size, and
 			// the device has given the buffer back - which is what `take_used` means.
 			let chunk: &[u8] = unsafe { core::slice::from_raw_parts((rx_virt + id as u64 * RX_SLOT) as *const u8, n) };
-			send_chunk(bind, bootstrap, state, chunk, frame);
+			if !offer_chunk(state, chunk, frame) {
+				*held = Some((id, len));
+				break;
+			}
 		}
 		rx.post_recv(id, rx_phys[id as usize], RX_SLOT as u32);
 		worked = true;
@@ -422,6 +437,9 @@ pub struct Stream<'a> {
 	rx_virt: u64,
 	rx_phys: [u64; RX_SLOTS as usize],
 	state: Attachment,
+	// A received buffer whose chunk the consumer's full stream refused: its slot id and length, the
+	// bytes still in the slot and the slot not yet given back to the device (`drain_receive`).
+	held: Option<(u16, u32)>,
 }
 
 impl<'a> Stream<'a> {
@@ -453,19 +471,23 @@ impl<'a> Stream<'a> {
 				id += 1;
 			}
 			rx.notify();
-			Some(Stream { port: Port { device, irq, tx, virt, phys, busy: false }, rx, rx_virt, rx_phys, state: Attachment::default() })
+			Some(Stream { port: Port { device, irq, tx, virt, phys, busy: false }, rx, rx_virt, rx_phys, state: Attachment::default(), held: None })
 		}
 	}
 
 	// BACK FROM A SLEEP THAT RESET THE DEVICE, between `Virtio::restore` and `driver_ok`: both queues pointed at their
 	// rings again, emptied, and the receive pool posted again. A transmit in flight when the device stopped went with
-	// it, so the buffer is free; what the attached consumer was told stands.
+	// it, so the buffer is free; what the attached consumer was told stands - and so does a chunk held for it, whose
+	// slot stays out of the pool until the chunk is taken.
 	pub fn rearm(&mut self) -> bool {
 		let device = self.port.device;
 		if !self.rx.restore(device) || !self.port.tx.restore(device) {
 			return false;
 		}
 		for id in 0..RX_SLOTS {
+			if self.held.is_some_and(|(held, _)| held == id) {
+				continue;
+			}
 			self.rx.post_recv(id, self.rx_phys[id as usize], RX_SLOT as u32);
 		}
 		self.rx.notify();
@@ -489,9 +511,20 @@ impl<'a> Stream<'a> {
 		self.port.reclaim();
 	}
 
-	// This consumer is over - see `Attachment::reset`.
+	// This consumer is over - see `Attachment::reset`. A chunk held for it was that session's bytes, so its slot goes
+	// back to the device.
 	pub fn reset(&mut self) {
 		self.state.reset();
+		if let Some((id, _)) = self.held.take() {
+			self.rx.post_recv(id, self.rx_phys[id as usize], RX_SLOT as u32);
+			self.rx.notify();
+		}
+	}
+
+	// Whether a received chunk waits on a consumer whose stream is full - what a pump arms its retry for, because a
+	// stream that gains room wakes nobody.
+	pub fn behind(&self) -> bool {
+		self.held.is_some()
 	}
 
 	// One line on this port before anybody is attached to it, which is what a driver stamps a
@@ -503,9 +536,10 @@ impl<'a> Stream<'a> {
 	}
 
 	// Hand whatever the device has delivered to the attached consumer and re-post the buffers. True
-	// when anything was taken, which is what tells the caller to look again before parking.
-	pub fn drain(&mut self, bind: &common::Bind, bootstrap: u64, buffers: &mut Buffers) -> bool {
-		drain_receive(bind, bootstrap, &mut self.rx, self.rx_virt, &self.rx_phys, &mut self.state, &mut buffers.frame)
+	// when anything was taken, which is what tells the caller to look again before parking; a chunk
+	// held for a consumer that is `behind` is not taken, so the look after it parks.
+	pub fn drain(&mut self, buffers: &mut Buffers) -> bool {
+		drain_receive(&mut self.rx, self.rx_virt, &self.rx_phys, &mut self.state, &mut self.held, &mut buffers.frame)
 	}
 
 	// Serve one request from the consumer on `index`. False means that consumer is gone.

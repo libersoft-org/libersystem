@@ -142,15 +142,25 @@ impl common::SleepStep for Sleep<'_, '_> {
 fn pump(bind: &common::Bind, irq: u64, bootstrap: u64, bytes: u64, stream: &mut Stream) -> ! {
 	let mut serving: common::Serving = common::Serving::from_offers(&[(CONSOLE_TOKEN, bytes)]);
 	let mut buffers: serial_port::Buffers = serial_port::Buffers::default();
+	// THE RETRY FOR A CONSUMER THAT IS BEHIND: armed a tick away while a received chunk waits on its full stream,
+	// because a stream that gains room wakes nobody.
+	let retry: u64 = match timer_create() {
+		t if t > 0 => t as u64,
+		_ => exit(),
+	};
 	common::takes_sleep();
 	loop {
 		// Anything the device has already handed back goes out before this thread parks, so a
 		// completion that arrived with an interrupt somebody else consumed is not left waiting
 		// for the next one.
-		if stream.drain(bind, bootstrap, &mut buffers) {
+		if stream.drain(&mut buffers) {
 			continue;
 		}
-		match common::wait_providers_or_sleep(bootstrap, bind, &mut serving, &[irq], false) {
+		// A housekeeping wait while behind: a consumer that never reads again must not keep a settling scheduler
+		// from settling.
+		let behind: bool = stream.behind();
+		timer_set(retry, if behind { clock() + 1 } else { u64::MAX });
+		match common::wait_providers_or_sleep(bootstrap, bind, &mut serving, &[irq, retry], behind) {
 			None => ended(bootstrap, bind, stream.capability()),
 			// THE SLEEP, between two exchanges.
 			Some(None) => {
@@ -177,13 +187,15 @@ fn pump(bind: &common::Bind, irq: u64, bootstrap: u64, bytes: u64, stream: &mut 
 					}
 				}
 			}
-			Some(Some(common::ProviderReady::Device(_))) => {
+			Some(Some(common::ProviderReady::Device(0))) => {
 				// Read the ISR to deassert the device's level-triggered INTx line before
 				// acking (a harmless zero read on MSI-X, which is edge-triggered).
 				let _ = stream.device().read_isr();
 				interrupt_ack(irq);
 				stream.reclaim();
 			}
+			// The retry: the next pass offers the held chunk again.
+			Some(Some(common::ProviderReady::Device(_))) => {}
 		}
 	}
 }

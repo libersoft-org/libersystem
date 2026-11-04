@@ -6,7 +6,10 @@ being a program with control paths of its own: the driver is a thirty-line trans
 decision this gate exists to protect - when a stalled transmit gives up, whether the manager's
 channel is answered while it waits, how many receive buffers one pass may take, what a stalled
 stream send does - moved into `drivers::serial_port`, which BOTH console drivers share. A checker
-still pointed at the old file was asserting against a program that no longer exists.
+still pointed at the old file was asserting against a program that no longer exists. And since
+2026-11-03 the receive pass HOLDS a chunk a full stream refuses rather than waiting it out: the
+development agent reads its stream only between writes it waits on the driver to answer, so a pass
+that waited on the agent was a driver and an agent each waiting on the other.
 
 WHAT IT PROTECTS. Each of these is a line whose absence is invisible in every ordinary run and fatal
 in the one that matters: a driver that stops answering its supervisor while a consumer is slow is a
@@ -345,7 +348,7 @@ mod tests {
         let mut rx = Queue { rx: true };
         let phys = [0u64; RX_SLOTS as usize];
         let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
-        assert!(drain_receive(&BIND, BOOTSTRAP, &mut rx, rx_virt(), &phys, &mut state, &mut frame));
+        assert!(drain_receive(&mut rx, rx_virt(), &phys, &mut state, &mut None, &mut frame));
         assert_eq!(POSTED.with_borrow(Vec::len), RX_SLOTS as usize, "one pass takes the pool and stops");
     }
 
@@ -359,7 +362,7 @@ mod tests {
         USED.with_borrow_mut(|used| { for id in 0..3u16 { used.push_back((id, 4)) } });
         let phys = [0u64; RX_SLOTS as usize];
         let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
-        assert!(drain_receive(&BIND, BOOTSTRAP, &mut rx, rx_virt(), &phys, &mut state, &mut frame));
+        assert!(drain_receive(&mut rx, rx_virt(), &phys, &mut state, &mut None, &mut frame));
         assert_eq!(POSTED.with_borrow(Clone::clone), alloc::vec![0u16, 1, 2]);
         assert_eq!(NOTIFIES.get(), 1, "the device is told once for the pass and not once per buffer");
         assert_eq!(DELIVERED.with_borrow(Vec::len), 3, "and each one's bytes reached the consumer");
@@ -374,7 +377,7 @@ mod tests {
         let mut rx = Queue { rx: true };
         let phys = [0u64; RX_SLOTS as usize];
         let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
-        assert!(!drain_receive(&BIND, BOOTSTRAP, &mut rx, rx_virt(), &phys, &mut state, &mut frame));
+        assert!(!drain_receive(&mut rx, rx_virt(), &phys, &mut state, &mut None, &mut frame));
         assert_eq!(NOTIFIES.get(), 0);
         assert!(POSTED.with_borrow(Vec::is_empty));
     }
@@ -389,9 +392,54 @@ mod tests {
         USED.with_borrow_mut(|used| { for id in 0..2u16 { used.push_back((id, 4)) } });
         let phys = [0u64; RX_SLOTS as usize];
         let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
-        assert!(drain_receive(&BIND, BOOTSTRAP, &mut rx, rx_virt(), &phys, &mut state, &mut frame));
+        assert!(drain_receive(&mut rx, rx_virt(), &phys, &mut state, &mut None, &mut frame));
         assert!(DELIVERED.with_borrow(Vec::is_empty), "there is nobody to hand them to");
         assert_eq!(POSTED.with_borrow(Clone::clone), alloc::vec![0u16, 1], "and the ring keeps its buffers");
+    }
+
+    // A FULL STREAM HOLDS THE CHUNK IN ITS BUFFER AND THE PASS WAITS ON NOTHING (2026-11-03). The pass waited the
+    // stream out, and the development agent - which reads that stream only between the writes it is waiting on the
+    // driver to answer - never read it again: the driver waited on the agent, the agent on the driver. The chunk is
+    // kept, its buffer is NOT given back, so the device and the host behind it are held back instead, and the pass
+    // returns to a pump that serves the write.
+    #[test]
+    fn a_full_stream_holds_the_chunk_and_its_buffer_and_waits_on_nothing() {
+        reset();
+        let mut state = attached();
+        let mut rx = Queue { rx: true };
+        let mut held = None;
+        USED.with_borrow_mut(|used| { for id in 0..3u16 { used.push_back((id, 4)) } });
+        SEND_SCRIPT.with_borrow_mut(|script| { script.push_back(0); script.push_back(1); });
+        let phys = [0u64; RX_SLOTS as usize];
+        let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
+        assert!(drain_receive(&mut rx, rx_virt(), &phys, &mut state, &mut held, &mut frame), "the first buffer was taken");
+        assert_eq!(held, Some((1, 4)), "the refused chunk is held with its slot");
+        assert_eq!(POSTED.with_borrow(Clone::clone), alloc::vec![0u16], "and only the delivered buffer went back");
+        assert_eq!(USED.with_borrow(VecDeque::len), 1, "and the pass stopped at the full stream");
+        assert!(WAITS.with_borrow(Vec::is_empty) && PERIODIC.with_borrow(Vec::is_empty), "the pass waits on nothing");
+        assert_eq!(state.stream, STREAM, "and the session is intact");
+    }
+
+    // AND THE HELD CHUNK GOES FIRST ONCE THERE IS ROOM, under the sequence number it was refused with, so the consumer
+    // reads the port's bytes in order and with no gap.
+    #[test]
+    fn a_held_chunk_goes_first_and_in_order_once_there_is_room() {
+        reset();
+        let mut state = attached();
+        let mut rx = Queue { rx: true };
+        let mut held = None;
+        USED.with_borrow_mut(|used| { for id in 0..3u16 { used.push_back((id, 4)) } });
+        SEND_SCRIPT.with_borrow_mut(|script| { script.push_back(0); script.push_back(1); script.push_back(1); });
+        let phys = [0u64; RX_SLOTS as usize];
+        let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
+        assert!(drain_receive(&mut rx, rx_virt(), &phys, &mut state, &mut held, &mut frame));
+        assert!(!drain_receive(&mut rx, rx_virt(), &phys, &mut state, &mut held, &mut frame), "a stream still full takes nothing");
+        assert_eq!(held, Some((1, 4)));
+        assert!(drain_receive(&mut rx, rx_virt(), &phys, &mut state, &mut held, &mut frame), "and room takes the rest");
+        assert_eq!(held, None);
+        assert_eq!(POSTED.with_borrow(Clone::clone), alloc::vec![0u16, 1, 2], "every buffer back on the ring, in order");
+        let sequence: Vec<u32> = DELIVERED.with_borrow(|delivered| delivered.iter().map(|chunk| u32::from_le_bytes(chunk[..4].try_into().unwrap())).collect());
+        assert_eq!(sequence, alloc::vec![0, 1, 2], "each chunk once, numbered without a gap");
     }
 }
 '''
@@ -401,7 +449,7 @@ def fixture(source: str) -> str:
     constants = '\n'.join(line for line in source.splitlines() if line.startswith(('pub const RX_', 'pub const MAX_WRITE:', 'pub const TX_DRAIN_TICKS:')))
     # `Attachment` IS TAKEN WITH ITS DERIVE, because `reset` calls `Attachment::default()` and a
     # struct extracted from the line below the attribute is one that no longer has it.
-    items = ['pub struct Port<'"'"'a>', 'impl Port<'"'"'_>', '#[derive(Default)]\npub struct Attachment', 'impl Attachment', 'fn drain_receive(', 'fn send_chunk(']
+    items = ['pub struct Port<'"'"'a>', 'impl Port<'"'"'_>', '#[derive(Default)]\npub struct Attachment', 'impl Attachment', 'fn drain_receive(', 'fn send_chunk(', 'fn offer_chunk(']
     body = '\n'.join(item(source, start) for start in items)
     return FIXTURE.replace('EXTRACTED', constants + '\n' + body) + TESTS
 
@@ -418,13 +466,15 @@ def main() -> None:
     send_wait = 'wait_any_periodic(&[bootstrap], clock().saturating_add(1))'
     send_timeout = 'if ready < 0 && ready != ERR_TIMED_OUT {'
     send_failed = 'SendOutcome::Failed => {\n\t\t\t\tclose(state.stream);\n\t\t\t\tstate.stream = 0;\n\t\t\t\treturn;\n\t\t\t}'
-    rx_bound = 'for _ in 0..RX_SLOTS {\n\t\tlet Some((id, len)) = rx.take_used() else { break };'
+    rx_bound = 'for _ in 0..RX_SLOTS {\n\t\tlet Some((id, len)) = held.take().or_else(|| rx.take_used()) else { break };'
+    # THE HOLD: a chunk the consumer's full stream refused stays in its buffer, and the pass ends.
+    rx_hold = 'if !offer_chunk(state, chunk, frame) {\n\t\t\t\t*held = Some((id, len));\n\t\t\t\tbreak;\n\t\t\t}'
     # THE ONE INSIDE `drain_receive` AND NOT THE ONE THAT FILLS THE POOL AT OPEN. Both lines are
     # identical; what tells them apart is what follows, and a mutation that hit the wrong one would
     # be testing a path no interrupt ever takes.
     rx_repost = 'rx.post_recv(id, rx_phys[id as usize], RX_SLOT as u32);\n\t\tworked = true;'
     rx_notify = 'if worked {\n\t\trx.notify();\n\t}'
-    for needle in [tx_control, tx_bound, tx_wait, send_control, send_wait, send_timeout, send_failed, rx_bound, rx_repost, rx_notify]:
+    for needle in [tx_control, tx_bound, tx_wait, send_control, send_wait, send_timeout, send_failed, rx_bound, rx_hold, rx_repost, rx_notify]:
         if source.count(needle) != 1:
             raise SystemExit(f'dev-channel-control: the anchor below is not in `serial_port.rs` exactly once - it was found {source.count(needle)} times:\n{needle}')
 
@@ -438,7 +488,12 @@ def main() -> None:
         ('stream retry spins without waiting', source.replace(send_wait, '0', 1), 'stream_backpressure_answers_control_and_retries_until_capacity'),
         ('a retry timeout ends the session', source.replace(send_timeout, 'if ready < 0 {', 1), 'a_retry_that_times_out_keeps_the_session'),
         ('a failed send leaks the stream', source.replace(send_failed, 'SendOutcome::Failed => {\n\t\t\t\tstate.stream = 0;\n\t\t\t\treturn;\n\t\t\t}', 1), 'a_failed_send_ends_the_attachment'),
-        ('the receive pass is unbounded', source.replace(rx_bound, 'while let Some((id, len)) = rx.take_used() {', 1), 'the_receive_pass_is_bounded_by_the_pool'),
+        ('the receive pass is unbounded', source.replace(rx_bound, 'while let Some((id, len)) = held.take().or_else(|| rx.take_used()) {', 1), 'the_receive_pass_is_bounded_by_the_pool'),
+        # THE DEADLOCK ITSELF: the pass waits the full stream out again, as it did until 2026-11-03.
+        ('a full stream is waited out', source.replace(rx_hold, 'while !offer_chunk(state, chunk, frame) {\n\t\t\t\tlet _ = wait_any_periodic(&[BOOTSTRAP], clock().saturating_add(1));\n\t\t\t}', 1), 'a_full_stream_holds_the_chunk_and_its_buffer_and_waits_on_nothing'),
+        ('a refused chunk is dropped', source.replace(rx_hold, 'offer_chunk(state, chunk, frame);', 1), 'a_full_stream_holds_the_chunk_and_its_buffer_and_waits_on_nothing'),
+        ('a held buffer goes back to the device', source.replace(rx_hold, rx_hold.replace('\t\t\t\tbreak;\n', ''), 1), 'a_full_stream_holds_the_chunk_and_its_buffer_and_waits_on_nothing'),
+        ('a held chunk is never offered again', source.replace(rx_bound, rx_bound.replace('held.take().or_else(|| rx.take_used())', 'rx.take_used()'), 1), 'a_held_chunk_goes_first_and_in_order_once_there_is_room'),
         ('a taken buffer is not re-posted', source.replace(rx_repost, '', 1), 'every_taken_buffer_is_re_posted_and_the_device_told_once'),
         ('the device is told once per buffer', source.replace(rx_notify, '', 1).replace(rx_repost, rx_repost + '\n\t\trx.notify();', 1), 'every_taken_buffer_is_re_posted_and_the_device_told_once'),
     ]

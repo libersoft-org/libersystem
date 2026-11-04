@@ -161,22 +161,32 @@ fn pump(bind: &common::Bind, irq: u64, bootstrap: u64, published: &mut [Publishe
 	}
 	let mut serving: common::Serving = common::Serving::from_offers(&offers[..published.len()]);
 	let mut buffers: serial_port::Buffers = serial_port::Buffers::default();
-	let devices: [u64; 1] = [irq];
-	let waits: &[u64] = if irq != 0 { &devices } else { &[] };
+	// THE RETRY FOR A CONSUMER THAT IS BEHIND: armed a tick away while a received chunk waits on a port's full
+	// stream, because a stream that gains room wakes nobody (`serial_port::drain_receive`).
+	let retry: u64 = match timer_create() {
+		t if t > 0 => t as u64,
+		_ => ended(bootstrap, bind, capability),
+	};
+	let devices: [u64; 2] = [irq, retry];
+	let waits: &[u64] = if irq != 0 { &devices } else { &devices[1..] };
 	loop {
 		// Anything any port has already been handed goes out before this thread parks, so a
 		// completion that arrived with an interrupt another port's wait consumed is not left
 		// waiting for the next one. They share a single MSI-X vector, which is exactly why.
 		let mut worked: bool = false;
 		for entry in published.iter_mut() {
-			if entry.stream.drain(bind, bootstrap, &mut buffers) {
+			if entry.stream.drain(&mut buffers) {
 				worked = true;
 			}
 		}
 		if worked {
 			continue;
 		}
-		match common::wait_providers_or_answer(bootstrap, bind, &mut serving, waits) {
+		// A housekeeping wait while behind: a consumer that never reads again must not keep a settling scheduler
+		// from settling.
+		let behind: bool = published.iter().any(|entry| entry.stream.behind());
+		timer_set(retry, if behind { clock() + 1 } else { u64::MAX });
+		match common::wait_providers(bootstrap, bind, &mut serving, waits, behind) {
 			None => ended(bootstrap, bind, capability),
 			// A REPLACEMENT CONSUMER on one port, and that port's session before it is over. The
 			// others are untouched: a restarted consumer of the diagnostic port has nothing to do
@@ -206,6 +216,8 @@ fn pump(bind: &common::Bind, irq: u64, bootstrap: u64, published: &mut [Publishe
 					}
 				}
 			}
+			// The retry: the next pass offers the held chunks again.
+			Some(common::ProviderReady::Device(index)) if waits[index] == retry => {}
 			Some(common::ProviderReady::Device(_)) => {
 				// Read the ISR to deassert the device's level-triggered INTx line before acking
 				// (a harmless zero read on MSI-X, which is edge-triggered). The vector is the
