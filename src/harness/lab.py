@@ -566,6 +566,12 @@ def broker_client_input(state, client):
 
 
 def broker(serial, ctl_path=CTL_SOCK, log_path=SERIAL_LOG, console_path=None):
+	# A CLIENT THAT HAS GONE IS A SEND THAT FAILS, NOT THE BROKER'S END. Every broker is forked from `main()`, which puts
+	# SIGPIPE back to its default for the commands' own output, so a guest line sent to a console client that had closed,
+	# before the loop read its close, killed the broker on the spot: nothing unlinked, every later attach refused, the
+	# serial log cut mid-line, and the guest running on with nobody draining its UART. Ignored, that send raises EPIPE,
+	# which `broker_send` and `broker_reply` already answer.
+	signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 	if os.path.exists(ctl_path):
 		os.unlink(ctl_path)
 	ctl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

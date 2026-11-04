@@ -25,6 +25,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -1044,6 +1045,69 @@ class BrokerConsoleTest(unittest.TestCase):
 		self.assertIn(entry, state['clients'])
 		host.close()
 		client.close()
+
+	# A GUEST LINE FOR A CLIENT THAT HAD JUST CLOSED ENDED THE BROKER. Every broker is forked from `main()`, which puts
+	# SIGPIPE back to its default, so a `send` to a console client whose close the loop had not read yet killed it on the
+	# spot - nothing unlinked, and every later attach refused. The sleep gate met it on 2026-11-04: its Ctrl+Z was
+	# refused a second after its `fg`, the serial log cut in the middle of a line. The race is made certain here: the
+	# broker is stopped, the client reads what it was sent and closes, the guest prints, and the broker's next select
+	# sees the line and the closed client together - and the line is served first.
+	def test_a_line_for_a_client_that_has_just_closed_does_not_end_the_broker(self):
+		directory = tempfile.TemporaryDirectory()
+		self.addCleanup(directory.cleanup)
+		ctl, log, console = (os.path.join(directory.name, name) for name in ('ctl.sock', 'serial.log', 'console.sock'))
+		host, guest = socket.socketpair()
+		pid = os.fork()
+		if pid == 0:
+			try:
+				signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+				guest.close()
+				lab.broker(host, ctl, log, console)
+			finally:
+				os._exit(0)
+		host.close()
+
+		def attach():
+			sock = socket.socket(socket.AF_UNIX)
+			sock.settimeout(5)
+			sock.connect(console)
+			sock.sendall(b'ATTACH rw\n')
+			granted = b''
+			while not granted.endswith(b'\n'):
+				granted += sock.recv(1)
+			self.assertTrue(granted.startswith(b'OK rw'), granted)
+			return sock
+
+		for _ in range(250):
+			if os.path.exists(console):
+				break
+			time.sleep(0.02)
+		writer = attach()
+		guest.sendall(b'before the close\n')
+		# Everything sent is read first, as `check-sleep.sh`'s client drains it: a client closing with bytes unread
+		# leaves ECONNRESET on the broker's end instead, which is a different case and never raised the signal.
+		writer.settimeout(0.3)
+		with contextlib.suppress(TimeoutError):
+			while writer.recv(65536):
+				pass
+		os.kill(pid, signal.SIGSTOP)
+		writer.close()
+		guest.sendall(b'sleepcheck: count 11\n')
+		time.sleep(0.1)
+		os.kill(pid, signal.SIGCONT)
+		ended, status = 0, 0
+		for _ in range(50):
+			ended, status = os.waitpid(pid, os.WNOHANG)
+			if ended:
+				break
+			time.sleep(0.02)
+		how = (signal.Signals(os.WTERMSIG(status)).name if os.WIFSIGNALED(status) else f'exit {os.WEXITSTATUS(status)}') if ended else ''
+		if not ended:
+			attach().close()
+		guest.close()
+		if not ended:
+			os.waitpid(pid, 0)
+		self.assertFalse(ended, f'the broker ended ({how}) on a line for a client that had closed')
 
 
 class DecoderTest(unittest.TestCase):
