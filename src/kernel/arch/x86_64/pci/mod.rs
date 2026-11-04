@@ -171,6 +171,11 @@ impl common::ConfigAccess for Access {
 		Self::write32_raw(bus, dev, func, off, val);
 	}
 
+	// Through `config_write_exact`, which takes the same lock: never from inside `with_config`.
+	fn write16(bus: u8, dev: u8, func: u8, off: u16, val: u16) {
+		let _ = config_write_exact(bus, dev, func, off, 2, val as u32);
+	}
+
 	// The lock held across a whole read-modify-write rather than across each half of it. It is not
 	// reentrant, which is why the `_raw` forms exist and why they are the only accesses allowed
 	// inside.

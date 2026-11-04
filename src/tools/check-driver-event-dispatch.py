@@ -49,10 +49,16 @@ def check(source):
     # a driver's terminal answer on the floor - the node then ran to its bind deadline and was
     # restarted over a code it had already been given. The rule here is unchanged: one pop, the
     # redirect, then the reducer.
+    #
+    # AND THE REDIRECT TAKES THE CLOSURE OF THE CHANNEL A TEARDOWN HAS ALREADY TAKEN (2026-11-04).
+    # A driver sends STOPPED and exits, so one drain queues the frame and the closure; reduced, the
+    # closure was `driver-exited` and captured every clean stop as an incident. A closure while a
+    # binding is live still reaches the reducer, which is why the clause names `binding.is_none()`.
     if compact(dispatch) != (
         'letSome(popped)=node.pop()else{break};'
         'ifletSome(teardown)=node.teardown.as_mut()'
-        '&&matches!(popped,BindingEvent::Exited{..}|BindingEvent::ClaimSettled{..}){'
+        '&&(matches!(popped,BindingEvent::Exited{..}|BindingEvent::ClaimSettled{..})'
+        '||node.binding.is_none()&&matches!(popped,BindingEvent::Closed{..})){'
         'teardown.pending.note(popped);continue;}'
         'driver_binding::reduce_event(node.record.state,popped)'
     ):
@@ -115,7 +121,11 @@ def rejected_mutations(source):
     prefix = source[start:prefix_end]
     call = 'driver_binding::reduce_event(node.record.state, popped)'
     raw = '\t\tlet Some(event) = node.pop() else { break };\n'
+    closure = ' || node.binding.is_none() && matches!(popped, BindingEvent::Closed { .. })'
+    assert prefix.count(closure) == 1
     mutations = {
+        'a closure after the teardown is a second outcome': source.replace(closure, '', 1),
+        'a closure of a live binding goes to the teardown': source.replace(closure, ' || matches!(popped, BindingEvent::Closed { .. })', 1),
         'deleted dispatch': source.replace(prefix, raw, 1),
         'dispatch inside one arm': source.replace(prefix, raw, 1).replace('BindingEvent::Ready { .. } => {\n', 'BindingEvent::Ready { .. } => {\n let _ = driver_binding::reduce_event(node.record.state, event);\n', 1),
         'discarded result and raw-event bypass': source.replace(prefix, raw + '\t\tlet _ = driver_binding::reduce_event(node.record.state, event);\n', 1),

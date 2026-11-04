@@ -4994,7 +4994,8 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 		// A Copy event must leave scope before effects can see the admitted payload.
 		let decision = {
 			let Some(popped) = node.pop() else { break };
-			// A TEARDOWN TAKES ITS OWN TWO CONFIRMATIONS AND NOTHING ELSE.
+			// A TEARDOWN TAKES ITS OWN TWO CONFIRMATIONS, AND THE CLOSURE OF THE CHANNEL IT ENDED, AND
+			// NOTHING ELSE.
 			//
 			// This routed EVERY event to the outstanding teardown while one existed - and
 			// `Pending::note` consumes exactly two of them, `Exited` and `ClaimSettled`, discarding
@@ -5008,8 +5009,22 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 			// spent TWO full bind windows waiting for an answer it had been given twice. The generation
 			// filter in `pop` has already established that the event is about the binding this node
 			// holds NOW, which is the question routing was standing in for.
+			//
+			// AND THE CHANNEL OF A BINDING THE TEARDOWN HAS ALREADY TAKEN, CLOSING, IS THE TEARDOWN'S
+			// TOO (2026-11-04) - `note` discards it, as it says of everything a dying binding emits.
+			//
+			// A driver answers `STOP` with `STOPPED` and exits, so one drain reads the frame and then
+			// the closed channel, and both are queued. `STOPPED` starts the teardown and takes the
+			// binding; the closure then reached the reducer as `driver-exited` with `planned_stop`
+			// false, and was captured as an incident - so every clean stop of a driver that exits
+			// straight after answering was stored as a failure, and a forced stop had its `hung`
+			// overwritten by the same. Measured on a live machine: `lsdev --incident` after an
+			// operator's disable of `virtio_gpu` said `state=stopping, cause=driver-exited,
+			// last-opcode=10` - a crash whose last word was the clean answer. The process's exit is
+			// still the teardown's confirmation, waited for on its own handle; a closure while a
+			// binding is live is about that binding and goes on to the reducer as before.
 			if let Some(teardown) = node.teardown.as_mut()
-				&& matches!(popped, BindingEvent::Exited { .. } | BindingEvent::ClaimSettled { .. })
+				&& (matches!(popped, BindingEvent::Exited { .. } | BindingEvent::ClaimSettled { .. }) || node.binding.is_none() && matches!(popped, BindingEvent::Closed { .. }))
 			{
 				teardown.pending.note(popped);
 				continue;

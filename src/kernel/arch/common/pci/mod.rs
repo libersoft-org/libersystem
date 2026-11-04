@@ -205,6 +205,11 @@ pub fn slot_event<A: ConfigAccess>(d: &PciDevice, slot: Slot) -> SlotEvent {
 	if status & SLOT_STATUS_PRESENT != 0 { SlotEvent::Arrived } else { SlotEvent::Departed }
 }
 
+/// Whether a device is in the slot NOW - the presence state, which no acknowledgement changes.
+pub fn slot_present<A: ConfigAccess>(d: &PciDevice, slot: Slot) -> bool {
+	A::read16(d.bus, d.dev, d.func, slot.cap + 0x1A) & SLOT_STATUS_PRESENT != 0
+}
+
 /// Power the slot down, which is how a guest says the removal may proceed.
 ///
 /// THIS IS THE ACKNOWLEDGEMENT THAT MATTERS. The button said "may I", the driver has stopped and its
@@ -236,20 +241,25 @@ pub fn slot_power_on<A: ConfigAccess>(d: &PciDevice, slot: Slot) {
 /// AND THE OTHER STICKY BITS ARE NOT TOUCHED. Writing a one to a bit CLEARS it, so a write-back of
 /// the whole status register would acknowledge every event the slot had recorded, including the ones
 /// this caller never read.
+///
+/// AND IT IS SLOT STATUS ALONE, AT ITS OWN WIDTH, AND NOT THE DWORD IT SHARES WITH SLOT CONTROL
+/// (2026-11-04). This wrote the dword - the control half back as it was, the status half carrying the
+/// bit - and QEMU's ports undo a status write that would clear an event which is not pending, judging
+/// it by the written value as though it started at Slot Status. So the control half's enables read as
+/// clears of the attention button and the presence change, and whenever one of those was not pending
+/// the acknowledgement was undone. Measured on QEMU 10.0: the button's acknowledgement at a removal
+/// left `sta=0051` standing, the next poll took the same press for a second request, found the device
+/// already gone from the inventory and powered the slot down under a driver that had not let go - and
+/// the slot was then powered down a second time, after it had been brought back up, so the next device
+/// plugged into it was never seen.
 pub fn slot_acknowledge<A: ConfigAccess>(d: &PciDevice, slot: Slot) {
-	// ONE DWORD, WRITTEN DELIBERATELY, because Slot Control and Slot Status share it and the two
-	// halves do not obey the same rule. The control half is ordinary and is written back as it was;
-	// the status half is RW1C and carries EXACTLY the bit being acknowledged, so every other sticky
-	// event the slot has recorded survives. A read-modify-write of the whole dword would write the
-	// status bits back as ones and acknowledge all of them, including ones nobody read.
-	let control = A::read16(d.bus, d.dev, d.func, slot.cap + 0x18) as u32;
-	A::write32(d.bus, d.dev, d.func, slot.cap + 0x18, control | ((SLOT_STATUS_PRESENCE_CHANGED as u32) << 16));
+	A::write16(d.bus, d.dev, d.func, slot.cap + 0x1A, SLOT_STATUS_PRESENCE_CHANGED);
 }
 
-/// Acknowledge the attention button, which is a separate sticky bit from the presence change.
+/// Acknowledge the attention button, which is a separate sticky bit from the presence change - the same
+/// way, for the same reason.
 pub fn slot_acknowledge_button<A: ConfigAccess>(d: &PciDevice, slot: Slot) {
-	let control = A::read16(d.bus, d.dev, d.func, slot.cap + 0x18) as u32;
-	A::write32(d.bus, d.dev, d.func, slot.cap + 0x18, control | ((SLOT_STATUS_ATTENTION_BUTTON as u32) << 16));
+	A::write16(d.bus, d.dev, d.func, slot.cap + 0x1A, SLOT_STATUS_ATTENTION_BUTTON);
 }
 
 /// Ask the slot to report presence changes, as an interrupt as well as in its status, and TURN IT ON.
@@ -327,6 +337,12 @@ pub trait ConfigAccess {
 	// Read / write a 32-bit config-space dword for one bus/device/function.
 	fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32;
 	fn write32(bus: u8, dev: u8, func: u8, off: u16, val: u32);
+
+	// Write ONE 16-bit register at exactly its width, for a register that must not share a write with
+	// the one beside it in its dword: Slot Status, whose acknowledgement is the bit being cleared and
+	// nothing else - see `slot_acknowledge`. NO DEFAULT, because the only portable spelling is a
+	// read-modify-write of the dword, which is the write this exists to avoid.
+	fn write16(bus: u8, dev: u8, func: u8, off: u16, val: u16);
 
 	// Run `f` with the backend's config access serialised, if it serialises at all.
 	//
@@ -837,12 +853,29 @@ pub fn hot_plug_ports(out: &mut [Option<HotPlugPort>; MAX_HOT_PLUG_PORTS]) -> us
 fn arm_hot_plug_slots<A: ConfigAccess>(devices: &[PciDevice]) {
 	let first: bool = !SLOTS_REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel);
 	let mut ports = PORTS.lock();
+	let watched = *ports;
 	ports.1 = 0;
 	for function in devices.iter().filter(|function| controls(function.bus, OSC_HOT_PLUG)) {
 		let Some(slot) = resolve_slot::<A>(function) else { continue };
 		slot_arm::<A>(function, slot);
-		slot_acknowledge::<A>(function, slot);
-		let occupied = slot_event::<A>(function, slot) == SlotEvent::Arrived;
+		// WHAT IS IN A SLOT IS ITS PRESENCE STATE, AND A PORT ALREADY WATCHED KEEPS WHAT ITS POLL KNOWS
+		// (2026-11-04).
+		//
+		// This acknowledged the change and then asked for one - `occupied` was "the slot reports an
+		// arrival", which after the acknowledgement it cannot - and it did so at EVERY scan, and an
+		// arrival rescans the bus. It read right only while QEMU undid the acknowledgement (see
+		// `slot_acknowledge`); acknowledged for real, the rescan of an arrival recorded the slot empty
+		// under the device it had just reported, and the removal asked for next was dropped as a button
+		// on an empty slot. A device in the slot at boot, with no change pending, was "empty" from the
+		// start. So a port first armed here is occupied when its presence bit says so, and a port the
+		// poll already watches keeps its record and its pending events: they are the poll's to answer.
+		let occupied = match watched.0.iter().take(watched.1).flatten().find(|port| (port.bus, port.dev, port.func) == (function.bus, function.dev, function.func)) {
+			Some(port) => port.occupied,
+			None => {
+				slot_acknowledge::<A>(function, slot);
+				slot_present::<A>(function, slot)
+			}
+		};
 		// REMEMBERED HERE AND NOWHERE ELSE, so a later read costs no bus walk. A ninth port is
 		// reported rather than dropped: a machine with more hot-plug ports than this array holds is
 		// a machine this kernel would watch part of, which is worse than one it says it cannot.

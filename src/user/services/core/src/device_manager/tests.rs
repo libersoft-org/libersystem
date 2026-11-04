@@ -111,9 +111,14 @@ pub fn pending_shutdown_outcomes() {
 }
 
 // Exercise real STOPPED decoding before and after expiry through both supervision callers.
+//
+// AND WITH THE DRIVER GONE BEFORE ITS ANSWER IS READ, which is what a real driver does: it sends
+// STOPPED and exits, so one drain reads the frame and then the closed channel. That closure is the
+// teardown's consequence, not a second outcome - read as one, it captured every clean stop as a
+// `driver-exited` incident and overwrote a forced stop's `hung` with the same.
 fn planned_stop_deadlines() {
 	for shutdown in [false, true] {
-		for timely in [true, false] {
+		for (timely, exits) in [(true, false), (true, true), (false, false), (false, true)] {
 			let (control, driver) = channel().expect("stop deadline fixture channel");
 			let mut node = Node::new(0, &DeviceInfo::default(), Vec::new());
 			node.id = node.id.rebound(1);
@@ -124,6 +129,9 @@ fn planned_stop_deadlines() {
 			// Shutdown must apply its earlier overall bound before reading this reply.
 			node.stop_deadline = if timely || shutdown { u64::MAX } else { clock().max(1) };
 			assert!(send_frame(driver, driver_protocol::Opcode::Stopped, node.id.generation, &[], 0, 0));
+			if exits {
+				close(driver);
+			}
 			let mut catalogue = Catalogue::new();
 			let mut bytes = [0; 128];
 			if shutdown {
@@ -136,6 +144,11 @@ fn planned_stop_deadlines() {
 				let _ = advance(&mut node, b"stop-deadline-fixture", &mut catalogue);
 				let _ = advance(&mut node, b"stop-deadline-fixture", &mut catalogue);
 			}
+			let closure_recorded = node.incident_report.as_ref().is_some_and(|report| report.cause == FailureCause::DriverExited);
+			if closure_recorded {
+				debug_write(b"DeviceManager: a driver's channel closing after its stop was recorded as an incident\n");
+			}
+			assert!(!closure_recorded, "the channel of a binding its teardown has taken closing is not a second outcome");
 			assert!(node.binding.is_none() && node.teardown.is_none());
 			assert!(node.record.state == BindingState::Disabled);
 			assert_eq!(node.stop_deadline, 0);
@@ -145,8 +158,10 @@ fn planned_stop_deadlines() {
 			}
 			assert_eq!(forced, !timely, "only a STOPPED read before expiry can certify a clean stop");
 			assert_eq!(node.incident_report.is_none(), timely);
-			assert!(matches!(try_recv(driver, &mut bytes), Polled::Closed));
-			close(driver);
+			if !exits {
+				assert!(matches!(try_recv(driver, &mut bytes), Polled::Closed));
+				close(driver);
+			}
 		}
 	}
 }

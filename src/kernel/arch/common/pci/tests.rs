@@ -46,6 +46,18 @@ struct Space {
 	// back - look like clearing it, which is the defect exactly upside down. So the one behaviour
 	// these tests are about is modelled here rather than assumed away.
 	rw1c: u16,
+	// THE RW1C HALF-WORD WHOSE PORT UNDOES A STRAY CLEAR, as QEMU's PCIe ports do for Slot Status, or
+	// zero for none.
+	//
+	// A guest that clears an event bit that was NOT pending loses the race against the port setting it,
+	// so QEMU puts the whole status back when a write would clear a bit that is not set - and it judges
+	// that by the written VALUE as though it started at Slot Status, so a dword written at Slot Control
+	// has its CONTROL half read as status bits to clear. The enables there (attention button, presence
+	// changed) then read as clears of events that are not pending, and the acknowledgement the dword
+	// carried is undone. Measured on QEMU 10.0: the button's acknowledgement left `sta=0051` as it was,
+	// the next poll took the same press for a second removal request, and the slot was powered down
+	// while its driver still held the device.
+	reverts_stray_clears: u16,
 	next: u64,
 	// A PCI-TO-PCI BRIDGE ON THE SAME FAKE BUS, when a test stands one up.
 	//
@@ -61,7 +73,7 @@ const DEVICE_AT: (u8, u8, u8) = (0, 0, 0);
 const BRIDGE_AT: (u8, u8, u8) = (0, 2, 0);
 const BEHIND_AT: (u8, u8, u8) = (1, 0, 0);
 
-static SPACE: SpinLock<Space> = SpinLock::new(Space { bar: [0; 6], mask: [0; 6], command: 0, cfg: [0; 256], ext: [0; 256], ext_reach: false, ext_rw1c: [0; 4], rw1c: 0, next: WINDOW_BASE, bridge: None });
+static SPACE: SpinLock<Space> = SpinLock::new(Space { bar: [0; 6], mask: [0; 6], command: 0, cfg: [0; 256], ext: [0; 256], ext_reach: false, ext_rw1c: [0; 4], rw1c: 0, reverts_stray_clears: 0, next: WINDOW_BASE, bridge: None });
 
 // Put a device on the fake bus: `bar` is what the firmware left in each slot, `mask` what each
 // slot answers a probe with.
@@ -75,6 +87,7 @@ fn stand_up(bar: [u32; 6], mask: [u32; 6]) {
 	space.ext_reach = false;
 	space.ext_rw1c = [0; 4];
 	space.rw1c = 0;
+	space.reverts_stray_clears = 0;
 	space.next = WINDOW_BASE;
 	space.bridge = None;
 	drop(space);
@@ -157,6 +170,10 @@ const VIRTIO_CAP_ISR: u8 = 3;
 const VIRTIO_CAP_DEVICE: u8 = 4;
 
 struct Fake;
+
+// The Slot Status bits that record an EVENT rather than a state: attention button, power fault, MRL
+// sensor changed, presence detect changed, command completed. What QEMU's port guards.
+const SLOT_EVENTS: u32 = 0x1F;
 
 impl ConfigAccess for Fake {
 	const BUS_COUNT: u16 = 1;
@@ -263,14 +280,36 @@ impl ConfigAccess for Fake {
 					// The addressed dword holds the write-one-to-clear half: a one CLEARS, a zero
 					// leaves the bit alone, and the other half of the dword is stored as written.
 					let half = (rw1c & 2) as usize;
+					let before = [space.cfg[at + half], space.cfg[at + half + 1]];
 					for i in 0..2 {
 						bytes[half + i] = space.cfg[at + half + i] & !bytes[half + i];
+					}
+					// AND THE PORT THAT UNDOES IT, reading the whole written value - see `reverts_stray_clears`.
+					if space.reverts_stray_clears == rw1c && val & !(u16::from_le_bytes(before) as u32) & SLOT_EVENTS != 0 {
+						bytes[half..half + 2].copy_from_slice(&before);
 					}
 				}
 				space.cfg[at..at + 4].copy_from_slice(&bytes);
 			}
 			_ => {}
 		}
+	}
+
+	// ONE HALF-WORD OF THE STANDARD SPACE, which is all the kernel writes at this width: the
+	// write-one-to-clear half is cleared where a one is written, and the port's undoing applies to
+	// the half-word alone, which is what the kernel's acknowledgement relies on.
+	fn write16(bus: u8, dev: u8, func: u8, off: u16, val: u16) {
+		let mut space = SPACE.lock();
+		if (bus, dev, func) != DEVICE_AT && (bus, dev, func) != BEHIND_AT {
+			return;
+		}
+		let at = off as usize;
+		if off < 0x28 || off % 2 != 0 || at + 2 > space.cfg.len() {
+			return;
+		}
+		let before = u16::from_le_bytes([space.cfg[at], space.cfg[at + 1]]);
+		let after = if space.rw1c == off { if space.reverts_stray_clears == off && val & !before & SLOT_EVENTS as u16 != 0 { before } else { before & !val } } else { val };
+		space.cfg[at..at + 2].copy_from_slice(&after.to_le_bytes());
 	}
 
 	// The same bump the two ECAM backends use, over the small window above.
@@ -619,6 +658,7 @@ fn stand_up_pcie(port_type: u16, slot_implemented: bool, slot_caps: u32, slot_st
 		space.cfg[at + 0x1A + i] = *byte;
 	}
 	space.rw1c = (at + 0x1A) as u16;
+	space.reverts_stray_clears = space.rw1c;
 }
 
 // Put a value into the slot's STATUS half without going through the write path.
@@ -758,6 +798,33 @@ fn the_attention_button_is_a_request_and_not_a_removal() {
 	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::Quiet, "asked once");
 }
 
+crate::tagged_test!(an_acknowledgement_survives_a_port_that_undoes_a_stray_clear, [Kernel, Pci], id = "kernel.arch.common.pci.an_acknowledgement_survives_a_port_that_undoes_a_stray_clear", covers = ["kernel"]);
+fn an_acknowledgement_survives_a_port_that_undoes_a_stray_clear() {
+	// THE ACKNOWLEDGEMENT IS THE STATUS HALF-WORD AND NOTHING ELSE, because QEMU's ports undo a status
+	// write that clears an event which is not pending - and read a dword written at Slot Control as one
+	// such write whenever the armed enables name an event that is not set. See `reverts_stray_clears`.
+	//
+	// AN ARMED SLOT, THE BUTTON PRESSED AND NO PRESENCE CHANGE: what a removal looks like. The dword
+	// acknowledgement left the press standing, the next poll read it as a second request, and the slot
+	// was powered down under a driver that had not let go yet.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, SLOT_STATUS_PRESENT);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	slot_arm::<Fake>(&a_function(), slot);
+	slot_status_is(slot.cap, SLOT_STATUS_PRESENT | SLOT_STATUS_ATTENTION_BUTTON);
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::RemovalRequested);
+	slot_acknowledge_button::<Fake>(&a_function(), slot);
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::Quiet, "the press is acknowledged once, on a port that undoes stray clears");
+
+	// AND A PRESENCE CHANGE WITH NO PRESS STANDING, which is what an arrival looks like once the press
+	// that came with it has been answered.
+	slot_status_is(slot.cap, SLOT_STATUS_PRESENT | SLOT_STATUS_PRESENCE_CHANGED);
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::Arrived);
+	slot_acknowledge::<Fake>(&a_function(), slot);
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::Quiet, "the change is acknowledged once, on the same port");
+	let armed = Fake::read16(0, 0, 0, slot.cap + 0x18);
+	assert!(armed & SLOT_CONTROL_ATTENTION_BUTTON_ENABLE != 0 && armed & SLOT_CONTROL_PRESENCE_CHANGED_ENABLE != 0, "and the slot is still armed");
+}
+
 crate::tagged_test!(powering_a_slot_down_says_off_on_the_indicator_and_not_the_reserved_value, [Kernel, Pci], id = "kernel.arch.common.pci.powering_a_slot_down_says_off_on_the_indicator_and_not_the_reserved_value", covers = ["kernel"]);
 fn powering_a_slot_down_says_off_on_the_indicator_and_not_the_reserved_value() {
 	// OFF IS THREE AND NOT ZERO, which is the specification's spelling and not an obvious one: the
@@ -780,6 +847,48 @@ fn powering_a_slot_down_says_off_on_the_indicator_and_not_the_reserved_value() {
 	let control = Fake::read16(0, 0, 0, slot.cap + 0x18);
 	assert!(control & SLOT_CONTROL_POWER_OFF == 0);
 	assert_eq!(control & SLOT_CONTROL_POWER_INDICATOR, SLOT_CONTROL_POWER_INDICATOR_ON);
+}
+
+crate::tagged_test!(a_slot_holds_what_its_presence_says_across_every_scan, [Kernel, Pci], id = "kernel.arch.common.pci.a_slot_holds_what_its_presence_says_across_every_scan", covers = ["kernel"]);
+fn a_slot_holds_what_its_presence_says_across_every_scan() {
+	// THE BUTTON IS A REQUEST ONLY ON AN OCCUPIED SLOT, so what the port table records as occupied is
+	// what decides whether a removal is asked for at all. It was "the slot reports an arrival" right
+	// after that arrival was acknowledged, at every scan - and an arrival rescans the bus.
+	//
+	// A DEVICE IN THE SLOT AT BOOT, with no change pending: occupied, and its button is a request.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, SLOT_STATUS_PRESENT);
+	let ports = super::HeldPorts::take();
+	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	let mut out = [super::SlotChange { bus: 0, dev: 0, func: 0, secondary: 0, what: SlotEvent::Quiet }; super::MAX_HOT_PLUG_PORTS];
+	slot_status_is(slot.cap, SLOT_STATUS_PRESENT | SLOT_STATUS_ATTENTION_BUTTON);
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 1, "a device that was there at boot can be asked for");
+	assert_eq!(out[0].what, SlotEvent::RemovalRequested);
+	// The kernel's table back, so the port below is armed for the first time.
+	drop(ports);
+
+	// A DEVICE PLUGGED IN LATER, AND THE BUS RESCANNED FOR IT - which is what an arrival does.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, 0);
+	let _ports = super::HeldPorts::take();
+	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
+	slot_status_is(slot.cap, SLOT_STATUS_PRESENT | SLOT_STATUS_PRESENCE_CHANGED);
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 1);
+	assert_eq!(out[0].what, SlotEvent::Arrived);
+	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
+	slot_status_is(slot.cap, SLOT_STATUS_PRESENT | SLOT_STATUS_ATTENTION_BUTTON);
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 1, "the rescan an arrival makes does not record the slot empty under its device");
+	assert_eq!(out[0].what, SlotEvent::RemovalRequested);
+	drop(_ports);
+
+	// AND A CHANGE THE POLL HAS NOT READ YET IS NOT TAKEN BY A RESCAN somebody else's arrival made: the
+	// device plugged in between the two is reported, not acknowledged on the way past.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, 0);
+	let _ports = super::HeldPorts::take();
+	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
+	slot_status_is(slot.cap, SLOT_STATUS_PRESENT | SLOT_STATUS_PRESENCE_CHANGED);
+	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 1, "the arrival is still the poll's to report");
+	assert_eq!(out[0].what, SlotEvent::Arrived);
 }
 
 crate::tagged_test!(a_poll_answers_a_change_once_and_the_state_it_left_behind, [Kernel, Pci], id = "kernel.arch.common.pci.a_poll_answers_a_change_once_and_the_state_it_left_behind", covers = ["kernel"]);

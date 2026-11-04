@@ -126,6 +126,10 @@ impl common::ConfigAccess for Access {
 		unsafe { core::ptr::write_volatile(super::paging::phys_to_virt(cfg_phys(bus, dev, func, off)) as *mut u32, val) }
 	}
 
+	fn write16(bus: u8, dev: u8, func: u8, off: u16, val: u16) {
+		let _ = config_write_exact(bus, dev, func, off, 2, val as u32);
+	}
+
 	// The bus is reachable only once the ECAM base is known (from the device tree).
 	fn ready() -> bool {
 		ECAM_BASE.load(Ordering::Relaxed) != 0

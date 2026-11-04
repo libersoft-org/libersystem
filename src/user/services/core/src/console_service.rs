@@ -116,11 +116,19 @@ impl Presenter {
 		self.surface.image(0).map(|image| image.layout()).expect("a surface has at least one image while it has a generation")
 	}
 
-	/// Bring one image up to date and present it.
+	/// Bring one image up to date and present it: `Some(true)` for a frame the display took, `Some(false)` for one it
+	/// refused, and `None` for a frame that was not presented at all.
 	///
 	/// `Again` IS NOT A FAILURE. It means every image is in flight, and the console's answer is to
 	/// skip this frame rather than to block the only loop it has - the next change presents.
-	fn present(&mut self, rect: Rect) -> bool {
+	///
+	/// AND NEITHER IS `out-of-date` OR `not-visible`, WHICH THIS REPORTED AS ONE (2026-11-04). All three answered
+	/// `false`, the same as a present the display refused, so the console's one-line outcome said "a frame did NOT
+	/// reach the display" for a frame the protocol had told it to skip or to rebuild for. Measured after an
+	/// operator's disable and enable of `virtio_gpu`: DisplayService adopted the rebound provider and moved the
+	/// surface to a new serial, the next keystroke's echo was answered `out-of-date`, the console rebuilt and its
+	/// redraw reached the display - and the line on record was the failure.
+	fn present(&mut self, rect: Rect) -> Option<bool> {
 		let index = match self.surface.acquire() {
 			Some(Ok(surface::AcquiredImage::Image(index))) => index,
 			// THE CLIENT REBUILDS, which is what the contract says `out-of-date` asks for. Waiting for the Configure
@@ -129,13 +137,14 @@ impl Presenter {
 			// while the console is still presenting the burst of lines the rebinding printed.
 			Some(Ok(surface::AcquiredImage::OutOfDate)) => {
 				self.out_of_date = true;
-				return false;
+				return None;
 			}
-			_ => return false,
+			Some(Ok(surface::AcquiredImage::Again | surface::AcquiredImage::NotVisible)) => return None,
+			_ => return Some(false),
 		};
 		let Some(image) = self.surface.image(index) else {
 			let _ = self.surface.abandon(index);
-			return false;
+			return Some(false);
 		};
 		let complete: bool = self.complete.get(index as usize).copied().unwrap_or(false);
 		let length: usize = self.shadow.len();
@@ -158,7 +167,7 @@ impl Presenter {
 		if let Some(slot) = self.complete.get_mut(index as usize) {
 			*slot = true;
 		}
-		matches!(outcome, Some(Ok(_)))
+		Some(matches!(outcome, Some(Ok(_))))
 	}
 }
 
@@ -182,7 +191,8 @@ impl Surface for DisplaySurface {
 		&self.raster
 	}
 	fn present(&self, x: u32, y: u32, w: u32, h: u32) {
-		let landed = self.presenter.borrow_mut().present(Rect { x, y, width: w, height: h });
+		// A FRAME THAT WAS NOT PRESENTED HAS NO OUTCOME TO REPORT - see `Presenter::present`.
+		let Some(landed) = self.presenter.borrow_mut().present(Rect { x, y, width: w, height: h }) else { return };
 		let want = if landed { PRESENT_OK } else { PRESENT_FAILED };
 		if PRESENTED.load(core::sync::atomic::Ordering::Relaxed) & want == 0 && PRESENTED.fetch_or(want, core::sync::atomic::Ordering::AcqRel) & want == 0 {
 			print(if landed { b"ConsoleService: a frame reached the display\n".as_slice() } else { b"ConsoleService: a frame did NOT reach the display\n".as_slice() });
