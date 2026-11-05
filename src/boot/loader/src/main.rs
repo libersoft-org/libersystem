@@ -179,6 +179,13 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		arch::serial::write_str("loader: the boot medium names no system volume; using the first LiberFS volume found\n");
 	}
 
+	// THIS ENTRY PATH'S DMA-MODE INPUT, READ BEFORE THE KERNEL, and the boot ended here if the
+	// pairing record just verified already settles a refusal: a tag-0 medium with no carrier halted
+	// only after it had read, verified and announced a kernel it could never hand over. A set that
+	// may still resolve is judged whole at the end, from this same reading.
+	let dma_inputs = arch::dma_mode_inputs(bs, root, system_table);
+	dma_mode::refuse_if_settled(&dma_inputs);
+
 	// Prefer the system volume: a program that runs should have a file on the volume the user can
 	// see, which is the whole point of this milestone. The ESP copy is the fallback, so a machine
 	// whose system volume is missing or unreadable still boots far enough to say so.
@@ -506,10 +513,10 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	}
 	// THE DMA MODE, RESOLVED OVER THE WHOLE SELECTED SET, before anything is handed off. Every
 	// manifest verified above recorded its tag into the latch; this is where the set is judged as
-	// one, this entry path's harness input is read, and an independent input is refused. A boot
-	// that cannot state its mode halts here, with the reason, rather than handing the kernel a
-	// value it would refuse anyway or - worse - none.
-	dma_mode::resolve(arch::dma_mode_inputs(bs, root, system_table));
+	// one, against the harness input read before the kernel, and an independent input is refused.
+	// A boot that cannot state its mode halts here, with the reason, rather than handing the kernel
+	// a value it would refuse anyway or - worse - none.
+	dma_mode::resolve(dma_inputs);
 	// AND THE ROLLBACK FLOOR, LAST: the complete selected set is verified and its DMA mode judged,
 	// so the one generation that set carries is the only input to the floor. Below it halts here;
 	// equal or above converges both slots and reads them back before anything is handed off.

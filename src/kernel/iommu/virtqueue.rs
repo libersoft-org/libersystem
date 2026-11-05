@@ -188,6 +188,14 @@ impl VirtQueue {
 		if self.size < 2 || self.request_failed {
 			return None;
 		}
+		// A DEADLINE ALREADY PAST IS A REQUEST NEVER SENT, and the queue stays usable. Sent, its
+		// answer would come after this had stopped looking, and the latch below would close the
+		// queue for the boot - every later attach, map and detach answered `Unconfirmed` because one
+		// caller ran out of time before it asked. The answer is the same refusal without that cost.
+		let deadline = DEADLINE.load(core::sync::atomic::Ordering::Relaxed);
+		if deadline != 0 && crate::arch::apic::ticks() >= deadline {
+			return None;
+		}
 		// Reopen only after validating the sole completion. Any early return keeps every queue
 		// resource unavailable, so a late answer cannot confirm a later request with a reused id.
 		self.request_failed = true;
@@ -220,15 +228,18 @@ impl VirtQueue {
 		// CHECKED EVERY `CLOCK_EVERY` SPINS, not every spin: reading the timer is a device access on
 		// two of the three ports and doing it per iteration would make the wait it bounds slower than
 		// the wait itself.
+		//
+		// AND THE RING IS READ BEFORE THE CLOCK, so an answer that is already there is taken rather
+		// than timed out: the deadline ends a wait, it does not discard a completion that arrived.
 		const CLOCK_EVERY: u64 = 1024;
-		let deadline = DEADLINE.load(core::sync::atomic::Ordering::Relaxed);
 		for spin in 0..spin_budget() {
-			if deadline != 0 && spin % CLOCK_EVERY == 0 && crate::arch::apic::ticks() >= deadline {
-				return None;
-			}
 			// SAFETY: the used ring's index field, in this queue's own frame.
 			let used = unsafe { read16(self.used + 2) };
-			if used != self.used_seen {
+			if used == self.used_seen {
+				if deadline != 0 && spin % CLOCK_EVERY == 0 && crate::arch::apic::ticks() >= deadline {
+					return None;
+				}
+			} else {
 				if used != self.used_seen.wrapping_add(1) {
 					return None;
 				}

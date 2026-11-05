@@ -22,7 +22,9 @@
 use bootproto::dma_mode::{Carrier, Handoff, Latch, LatchRefusal};
 
 // THE LATCH, recorded by `trust::verify_for` for every manifest it accepts - the same set the
-// release latch is taken over - and resolved once, before the hand-off.
+// release latch is taken over - and resolved once, before the hand-off. It is also asked once
+// earlier, before a kernel is read, whether it already holds a refusal nothing can lift
+// (`refuse_if_settled`).
 static mut LATCH: Latch = Latch::new();
 
 // What the hand-off carries, once resolved. `None` until `resolve` has run; the arch backends read
@@ -54,6 +56,8 @@ pub(crate) fn handoff_words() -> (u32, u32) {
 }
 
 // What this entry path's harness input looked like, and whether an INDEPENDENT input is present.
+// Read once, before the kernel, and judged twice from the same copy.
+#[derive(Clone, Copy)]
 pub(crate) struct Inputs {
 	// The one input this architecture's UEFI path reads: `fw_cfg` on x86_64, the ESP file on the
 	// device-tree ports.
@@ -63,14 +67,29 @@ pub(crate) struct Inputs {
 	pub independent: Option<&'static str>,
 }
 
+// Halt now if the boot is already bound to refuse, or return and decide nothing.
+//
+// A KERNEL IS NOT READ FOR A BOOT THAT CANNOT HAND IT OVER. Called after the boot medium's pairing
+// record - the first manifest - is verified and before the kernel is: an independent input, or a
+// latch whose refusal no later manifest can lift (a tag-0 record with no carrier or a malformed
+// one, a signed one beside a carrier), ends the boot here with the sentence `resolve` would have
+// printed at the end, and nothing of the kernel has been read. A set that could still resolve - an
+// empty latch, a carrier that fits so far - stores nothing and goes on to be judged whole.
+pub(crate) fn refuse_if_settled(inputs: &Inputs) {
+	if let Some(what) = inputs.independent {
+		refuse_independent(what);
+	}
+	let latch = latch();
+	if let Some(refusal) = latch.settled_refusal(inputs.carrier) {
+		refuse(refusal, &latch);
+	}
+}
+
 // Resolve the mode this boot runs under, or halt with the reason. Called once, after every source
 // has been verified and before the hand-off.
 pub(crate) fn resolve(inputs: Inputs) {
 	if let Some(what) = inputs.independent {
-		crate::arch::serial::write_str("loader: FATAL - ");
-		crate::arch::serial::write_str(what);
-		crate::arch::serial::write_str(" is present beside this entry path's DMA-mode input: an independent producer, refused whether or not it agrees\n");
-		crate::arch::halt();
+		refuse_independent(what);
 	}
 	let latch = latch();
 	match latch.resolve(inputs.carrier) {
@@ -84,24 +103,33 @@ pub(crate) fn resolve(inputs: Inputs) {
 				Handoff::Harness(_) => " (harness - every selected manifest declares none and this path's carrier supplied it)\n",
 			});
 		}
-		Err(refusal) => {
-			crate::arch::serial::write_str("loader: FATAL - no DMA mode can be handed to the kernel: ");
-			crate::arch::serial::write_str(refusal.message());
-			match refusal {
-				LatchRefusal::CarrierMalformed(reason) => {
-					crate::arch::serial::write_str(" (");
-					crate::arch::serial::write_str(malformed_name(reason));
-					crate::arch::serial::write_str(")");
-				}
-				LatchRefusal::NothingSelected => {}
-				_ => {}
-			}
-			crate::arch::serial::write_str(" - over ");
-			crate::serial_write_usize(latch.manifests());
-			crate::arch::serial::write_str(" verified manifest(s)\n");
-			crate::arch::halt();
-		}
+		Err(refusal) => refuse(refusal, &latch),
 	}
+}
+
+fn refuse_independent(what: &str) -> ! {
+	crate::arch::serial::write_str("loader: FATAL - ");
+	crate::arch::serial::write_str(what);
+	crate::arch::serial::write_str(" is present beside this entry path's DMA-mode input: an independent producer, refused whether or not it agrees\n");
+	crate::arch::halt();
+}
+
+fn refuse(refusal: LatchRefusal, latch: &Latch) -> ! {
+	crate::arch::serial::write_str("loader: FATAL - no DMA mode can be handed to the kernel: ");
+	crate::arch::serial::write_str(refusal.message());
+	match refusal {
+		LatchRefusal::CarrierMalformed(reason) => {
+			crate::arch::serial::write_str(" (");
+			crate::arch::serial::write_str(malformed_name(reason));
+			crate::arch::serial::write_str(")");
+		}
+		LatchRefusal::NothingSelected => {}
+		_ => {}
+	}
+	crate::arch::serial::write_str(" - over ");
+	crate::serial_write_usize(latch.manifests());
+	crate::arch::serial::write_str(" verified manifest(s)\n");
+	crate::arch::halt();
 }
 
 fn malformed_name(reason: bootproto::dma_mode::Malformed) -> &'static str {

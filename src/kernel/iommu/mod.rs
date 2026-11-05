@@ -1142,11 +1142,24 @@ pub fn detach_for(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// wait, and either expiry is `Unconfirmed`, which quarantines the claim rather than freeing
 	// anything. Restored on every path, like the budget, because the boot's own attaches must not
 	// inherit a deadline that has already passed.
-	let previous_deadline = virtqueue::set_deadline(crate::arch::apic::ticks().saturating_add(virtqueue::TEARDOWN_TICKS));
+	let previous_deadline = virtqueue::set_deadline(teardown_deadline());
 	let confirmed = detach_for_inner(index, bus, dev, func);
 	virtqueue::set_deadline(previous_deadline);
 	virtqueue::set_spin_budget(previous_budget);
 	confirmed
+}
+
+// THE BOUND IS PER CONVERSATION WITH THE CONTROLLER, armed again just before each one.
+//
+// It was armed once, at the top of `detach_for`, and the fault drains before the revoke spent it: an
+// endpoint with a fault queued prints two lines there, and on a port whose kernel console also draws
+// into a framebuffer under emulation two lines took longer than the whole 200 ms. The DETACH then
+// went out with its deadline already behind it, the device answered, and nobody read the answer -
+// the replacement binding of the forced-release test was quarantined on all three port IOMMU
+// profiles, every run. The drains are bounded by their own buffer; the deadline bounds the wait for
+// the controller, which is the one thing a wedged device can stretch.
+fn teardown_deadline() -> u64 {
+	crate::arch::apic::ticks().saturating_add(virtqueue::TEARDOWN_TICKS)
 }
 
 fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
@@ -1172,6 +1185,7 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	if let Some(slot) = RETAINED.lock().get_mut(index) {
 		*slot = Some(domain);
 	}
+	virtqueue::set_deadline(teardown_deadline());
 	let confirmed = match revoke_endpoint(domain, bus, dev, func) {
 		Ok(dma::Release::FramesReusable) => true,
 		other => {
@@ -1244,6 +1258,7 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// AND IT HAPPENS AFTER THE DRAIN ABOVE, which is what lets the binding be charged for the faults
 	// its own revoke raised. See that paragraph.
 	if confirmed {
+		virtqueue::set_deadline(teardown_deadline());
 		match with(|controller| controller.iommu().destroy_domain(domain)) {
 			Some(Ok(_)) => {
 				if let Some(slot) = RETAINED.lock().get_mut(index) {

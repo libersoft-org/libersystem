@@ -66,13 +66,10 @@ def check_sleep(lines, record):
 	# The host interval includes controller/core restoration after the RTC sample. It can be longer,
 	# but an RTC duration longer than the whole host interval would be fabricated sleep time.
 	require(reported <= elapsed + MARGIN_MS, f'the host measured {elapsed:.0f} ms but the RTC reported {reported} ms')
-	rows = []
-	for at, (stamp, line) in enumerate(lines):
-		if found := tickless.COUNTER.search(tickless.PROMPT_TEXT.sub('', line)):
-			rows.append((at, stamp, *map(int, found.groups())))
+	rows = tickless.counter_rows(lines)
 	require(len(rows) >= 2 and [row[2] for row in rows] == list(range(1, len(rows) + 1)), 'the counter skipped, repeated, restarted, or did not begin at one')
 	require(not any(entry_at < row[0] < resume_at for row in rows), 'the counter ran while the machine slept')
-	_, _, mono, boot = tickless.sleep_clock_gap(rows, entries[0], resumes[0][:3], reported, MARGIN_MS)
+	_, _, mono, boot = tickless.sleep_clock_gap(rows, entries[0], resumes[0][:3], reported, MARGIN_MS, frozen=tickless.freeze_window(lines))
 	last = LAST_SLEEP.findall(record)
 	require(len(last) == 1 and int(last[0]) == reported, 'the last record does not match this successful RTC wake')
 	return elapsed, mono, boot
@@ -105,7 +102,7 @@ def check_frame(before, after):
 
 def self_test():
 	tickless.clock_self_test()
-	lines = [(0.0, 'count 1 mono-ms 100 boot-ms 100'), (0.1, ENTERED + ' at tick 1)'), (0.2, STOPPED), (8.09, BACK), (8.1, 'sleep: resumed (the RTC alarm, after 8000 ms, at tick 1)'), (8.2, 'count 2 mono-ms 200 boot-ms 8200')]
+	lines = [(0.0, 'count 1 mono-ms 100 boot-ms 100'), (0.05, 'ServiceManager: sleep: step flush at tick 1'), (0.1, ENTERED + ' at tick 1)'), (0.2, STOPPED), (8.09, BACK), (8.1, 'sleep: resumed (the RTC alarm, after 8000 ms, at tick 1)'), (8.15, 'ServiceManager: sleep: step thaw at tick 2'), (8.2, 'count 2 mono-ms 200 boot-ms 8200')]
 	record = 'slept 8000 ms and was woken by the RTC alarm'
 	check_sleep(lines, record)
 	check_sleep([(stamp, line + '\r') for stamp, line in lines], record + '\r')
@@ -214,7 +211,7 @@ def ram_sleep(serial, qmp_path, work, label):
 	with open(os.path.join(work, f'{label}-stamped.log'), 'w') as log:
 		for stamp, line in lines:
 			log.write(f'{stamp:.6f} {line}\n')
-	require(sum(tickless.COUNTER.search(tickless.PROMPT_TEXT.sub('', line)) is not None for _, line in lines) == 300, 'the thirty-second counter did not publish all 300 values')
+	require(len(tickless.counter_rows(lines)) == 300, 'the thirty-second counter did not publish all 300 values')
 	record = serial.run('sleepctl last', 600)
 	elapsed, mono, boot = check_sleep(lines, record)
 	note(f'{label}: RTC wake, host {elapsed:.0f} ms, counter silent; monotonic +{mono} ms, boot-time +{boot} ms')

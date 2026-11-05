@@ -103,6 +103,44 @@ fn a_mixed_or_disagreeing_set_refuses_whatever_the_carrier_says() {
 }
 
 #[test]
+fn a_refusal_settled_on_part_of_the_set_is_never_lifted_by_the_rest() {
+	// The loader refuses on the boot medium's pairing record alone, before it reads a kernel, when
+	// `settled_refusal` says so - which is sound only if no set that begins that way resolves. So
+	// every set of up to four manifests, cut after every prefix, under every kind of carrier: a
+	// prefix that settles a refusal must belong to a set that refuses.
+	let fields = [None, Some(MODE_ENFORCING_REQUIRED), Some(MODE_NO_IOMMU)];
+	let carriers = [Carrier::Absent, Carrier::Valid(Mode::EnforcingRequired), Carrier::Valid(Mode::NoIommu), Carrier::Malformed(Malformed::Provenance(1))];
+	let mut sets: [[Option<u32>; 4]; 81] = [[None; 4]; 81];
+	for (index, set) in sets.iter_mut().enumerate() {
+		for (place, field) in set.iter_mut().enumerate() {
+			*field = fields[index / 3usize.pow(place as u32) % 3];
+		}
+	}
+	let mut settled = 0;
+	for set in &sets {
+		for length in 1..=set.len() {
+			let whole = latched(&set[..length]);
+			for prefix in 1..=length {
+				let part = latched(&set[..prefix]);
+				for carrier in carriers {
+					if part.settled_refusal(carrier).is_some() {
+						settled += 1;
+						assert!(whole.resolve(carrier).is_err(), "{:?} settled a refusal under {carrier:?} and the whole set {:?} resolved", &set[..prefix], &set[..length]);
+					}
+				}
+			}
+		}
+	}
+	assert!(settled > 0, "no prefix settled anything, so the property above was never exercised");
+	// The case the loader meets: a tag-0 pairing record and no carrier is final at once.
+	assert_eq!(latched(&[None]).settled_refusal(Carrier::Absent), Some(LatchRefusal::CarrierAbsent));
+	// An admissible start, and an empty latch, settle nothing - the next manifest decides.
+	assert_eq!(latched(&[None]).settled_refusal(Carrier::Valid(Mode::NoIommu)), None);
+	assert_eq!(latched(&[Some(MODE_NO_IOMMU)]).settled_refusal(Carrier::Absent), None);
+	assert_eq!(Latch::new().settled_refusal(Carrier::Absent), None);
+}
+
+#[test]
 fn the_x86_64_relay_check_admits_exactly_the_relayed_input() {
 	// The normal relay: harness provenance, and the fw_cfg record still there and agreeing.
 	assert_eq!(relay_check(MODE_ENFORCING_REQUIRED, PROVENANCE_HARNESS, Carrier::Valid(Mode::EnforcingRequired)), Ok(Handoff::Harness(Mode::EnforcingRequired)));

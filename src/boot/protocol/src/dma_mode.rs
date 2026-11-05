@@ -309,6 +309,20 @@ impl Latch {
 			},
 		}
 	}
+
+	// A refusal no manifest still to be verified can lift, or `None` while one could.
+	//
+	// THE LOADER ASKS THIS BEFORE IT READS A KERNEL, with the boot medium's pairing record in the
+	// latch: a boot already bound to refuse must not load a kernel first. Every refusal but one is
+	// final the moment it is found - a contradiction is kept, `present` never changes once set, and
+	// the carrier is a fixed input - so a later manifest can add a reason but never an admission.
+	// The exception is `NothingSelected`, which the next manifest ends.
+	pub fn settled_refusal(&self, carrier: Carrier) -> Option<LatchRefusal> {
+		match self.resolve(carrier) {
+			Ok(_) | Err(LatchRefusal::NothingSelected) => None,
+			Err(refusal) => Some(refusal),
+		}
+	}
 }
 
 impl Default for Latch {

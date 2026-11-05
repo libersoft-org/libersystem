@@ -31,8 +31,9 @@
 # AND THE PORTS' SLEEP, which is suspend to idle (neither firmware here offers more - the kernel says what it found at
 # boot): `sleepctl suspend idle` with the timed wake, the host's oracle the serial line's timing as on x86_64 - a
 # counter printing every 100 ms SILENT between the kernel's `sleep: entered` and `sleep: resumed` lines, that interval
-# at least the wake less a margin, the counter's next value after with its monotonic clock excluding the sleep
-# and its boot-time clock including it, with the synchronous entry/resume ticks checked against host time - and the parking
+# at least the wake less a margin, the one pair of consecutive counts that spans the freeze with its monotonic clock
+# excluding the sleep and its boot-time clock including it, with the synchronous entry/resume ticks checked against
+# host time - and the parking
 # from the last sleep's record: no core woke for a device,
 # cpu0 at most once for the timer, every other core at most once, for the IPI that ends its park.
 # On ARM, first request the RAM state this firmware does not offer: admission must refuse it before
@@ -74,7 +75,13 @@ SLEEP_OFFERED = re.compile(rb'sleep: [^\r\n]* is (offered|not offered) by this f
 PROMPT_TEXT = re.compile(r'vol://[^\r\n>]*> ')
 # WITHOUT ITS PREFIX: the counter writes "sleepcheck: " and the rest of its line in two writes, and another program's
 # lines - `sleepctl`'s record of the last sleep, then its prompt - can land between them.
-COUNTER = re.compile(r'count (\d+) mono-ms (\d+) boot-ms (\d+)')
+# AND TO ITS END OF LINE, because the kernel can land inside it. The kernel writes its lines straight to the port while
+# the counter's go through the console path, so "boot-ms 55575", then "DeviceManager: resumed console-uart ...", then
+# "4" on a line of its own was count 53's boot clock, 555754 - read as 55575, a clock eight minutes behind. A counter
+# line is read only whole; one another writer cut is rejoined with the rest of its own text when that arrives
+# (`counter_rows`).
+COUNTER_LINE = re.compile(r'count (\d+) mono-ms (\d+) boot-ms (\d+)\r?$')
+COUNTER_SHAPE = ('count ', None, ' mono-ms ', None, ' boot-ms ', None)
 PARKED = re.compile(r'cpu(\d+): woke (\d+) time\(s\) for the timer, (\d+) for an IPI, (\d+) for a device')
 
 ARMED = re.compile(rb'console: typed input raises interrupt (\d+)')
@@ -228,16 +235,110 @@ def idle_states(serial, timeout):
 	return cores
 
 
-def sleep_clock_gap(rows, entered, resumed, reported_ms, margin_ms=IDLE_MARGIN_MS):
-	"""Rows: (line index, host timestamp, count, mono ms, boot ms); boundaries: (index, stamp, tick)."""
+# The transaction's own steps, as ServiceManager prints them when each begins.
+FREEZE_STEP = re.compile(r'ServiceManager: sleep: step (flush|thaw) at tick (\d+)')
+
+# How far two consecutive counts' boot-minus-monotonic may move apart without sleeping between them: the counter reads
+# the two clocks one after the other, and a thread preempted between the reads shows a few milliseconds.
+CLOCK_READ_JITTER_MS = 100
+
+
+def freeze_window(lines):
+	"""The ticks the transaction's flush and thaw steps began at. Lines: (stamp, line)."""
+	ticks = {}
+	for _, line in lines:
+		if found := FREEZE_STEP.search(line):
+			if found.group(1) in ticks:
+				raise GateError(f'the sleep transaction began its {found.group(1)} step twice')
+			ticks[found.group(1)] = int(found.group(2))
+	if set(ticks) != {'flush', 'thaw'} or ticks['thaw'] < ticks['flush']:
+		raise GateError('the sleep transaction did not report its flush and thaw steps, in that order')
+	return ticks['flush'], ticks['thaw']
+
+
+def counter_head(text):
+	"""The part of `text`, from its `count `, that follows the counter's format - where another writer's text began."""
+	start = text.find('count ')
+	if start < 0:
+		return ''
+	at = start
+	for part in COUNTER_SHAPE:
+		if part is None:
+			while at < len(text) and text[at].isdigit():
+				at += 1
+			continue
+		for char in part:
+			if at < len(text) and text[at] == char:
+				at += 1
+			else:
+				return text[start:at]
+	return text[start:at]
+
+
+def counter_rows(lines):
+	"""(line index, stamp, count, mono ms, boot ms) for each counter line, the index and stamp where it began.
+	Lines: (stamp, line)."""
+	rows = []
+	cut = None
+	for at, (stamp, line) in enumerate(lines):
+		text = PROMPT_TEXT.sub('', line)
+		if cut is not None:
+			found = COUNTER_LINE.match(cut[2] + text)
+			if found:
+				rows.append((cut[0], cut[1], *map(int, found.groups())))
+				cut = None
+				continue
+		if found := COUNTER_LINE.search(text):
+			if cut is not None:
+				raise GateError(f'a counter line was cut at "{cut[2]}" and its end never arrived')
+			rows.append((at, stamp, *map(int, found.groups())))
+			continue
+		# CUT ONLY IF IT REACHED ITS FIELDS: the typed `sleepcheck count 30 &` and the closing `count done` are not
+		# counter lines, and a line cut before " m" is lost rather than guessed - which the caller's unbroken-run check
+		# then refuses.
+		head = counter_head(text)
+		if re.match(r'count \d+ m', head):
+			if cut is not None:
+				raise GateError(f'a counter line was cut at "{cut[2]}" and its end never arrived')
+			cut = (at, stamp, head)
+	if cut is not None:
+		raise GateError(f'a counter line was cut at "{cut[2]}" and its end never arrived')
+	return rows
+
+
+def sleep_clock_gap(rows, entered, resumed, reported_ms, margin_ms=IDLE_MARGIN_MS, frozen=None):
+	"""Rows: (line index, host timestamp, count, mono ms, boot ms); boundaries: (index, stamp, tick);
+	frozen: (flush tick, thaw tick), the window the counter could not sample in."""
 	entered_at, entered_stamp, entered_tick = entered
 	resumed_at, resumed_stamp, resumed_tick = resumed
-	before = [row for row in rows if row[0] < entered_at]
-	after = [row for row in rows if row[0] > resumed_at]
-	if not before or not after:
+	if not any(row[0] < entered_at for row in rows) or not any(row[0] > resumed_at for row in rows):
 		raise GateError('the same counter did not span the sleep')
-	left, right = before[-1], after[0]
+	# THE PAIR THAT SPANS THE SLEEP IS FOUND BY THE COUNTER, NOT BY THE WIRE. The counter's lines reach the serial
+	# line through ConsoleService and the console driver, which the transaction suspends, while the kernel's
+	# `sleep: entered` and `sleep: resumed` are written straight to the port. Under emulation the counter ran seconds
+	# behind: counts sampled before the freeze arrived after `sleep: resumed`, so "the last line before the entry and
+	# the first after the resume" were two samples from before the sleep, and the ports' check read a 0 ms step
+	# between them in every run while the kernel's clocks were right. So: the counts in their own order, and the one
+	# place where boot-minus-monotonic moved - exactly one, everywhere else within a clock read's jitter.
+	ordered = sorted(rows, key=lambda row: row[2])
+	steps = [(after[4] - after[3]) - (before[4] - before[3]) for before, after in zip(ordered, ordered[1:])]
+	at = max(range(len(steps)), key=steps.__getitem__)
+	if any(abs(step) > CLOCK_READ_JITTER_MS for index, step in enumerate(steps) if index != at):
+		raise GateError('the boot-time clock left the monotonic one at more than one point')
+	left, right = ordered[at], ordered[at + 1]
+	# WHAT THE WIRE STILL PROVES, which is one direction: a sample that counts the sleep was taken after it, so it
+	# cannot have reached the line before the kernel said it resumed. (A sample from before can arrive any time.)
+	early = [row for row in ordered[at + 1:] if row[0] < resumed_at]
+	if early:
+		raise GateError(f'count {early[0][2]} counts the sleep and reached the serial line before `sleep: resumed`')
 	mono, boot = right[3] - left[3], right[4] - left[4]
+	# AND THE PAIR SPANS THE FREEZE: the counter cannot sample between the transaction's flush (which begins after
+	# the freeze is answered) and its thaw, so the pair either side of the sleep is at least that far apart on the
+	# monotonic clock, which the ticks share. Two tick boundaries are the slack.
+	if frozen is not None:
+		frozen_ms = (frozen[1] - frozen[0]) * 10
+		if mono < frozen_ms - 20:
+			raise GateError(f'counts {left[2]} and {right[2]} are {mono} ms apart, less than the {frozen_ms} ms the counter was frozen - they do not span the sleep')
 	# The application is frozen during awake driver preparation and restoration too. That interval
 	# need not be shorter than the sleep. Counter output may also queue at ConsoleService after thaw,
 	# so its receive timestamp is not its sample time. The kernel's entry/resume lines, by contrast,
@@ -257,6 +358,7 @@ def clock_self_test():
 	long_preparation = [(0, 0.0, 1, 0, 0), (3, 10.0, 2, 5000, 10000)]
 	entered, resumed = (1, 0.1, 10), (2, 5.1, 10)
 	sleep_clock_gap(ordinary, entered, resumed, 5000)
+	sleep_clock_gap(ordinary, entered, resumed, 5000, frozen=(10, 20))
 	sleep_clock_gap(long_preparation, (1, 4.0, 400), (2, 9.0, 400), 5000)
 	# ConsoleService can deliver a queued counter batch later; synchronous kernel timing remains exact.
 	sleep_clock_gap([ordinary[0], (3, 7.5, 2, 200, 5200)], entered, resumed, 5000)
@@ -264,21 +366,51 @@ def clock_self_test():
 	left, right, _, _ = sleep_clock_gap(ordinary + [(4, 25.2, 3, 20200, 25200)], entered, resumed, 5000)
 	if (left[2], right[2]) != (1, 2):
 		raise GateError('the clock oracle selected an unrelated gap')
+	# THE PORTS' CASE: count 2 was sampled before the freeze and reached the wire after the resume. The pair is 2 and
+	# 3, which wire order would never have chosen - it took 1 and 2 and read a 0 ms step.
+	late = [(0, 0.0, 1, 0, 0), (3, 5.2, 2, 100, 100), (4, 5.3, 3, 1100, 6100)]
+	left, right, _, _ = sleep_clock_gap(late, entered, resumed, 5000, frozen=(10, 100))
+	if (left[2], right[2]) != (2, 3):
+		raise GateError('the clock oracle did not find the pair that spans the sleep among late counter lines')
+	early = (2, 0.1, 10), (3, 5.1, 10)
 	cases = [
-		('missing rebase', [ordinary[0], (3, 5.2, 2, 5200, 10200)], (2, 5.1, 510)),
-		('double rebase with clamped ticks', [(0, 0.0, 1, 5000, 5000), (3, 5.2, 2, 200, 5200)], resumed),
-		('backwards entry ticks', ordinary, (2, 5.1, 9)),
-		('omitted boot sleep', [ordinary[0], (3, 5.2, 2, 200, 200)], resumed),
-		('missing before', [ordinary[1]], resumed),
-		('missing after', [ordinary[0]], resumed),
+		('missing rebase', [ordinary[0], (3, 5.2, 2, 5200, 10200)], (entered, (2, 5.1, 510)), None),
+		('double rebase with clamped ticks', [(0, 0.0, 1, 5000, 5000), (3, 5.2, 2, 200, 5200)], (entered, resumed), None),
+		('backwards entry ticks', ordinary, (entered, (2, 5.1, 9)), None),
+		('omitted boot sleep', [ordinary[0], (3, 5.2, 2, 200, 200)], (entered, resumed), None),
+		('missing before', [ordinary[1]], (entered, resumed), None),
+		('missing after', [ordinary[0]], (entered, resumed), None),
+		('a step of the wrong size', [ordinary[0], (3, 5.2, 2, 200, 3200)], (entered, resumed), None),
+		('the clocks parting twice', ordinary + [(4, 5.3, 3, 300, 5800)], (entered, resumed), None),
+		('a sample counting the sleep before the resume', [(0, 0.0, 1, 0, 0), (1, 0.05, 2, 200, 5200), (4, 5.2, 3, 300, 5300)], early, None),
+		('a pair that does not span the freeze', ordinary, (entered, resumed), (10, 100)),
 	]
-	for name, rows, boundary in cases:
+	for name, rows, (entry, resume), frozen in cases:
 		try:
-			sleep_clock_gap(rows, entered, boundary, 5000)
+			sleep_clock_gap(rows, entry, resume, 5000, frozen=frozen)
 		except GateError:
 			continue
 		raise GateError(f'the clock oracle accepted {name}')
-	note('clock oracle self-test PASS (four positive cases, six rejected false outcomes)')
+	# THE KERNEL INSIDE A COUNTER LINE, as riscv64 printed it on 2026-11-02, and a cut earlier in the line.
+	rows = counter_rows([(0.0, 'sleepcheck count 30 &\r'), (0.1, 'sleepcheck: count 52 mono-ms 555713 boot-ms 555713\r'), (0.2, 'sleepcheck: count 53 mono-ms 555754 boot-ms 55575DeviceManager: resumed console-uart (platform device 22)\r'), (0.3, '4\r'), (0.4, 'count 54 mono-ms ServiceManager: sleep: step thaw at tick 1\r'), (0.5, 'DeviceManager: the sleep\'s resume step is done\r'), (0.6, '555808 boot-ms 555808\r'), (0.7, 'sleepcheck: count done\r')])
+	if [row[2:] for row in rows] != [(52, 555713, 555713), (53, 555754, 555754), (54, 555808, 555808)] or [row[0] for row in rows] != [1, 2, 4]:
+		raise GateError(f'counter lines cut by another writer were not rejoined where they began: {rows}')
+	for name, lines in [('a cut whose end never arrives', [(0.0, 'count 7 mono-ms 70 boot-ms 7DeviceManager: x'), (0.1, 'count 8 mono-ms 80 boot-ms 80')]), ('a cut at the end of the transcript', [(0.0, 'count 7 mono-ms 70 boot-ms 7DeviceManager: x')])]:
+		try:
+			counter_rows(lines)
+		except GateError:
+			continue
+		raise GateError(f'the counter reader accepted {name}')
+	window = freeze_window([(0.0, 'ServiceManager: sleep: step flush at tick 7'), (5.2, 'ServiceManager: sleep: step thaw at tick 19')])
+	if window != (7, 19):
+		raise GateError('the freeze window was not read from the transaction\'s steps')
+	for name, lines in [('no thaw', [(0.0, 'ServiceManager: sleep: step flush at tick 7')]), ('thaw before flush', [(0.0, 'ServiceManager: sleep: step flush at tick 9'), (1.0, 'ServiceManager: sleep: step thaw at tick 8')])]:
+		try:
+			freeze_window(lines)
+		except GateError:
+			continue
+		raise GateError(f'the freeze window accepted {name}')
+	note('clock oracle self-test PASS (six positive cases, ten rejected false outcomes, cut counter lines rejoined and two unrejoinable ones refused, the freeze window read and two malformed ones refused)')
 
 
 def suspend_to_idle(target, serial, scale):
@@ -316,14 +448,10 @@ def suspend_to_idle(target, serial, scale):
 	slept = (resumed_stamp - entered_stamp) * 1000
 	if slept < IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS:
 		raise GateError(f'suspend to idle: the host measured {slept:.0f} ms between the kernel\'s lines, under the {IDLE_WAKE_S} s wake')
-	rows = []
-	for at, (stamp, line) in enumerate(lines):
-		# A PROMPT THE SHELL PRINTED INTO A COUNTER LINE is taken out first: `sleepctl` ends at the serial shell while
-		# the counter writes in the background, and the two share the console - "sleepcheck: " then the prompt then
-		# "count 23 ..." is one counter line, not a missing value.
-		found = COUNTER.search(PROMPT_TEXT.sub('', line))
-		if found:
-			rows.append((at, stamp, int(found.group(1)), int(found.group(2)), int(found.group(3))))
+	# A PROMPT THE SHELL PRINTED INTO A COUNTER LINE is taken out first: `sleepctl` ends at the serial shell while
+	# the counter writes in the background, and the two share the console - "sleepcheck: " then the prompt then
+	# "count 23 ..." is one counter line, not a missing value. A kernel line inside one is rejoined around.
+	rows = counter_rows(lines)
 	inside = [row for row in rows if entered_at < row[0] < resumed_at]
 	if inside:
 		raise GateError(f'suspend to idle: {len(inside)} counter line(s) arrived while the machine slept, the first count {inside[0][2]}')
@@ -331,7 +459,7 @@ def suspend_to_idle(target, serial, scale):
 		raise GateError('suspend to idle: the counter skipped or repeated a value, or printed nothing')
 	if reported < IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS or reported > slept + IDLE_MARGIN_MS:
 		raise GateError(f'suspend to idle: the reported {reported} ms sleep disagrees with its timed wake or the host interval {slept:.0f} ms')
-	left, right, mono, boot = sleep_clock_gap(rows, entered, resumed[:3], reported)
+	left, right, mono, boot = sleep_clock_gap(rows, entered, resumed[:3], reported, frozen=freeze_window(lines))
 	record = serial.run('sleepctl last', 60 * scale)
 	if 'woken by the timed wake' not in record:
 		raise GateError(f'suspend to idle: the record does not name the timed wake: {record}')

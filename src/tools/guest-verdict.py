@@ -96,11 +96,13 @@ CASES = {
     "rollback-unprovisioned": Case((r"loader: rollback floor - this machine is UNPROVISIONED", LOADED), (r"loader: FATAL",), timeout=120),
     "rollback-manifest-refused": Case((r"refusing to (boot from it|compose)",), (r"loader: rollback floor [0-9]+ - generation [0-9]+ accepted", STARTED), timeout=120),
     "rollback-not-enforced": Case((r"loader: rollback floor - not enforced by this build", LOADED), (r"loader: FATAL", r"ROLLBACK FLOOR ENFORCED"), timeout=120),
-    # WHAT A LOADER REFUSAL CAN FORBID. `loader: kernel loaded` is printed the moment the kernel image
-    # has been read and verified, which is long BEFORE the selected set's DMA mode is resolved - the
-    # loader must hold a verified set before it can judge one. Forbidding that line demanded a refusal
-    # that no boot can produce, so this row could not pass however the loader behaved. What the
-    # refusal actually claims is that the boot stopped in the loader: the kernel never started.
+    # WHAT A LOADER REFUSAL CAN FORBID. A refusal the boot medium's pairing record already settles -
+    # a tag-0 medium with no carrier or a malformed one, an independent input - halts before the
+    # kernel is read. One that only the rest of the set reveals - a mixed set, differing values -
+    # cannot: the loader must hold a verified set before it can judge one, and `loader: kernel
+    # loaded` comes first. This row covers both, so what it forbids is what every refusal claims:
+    # the boot stopped in the loader, and the kernel never started. The rows that must not read a
+    # kernel say so themselves (`check-qemu-arch-profiles.sh`'s no-device-tree refusal).
     "dma-loader-refused": Case((r"loader: FATAL - (no DMA mode can be handed to the kernel|.* is present beside this entry path's DMA-mode input)",), (STARTED,), timeout=300),
     "dma-kernel-refused": Case((r"dma: NO DMA MODE reached this kernel|dma: the loader's hand-off is REFUSED",), (r"driver\.[a-z-]*: online \(",), timeout=300, observe=60),
     # THE PORTS' ENFORCING PROFILES (P02M0173), and the two entry paths differ in what a boot can
@@ -173,11 +175,11 @@ CASES = {
         (r"dma: boot DMA mode no-iommu \(harness provenance", r"REFUSED - the entry declares iommu-required and the boot mode is no-iommu", r"dma: DEGRADED ISOLATION", r"driver\.virtio-blk: online \(", r"network: no network provider on this boot - NetworkService is up without a link"),
         (r"KERNEL PANIC", r"loader: FATAL", r"driver\.virtio-net: online \("), timeout=1500, observe=240, health=True,
     ),
-    # THE KERNEL IMAGE IS LOADED BEFORE THE MODE IS RESOLVED, so `loader: kernel loaded` is not the
-    # forbidden signal here - the loader places the image, then reads this path's DMA-mode inputs,
-    # and refuses before ENTERING it. What must never appear is the kernel STARTING. Forbidding the
-    # load made this row unpassable on either port, which nothing had noticed because the ports' DMA
-    # gate had never been run.
+    # THE KERNEL IMAGE MAY BE LOADED BEFORE THE MODE IS REFUSED, so `loader: kernel loaded` is not the
+    # forbidden signal here - a refusal settled by the pairing record halts before the kernel is
+    # read, one that needs the whole set halts after it is placed and before it is ENTERED. What must
+    # never appear is the kernel STARTING. Forbidding the load made this row unpassable on either
+    # port, which nothing had noticed because the ports' DMA gate had never been run.
     "dma-port-loader-refused": Case((r"loader: FATAL - (no DMA mode can be handed to the kernel|.* is present beside this entry path's DMA-mode input)",), (STARTED,), timeout=1500),
     # TWO PRODUCERS, REFUSED BY WHICHEVER COMPONENT READS THE TREE. The rule is one: a boot with a
     # second, independent DMA-mode producer beside this entry path's own input stops, whether or not
