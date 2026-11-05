@@ -96,12 +96,22 @@ failures=0
 run_check() {
 	local id="$1" script="$2" key="$1 / x86_64 / dev-guest / development" log="$state/$1.log" status=0 at=$SECONDS
 	echo "development-lifecycle: $id ($script)"
+	# THE PROMPT ASKED FOR AGAIN WHEN A LATE LINE BURIED IT. Every check refuses an instance that is
+	# not `ready`, and `ready` is the broker seeing the shell's prompt as the LAST thing the guest
+	# printed - so a service's line that lands after it (WatchdogService's answer at the end of the
+	# boot, an IPv6 address the network configured) leaves the instance `starting` for good, and the
+	# check failed in a second, measuring nothing. This instance is the gate's own and nobody else
+	# types into it, so an empty line - one Return on the emulated keyboard - is safe here, where on
+	# a person's instance it could submit a half-typed line.
+	if ! ./dev.sh status 2>/dev/null | grep -q 'development instance ready'; then
+		./dev.sh key ret >/dev/null 2>&1 || true
+	fi
 	(cd src && "$script") >"$log" 2>&1 || status=$?
 	if ((status == 0)); then
 		echo "development-lifecycle:   $id passed ($((SECONDS - at))s)"
 		evidence_publish "$key" "check-development-lifecycle.sh" passed "$((SECONDS - at))" --input "$artifact" --log "$log"
 	else
-		tail -15 "$log" | sed 's/^/    /' >&2
+		tail -40 "$log" | sed 's/^/    /' >&2
 		echo "development-lifecycle:   $id FAILED (exit $status, $((SECONDS - at))s)" >&2
 		evidence_publish "$key" "check-development-lifecycle.sh" failed "$((SECONDS - at))" --input "$artifact" --log "$log"
 		failures=$((failures + 1))

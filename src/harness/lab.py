@@ -1070,7 +1070,14 @@ def dev_ready(timeout=3):
 # case worth separating, because nothing is draining the UART any more and the guest will
 # eventually block on a full socket buffer - so it is reported as a state with a named
 # repair rather than left to look like a healthy instance or a dead one.
-def dev_state():
+#
+# `prompt=False` answers without asking whether the shell is at a settled prompt, and calls a live
+# instance `running` instead of `ready` or `starting`. A caller that talks to the development agent
+# rather than to the shell needs to know whose instance it is and that a broker owns it - not where
+# the shell is - and the prompt question is a broker `WAIT` that settles for half a second: every
+# protocol session asked it, six times per scenario run and once per publication, 4.2 of the 6.8
+# seconds the development loop's run phase took (measured 2026-11-05).
+def dev_state(prompt=True):
 	identity = dev_identity_read()
 	if dev_lock_free():
 		# VERIFIED, not merely alive. A lock-free record whose pgid happens to name a living group
@@ -1089,6 +1096,8 @@ def dev_state():
 		return 'starting', identity
 	if identity.get('repo') != REPO:
 		return 'foreign', identity
+	if not prompt:
+		return 'running', identity
 	return ('ready' if dev_ready() else 'starting'), identity
 
 
@@ -2011,7 +2020,7 @@ def proto_session(timeout, announce=True):
 		buffer = bytearray()
 		bounds = proto_hello(sock, buffer, timeout)
 		return sock, buffer, bounds
-	state, identity = dev_state()
+	state, identity = dev_state(prompt=False)
 	if state == 'foreign':
 		dev_owner_conflict(identity)
 	if state in ('down', 'stale'):
@@ -2468,7 +2477,7 @@ def cmd_dev_loop(args):
 	artifact, scenarios = rest[0], rest[1:]
 	# Answered once, here, before anything is built: an instance older than the tree is the one
 	# thing a loop cannot fix by running, and each phase asking again would only repeat it.
-	_, identity = dev_state()
+	_, identity = dev_state(prompt=False)
 	warn_stale_inputs(identity)
 	child_env = dict(os.environ, LIBER_DEV_INPUTS_CHECKED='1')
 	phases = []

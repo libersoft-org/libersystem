@@ -150,6 +150,7 @@ REQUIRED_CASES=(
 	unreferenced-library
 	undeclared-edge
 	missing-edge
+	stale-candidate
 )
 ran_cases=()
 ran() { ran_cases+=("$1"); }
@@ -402,6 +403,47 @@ if [[ -n "$declared" ]]; then
 	undo
 else
 	echo "staged-consistency:   the manifest declares no provider for this consumer, so the missing-edge case has no subject"
+fi
+
+# 13. A SELECTION CANDIDATE THE CONSUMER WAS NOT BUILT AGAINST - the second check `--verify-staged`
+#     runs, which none of the cases above reaches: a slot candidate is recorded by an EXECUTABLE, not by
+#     any library's edges. The executable's recorded digest is changed in place, one hex digit and the
+#     note's length kept, so the provider chains still verify and only the candidate check can refuse.
+selector=""
+while IFS= read -r file; do
+	llvm-objcopy --dump-section .note.liber.identity="$work/note" "$file" /dev/null 2>/dev/null || continue
+	if grep -aq 'selection=[a-z0-9-]*:[a-zA-Z0-9_.-]*=[0-9a-f]\{64\}' "$work/note"; then
+		selector="$file"
+		break
+	fi
+done < <(find ".build/image/$TARGET/bin" ".build/image/$TARGET/libexec" -type f 2>/dev/null | sort)
+if [[ -n "$selector" ]]; then
+	# A PASS FIRST, so the change below is one program on an otherwise unchanged tree: the check keeps
+	# its last pass and re-reads only the programs that changed since, and the cases above have just
+	# rewritten libraries - without this the refusal would come from the whole check and the path
+	# that re-reads one program would never be tested.
+	"$VERIFY" --verify-staged "$TARGET" >/dev/null 2>&1 || fail "the staged tree does not verify before the candidate case"
+	mutate "$selector"
+	llvm-objcopy --dump-section .note.liber.identity="$work/note" "$selector" /dev/null 2>/dev/null || fail "could not read the selecting program's note"
+	python3 - "$work/note" <<-'PYEOF'
+		import re, sys
+		path = sys.argv[1]
+		data = open(path, 'rb').read()
+		found = re.search(rb'(selection=[a-z0-9-]*:[a-zA-Z0-9_.-]*=)([0-9a-f])', data)
+		sys.exit(3) if found is None else open(path, 'wb').write(data[: found.start(2)] + (b'1' if found.group(2) == b'0' else b'0') + data[found.end(2) :])
+	PYEOF
+	case $? in
+	0)
+		llvm-objcopy --update-section .note.liber.identity="$work/note" "$selector" 2>/dev/null || fail "could not write the mutated note back"
+		refuses "a selection candidate its consumer was not built against" "holds a selection candidate no consumer was built against"
+		ran stale-candidate
+		;;
+	3) echo "staged-consistency:   the selecting program's note records no candidate digest, so the stale-candidate case has no subject" ;;
+	*) fail "could not change the recorded candidate digest" ;;
+	esac
+	undo
+else
+	echo "staged-consistency:   no staged program records a selection candidate, so the stale-candidate case has no subject"
 fi
 
 # AND THE TREE IS AS IT WAS. Said rather than assumed: the restore above is what every case depends

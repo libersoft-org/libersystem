@@ -773,6 +773,21 @@ class ScriptedGuest:
 		return True
 
 
+# THE RECORD OF WHICH SCENARIOS HAVE RUN LIVES BESIDE THE INSTANCE THEY RAN ON. `dev-up` empties it in
+# the instance's state, so the runner must read and write the same file: with a run-private instance
+# (`LIBER_DEV_STATE`) the runner used `.build/boot`'s, and a person's scenarios made a fresh private
+# guest's first run a "repeat" held to zero loss. Watched failing against `lab.BUILD`.
+class SeenRecordPlacementTest(unittest.TestCase):
+	def test_the_seen_record_is_where_dev_up_empties_it(self):
+		with tempfile.TemporaryDirectory() as state:
+			probe = 'import lab, scenario, os; print(scenario.SEEN_PATH); print(os.path.join(lab.DEV_STATE, "dev-scenarios-seen"))'
+			result = subprocess.run([sys.executable, '-c', probe], cwd=HERE, env=dict(os.environ, LIBER_DEV_STATE=state), capture_output=True, text=True, timeout=30)
+			self.assertEqual(result.returncode, 0, result.stderr)
+			seen, emptied = result.stdout.split()
+			self.assertEqual(seen, emptied, 'the runner reads one record and dev-up empties another')
+			self.assertTrue(seen.startswith(state + os.sep), f'a run-private instance\'s record is not under its state: {seen}')
+
+
 class TeardownTest(unittest.TestCase):
 	def setUp(self):
 		self.directory = tempfile.TemporaryDirectory()

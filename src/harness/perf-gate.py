@@ -285,6 +285,12 @@ def main():
 
 	if failures:
 		print()
+		# AFTER THE TABLE, in a log that holds both streams. stdout is block-buffered into a file and
+		# stderr is not, so the reasons landed above the table it summarises - and a reader that
+		# shows a log's tail, as the development lifecycle does, showed the table without the first
+		# of them: every sealed run quoted "the publish phase is over budget" while the build phase
+		# was eleven times over.
+		sys.stdout.flush()
 		for message in failures:
 			print(f'perf-gate: {message}', file=sys.stderr)
 		sys.exit(1)

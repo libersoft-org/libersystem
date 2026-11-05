@@ -74,8 +74,13 @@ MAX_KEYS = 64
 # repeated launches, measured over twenty of them, so the ceiling can say what it means.
 MAX_FRAME_LOSS = 0
 
-# Which scenarios have already run in this instance, one name per line.
-SEEN_PATH = os.path.join(lab.BUILD, 'dev-scenarios-seen')
+# Which scenarios have already run in this instance, one name per line - BESIDE THE INSTANCE, where
+# `dev-up` empties it. It was in `.build/boot` whatever the instance, and `dev-up` empties the one in
+# the instance's state, so for the development lifecycle's run-private instance the two were
+# different files: every scenario a person had run on their own instance counted as already run on
+# a guest that had just booted, its first run was held to the repeat run's zero, and its first-touch
+# residency failed it as a leak (21 frames, 2026-11-05).
+SEEN_PATH = os.path.join(lab.DEV_STATE, 'dev-scenarios-seen')
 
 # WHICH TARGET THE HOST-SIDE ARTIFACTS COME FROM.
 #

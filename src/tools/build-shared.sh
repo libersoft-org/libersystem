@@ -138,6 +138,7 @@ target="$1"
 shift
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
+
 manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 manifest_digest="$(sha256sum <<<"$manifest_json" | awk '{print $1}')"
 if [[ -n "$selected_artifact" ]]; then
@@ -291,8 +292,13 @@ public_arch() {
 IDENTITY_NOTE_TYPE=1
 
 staged_identity_digest() {
-	local elf="$1" note="$2" len namesz name section_len note_type
-	llvm-objcopy --dump-section .note.liber.identity="$note" "$elf" /dev/null 2>/dev/null || return 1
+	llvm-objcopy --dump-section .note.liber.identity="$2" "$1" /dev/null 2>/dev/null || return 1
+	note_identity_digest "$2"
+}
+
+# The same, of a note already dumped to a file.
+note_identity_digest() {
+	local note="$1" len namesz name section_len note_type
 	section_len="$(stat -c%s "$note")"
 	# A note shorter than its own header is not a note.
 	[[ "$section_len" -ge 20 ]] || return 1
@@ -323,6 +329,126 @@ staged_identity_digest() {
 	head -c "$((20 + len))" "$note" | tail -c "$len" | sha256sum | awk '{print $1}'
 }
 
+# EVERY STAGED NOTE, READ ONCE PER CHANGE OF ITS FILE.
+#
+# The two checks below read the identity note of every staged library and program - the provider
+# chains on every build, the selection candidates after every consumer phase - and read each one with
+# about a dozen processes: `llvm-objcopy`, `stat`, three `od`, `head`, `tail`, `sha256sum` and
+# `grep`, twice over for a library, and a `jq` over the whole manifest per library. With 123 libraries
+# and 245 programs that was 36 of the 40 seconds a one-file rebuild took (measured 2026-11-05), so
+# what a one-line change cost grew with the tree - the proportionality the development loop's gate
+# holds the build to, which had been red since the checks arrived.
+#
+# THE GUARANTEE IS UNCHANGED: both checks still run over every staged file, against what each file
+# holds now. What is kept between builds is what a file's note SAID - whether it has one, the digest
+# of its record, the edges and candidates it records - keyed by everything `stat` reports about the
+# file: path, device, inode, size, modification and change time. A file written in any way is read
+# again, even to the same bytes under a restored mtime, because a write moves its change time and
+# only the kernel sets that. And the record is keyed by this script and the `llvm-objcopy` that reads
+# the notes, so a changed reader starts from nothing.
+#
+# Fields are separated by US (0x1f), which `read` does not merge as it merges whitespace, so an empty
+# digest stays an empty field rather than moving the ones after it.
+staged_notes_reader=""
+staged_notes_header() {
+	if [[ -z "$staged_notes_reader" ]]; then
+		staged_notes_reader="format=liber-staged-notes-v1 reader=$(sha256sum <"$root/tools/build-shared.sh" | awk '{print $1}') objcopy=$(stat -Lc '%n:%s:%y' "$(command -v llvm-objcopy)")"
+	fi
+	printf '%s\n' "$staged_notes_reader"
+}
+
+# AND A VERDICT, KEPT FOR AS LONG AS NOTHING IT WAS REACHED OVER HAS CHANGED. A check below is a
+# function of the staged files it reads, the manifest and this reader; when the `stat` of every one
+# of those files, the manifest's digest and the reader are what they were at the last pass, running
+# it again can only pass again - so the leaf rebuild that touched one program does not re-walk 123
+# libraries to learn that. Only a pass is kept: a failure is checked, and reported, every time.
+# The key covers the staged libraries; the selection check keeps its programs' own (see there).
+staged_verdict_key() {
+	local -a files=()
+	mapfile -t files < <(find "$provider_output_dir/lib" -name '*.lslib' -type f 2>/dev/null | sort)
+	{
+		printf 'libraries\n'
+		staged_notes_header
+		sha256sum <<<"$manifest_json"
+		if ((${#files[@]} > 0)); then stat -Lc '%n|%d|%i|%s|%y|%z' "${files[@]}"; fi
+	} | sha256sum | awk '{print $1}'
+}
+
+declare -A staged_note_present=()
+declare -A staged_note_digest=()
+declare -A staged_note_providers=()
+declare -A staged_note_selections=()
+read_staged_notes() {
+	local cache="$artifact_cache_dir/staged-notes" header file key present digest providers selections note fresh record listing line separator=$'\x1f'
+	local -a files=() lines=()
+	local -A keys=() cached_present=() cached_digest=() cached_providers=() cached_selections=()
+	staged_note_present=()
+	staged_note_digest=()
+	staged_note_providers=()
+	staged_note_selections=()
+	mapfile -t files < <({ find "$provider_output_dir/lib" -name '*.lslib' -type f 2>/dev/null; find "$artifact_output_root/bin" "$artifact_output_root/libexec" -type f 2>/dev/null; } | sort)
+	((${#files[@]} > 0)) || return 0
+	header="$(staged_notes_header)"
+	# READ FROM FILES, NOT PIPES: bash reads a pipe one byte at a time so as not to take a byte past
+	# the line it wants, and a regular file in blocks - for a few hundred lines that is most of the
+	# cost of this function.
+	if [[ -f "$cache" ]]; then
+		mapfile -t lines <"$cache"
+		if [[ "${lines[0]:-}" == "$header" ]]; then
+			for line in "${lines[@]:1}"; do
+				key="${line%%"$separator"*}"
+				line="${line#*"$separator"}"
+				cached_present[$key]="${line%%"$separator"*}"
+				line="${line#*"$separator"}"
+				cached_digest[$key]="${line%%"$separator"*}"
+				line="${line#*"$separator"}"
+				cached_providers[$key]="${line%%"$separator"*}"
+				cached_selections[$key]="${line#*"$separator"}"
+			done
+		fi
+	fi
+	mkdir -p "$artifact_cache_dir" "$build_scratch"
+	listing="$(mktemp "$build_scratch/staged-stat.XXXXXX")"
+	stat -Lc "%n$separator%n|%d|%i|%s|%y|%z" "${files[@]}" >"$listing" 2>/dev/null || true
+	mapfile -t lines <"$listing"
+	rm -f "$listing"
+	for line in ${lines[@]+"${lines[@]}"}; do
+		keys[${line%%"$separator"*}]="${line#*"$separator"}"
+	done
+	note="$(mktemp "$build_scratch/staged-note.XXXXXX")"
+	fresh="$(mktemp "$artifact_cache_dir/staged-notes.XXXXXX")"
+	exec {record}>"$fresh"
+	printf '%s\n' "$header" >&"$record"
+	for file in "${files[@]}"; do
+		key="${keys[$file]:-}"
+		if [[ -n "$key" && -n "${cached_present[$key]+set}" ]]; then
+			present="${cached_present[$key]}"
+			digest="${cached_digest[$key]}"
+			providers="${cached_providers[$key]}"
+			selections="${cached_selections[$key]}"
+		else
+			present=0 digest="" providers="" selections=""
+			if llvm-objcopy --dump-section .note.liber.identity="$note" "$file" /dev/null 2>/dev/null; then
+				present=1
+				digest="$(note_identity_digest "$note")" || digest=""
+				providers="$(grep -a -o 'provider=[a-z0-9_-]*:[0-9a-f]\{64\}' "$note" | tr '\n' ' ' || true)"
+				selections="$(grep -a -o 'selection=[a-z0-9-]*:[a-zA-Z0-9_.,=-]*' "$note" | tr '\n' ' ' || true)"
+			fi
+		fi
+		staged_note_present[$file]="$present"
+		staged_note_digest[$file]="$digest"
+		staged_note_providers[$file]="$providers"
+		staged_note_selections[$file]="$selections"
+		# A file `stat` could not answer for is read every time and remembered never.
+		if [[ -n "$key" ]]; then
+			printf '%s\n' "$key$separator$present$separator$digest$separator$providers$separator$selections" >&"$record"
+		fi
+	done
+	exec {record}>&-
+	rm -f "$note"
+	mv -f "$fresh" "$cache"
+}
+
 # WHAT A CHECK DOES WITH INPUT IT CANNOT READ IS THE CHECK.
 #
 # This had three fail-open branches on one screen: a provider whose identity could not be read became
@@ -331,6 +457,7 @@ staged_identity_digest() {
 # matched the providers staged beside it. Every one of them is now a refusal that names the artifact.
 verify_staged_provider_chains() {
 	local note file artifact provider recorded expected inconsistent=0 slot_kind entry
+	local -a recorded_rows=()
 	local -A staged_digests=()
 	local -A recorded_providers=()
 	# AND THE FOURTH ONE, WHICH WAS THE WHOLE INPUT. Both loops below read from
@@ -346,6 +473,11 @@ verify_staged_provider_chains() {
 	if ! find "$provider_output_dir/lib" -name '*.lslib' -type f >/dev/null; then
 		echo "build-shared: the staged tree at $provider_output_dir/lib cannot be read, so nothing about it has been checked" >&2
 		return 1
+	fi
+	local verdict verdict_file="$artifact_cache_dir/staged-chains.verdict"
+	verdict="$(staged_verdict_key)"
+	if [[ -f "$verdict_file" && "$(<"$verdict_file")" == "$verdict" ]]; then
+		return 0
 	fi
 	# WHAT THE MANIFEST SAYS SHOULD BE THERE, before anything is compared with anything else.
 	#
@@ -365,7 +497,8 @@ verify_staged_provider_chains() {
 	fi
 	local -A staged_present=()
 	while IFS= read -r file; do
-		staged_present["$(basename "$file" .lslib)"]=1
+		file="${file##*/}"
+		staged_present["${file%.lslib}"]=1
 	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f)
 	if ((${#staged_present[@]} == 0)); then
 		echo "build-shared: the staged tree at $provider_output_dir/lib holds no library, and the manifest declares ${#expected_libraries[@]} - an empty tree is not a consistent one" >&2
@@ -386,22 +519,31 @@ verify_staged_provider_chains() {
 	# EVERY DEPENDENCY THE MANIFEST DECLARES, as a set of `library:provider` pairs. Read once rather
 	# than queried per edge: this loop runs over every staged library and every edge each one records.
 	local -A manifest_providers=()
+	# AND THE SAME EDGES BY LIBRARY, for the reverse question below - one `jq` for the manifest, not
+	# one per staged library.
+	local -A manifest_providers_of=()
 	while IFS= read -r edge; do
 		[[ -n "$edge" ]] || continue
 		manifest_providers[$edge]=1
+		manifest_providers_of[${edge%%:*}]+="${edge#*:} "
 	done < <(jq -r '.libraries | to_entries[] | .key as $lib | (.value.providers[]? | "\($lib):\(.)")' <<<"$manifest_json")
-	note="$(mktemp "$build_scratch/staged-identity.XXXXXX")"
-	while IFS= read -r file; do
-		artifact="$(basename "$file" .lslib)"
-		if ! staged_digests[$artifact]="$(staged_identity_digest "$file" "$note")"; then
+	read_staged_notes
+	local -a libraries=()
+	mapfile -t libraries < <(find "$provider_output_dir/lib" -name '*.lslib' -type f | sort)
+	for file in "${libraries[@]}"; do
+		artifact="${file##*/}"
+		artifact="${artifact%.lslib}"
+		if [[ -z "${staged_note_digest[$file]:-}" ]]; then
 			echo "build-shared: $file carries no identity note this reader can validate - a staged library without one cannot be checked against anything" >&2
 			inconsistent=1
 			continue
 		fi
-	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f | sort)
-	while IFS= read -r file; do
-		artifact="$(basename "$file" .lslib)"
-		if ! llvm-objcopy --dump-section .note.liber.identity="$note" "$file" /dev/null 2>/dev/null; then
+		staged_digests[$artifact]="${staged_note_digest[$file]}"
+	done
+	for file in "${libraries[@]}"; do
+		artifact="${file##*/}"
+		artifact="${artifact%.lslib}"
+		if [[ "${staged_note_present[$file]:-0}" != 1 ]]; then
 			echo "build-shared: $file has no .note.liber.identity section - it was not staged by this build" >&2
 			inconsistent=1
 			continue
@@ -409,8 +551,8 @@ verify_staged_provider_chains() {
 		# THE EDGES AS A SET, not one at a time. A duplicate row for one provider is a note that
 		# contradicts itself, and it used to be two comparisons that both passed.
 		recorded_providers=()
-		while IFS= read -r recorded; do
-			[[ -n "$recorded" ]] || continue
+		read -r -a recorded_rows <<<"${staged_note_providers[$file]}"
+		for recorded in ${recorded_rows[@]+"${recorded_rows[@]}"}; do
 			provider="${recorded#provider=}"
 			provider="${provider%%:*}"
 			# TWICE IS TWICE, whether or not the two agree. This compared the rows and complained
@@ -441,25 +583,25 @@ verify_staged_provider_chains() {
 				echo "build-shared: $artifact was built against $provider ${recorded#provider=$provider:}, and the staged $provider is $expected" >&2
 				inconsistent=1
 			fi
-		done < <(grep -a -o 'provider=[a-z0-9_-]*:[0-9a-f]\{64\}' "$note" || true)
+		done
 		# AND THE EDGES THE MANIFEST DECLARES AND THE NOTE DOES NOT. The loop above walks what the
 		# note records, so an edge the manifest declares and the artifact was NOT built against is
 		# invisible to it - a library rebuilt without one of its providers records fewer edges and
 		# every edge it does record still checks out.
-		while IFS= read -r provider; do
-			[[ -n "$provider" ]] || continue
+		for provider in ${manifest_providers_of[$artifact]:-}; do
 			if [[ -z "${recorded_providers[$provider]:-}" ]]; then
 				echo "build-shared: the manifest says $artifact is built against $provider and its identity note records no such edge" >&2
 				inconsistent=1
 			fi
-		done < <(jq -r --arg artifact "$artifact" '.libraries[$artifact].providers[]? // empty' <<<"$manifest_json")
-	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f | sort)
-	rm -f "$note"
+		done
+	done
 	if ((inconsistent)); then
 		echo "build-shared: the staged tree for $target is inconsistent - a provider was replaced and a library that records it was not rebuilt" >&2
 		echo "build-shared: clear it and build again:  rm -rf .build/image/$target && ./build.sh --arch $(public_arch "$target")" >&2
 		return 1
 	fi
+	mkdir -p "$artifact_cache_dir"
+	printf '%s\n' "$verdict" >"$verdict_file"
 }
 # THE SELECTION CANDIDATES, which `verify_staged_provider_chains` cannot see at all.
 #
@@ -473,6 +615,7 @@ verify_staged_provider_chains() {
 # be finished.
 verify_staged_selection_candidates() {
 	local note file artifact program candidate recorded expected slot_line slot_kind entry inconsistent=0
+	local -a slot_lines=()
 	local -A staged_digests=()
 	local -A manifest_candidates=()
 	[[ -d "$provider_output_dir/lib" ]] || return 0
@@ -481,16 +624,50 @@ verify_staged_selection_candidates() {
 		manifest_candidates[$edge]=1
 	done < <(jq -r '.programs | to_entries[] | .key as $program | (.value.selection[]? | .kind as $kind | .candidates[] | "\($program):\($kind):\(.)")' <<<"$manifest_json")
 	((${#manifest_candidates[@]} > 0)) || return 0
-	note="$(mktemp "$build_scratch/staged-selection.XXXXXX")"
+	# THE LAST PASS, AND WHAT CAN HAVE CHANGED SINCE. A program's candidates are checked against the
+	# staged libraries' digests and the manifest, so while those are what they were at the last pass,
+	# only a program that changed can make the tree inconsistent - and only one whose note records a
+	# candidate. The pass is kept as the libraries' key and every program's `stat`; a program rebuilt
+	# since is read again, and the whole check runs when one of them selects anything, or when the
+	# libraries or the manifest moved. A leaf rebuild of a program that selects nothing reads one note.
+	local verdict verdict_file="$artifact_cache_dir/staged-selection.verdict" changed_file key selecting=0
+	local -a programs=() program_keys=() passed=()
+	local -A passed_keys=()
+	verdict="$(staged_verdict_key)"
+	mapfile -t programs < <(find "$artifact_output_root/bin" "$artifact_output_root/libexec" -type f 2>/dev/null | sort)
+	if ((${#programs[@]} > 0)); then
+		mapfile -t program_keys < <(stat -Lc '%n|%d|%i|%s|%y|%z' "${programs[@]}" 2>/dev/null || true)
+	fi
+	if ((${#program_keys[@]} == ${#programs[@]})) && [[ -f "$verdict_file" ]]; then
+		mapfile -t passed <"$verdict_file"
+		if [[ "${passed[0]:-}" == "$verdict" ]]; then
+			for key in "${passed[@]:1}"; do passed_keys[$key]=1; done
+			note="$(mktemp "$build_scratch/staged-selection.XXXXXX")"
+			for key in ${program_keys[@]+"${program_keys[@]}"}; do
+				[[ -z "${passed_keys[$key]:-}" ]] || continue
+				changed_file="${key%%|*}"
+				if llvm-objcopy --dump-section .note.liber.identity="$note" "$changed_file" /dev/null 2>/dev/null && grep -aq 'selection=' "$note"; then
+					selecting=1
+					break
+				fi
+			done
+			rm -f "$note"
+			if ((selecting == 0)); then
+				printf '%s\n' "$verdict" ${program_keys[@]+"${program_keys[@]}"} >"$verdict_file"
+				return 0
+			fi
+		fi
+	fi
+	read_staged_notes
 	while IFS= read -r file; do
-		artifact="$(basename "$file" .lslib)"
-		staged_digests[$artifact]="$(staged_identity_digest "$file" "$note")" || staged_digests[$artifact]=""
+		artifact="${file##*/}"
+		staged_digests[${artifact%.lslib}]="${staged_note_digest[$file]:-}"
 	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f | sort)
 	while IFS= read -r file; do
-		program="$(basename "$file")"
-		llvm-objcopy --dump-section .note.liber.identity="$note" "$file" /dev/null 2>/dev/null || continue
-		while IFS= read -r slot_line; do
-			[[ -n "$slot_line" ]] || continue
+		program="${file##*/}"
+		[[ "${staged_note_present[$file]:-0}" == 1 ]] || continue
+		read -r -a slot_lines <<<"${staged_note_selections[$file]}"
+		for slot_line in ${slot_lines[@]+"${slot_lines[@]}"}; do
 			slot_kind="${slot_line#selection=}"
 			slot_kind="${slot_kind%%:*}"
 			for entry in $(tr ',' ' ' <<<"${slot_line#selection=*:}"); do
@@ -513,13 +690,21 @@ verify_staged_selection_candidates() {
 					inconsistent=1
 				fi
 			done
-		done < <(grep -a -o 'selection=[a-z0-9-]*:[a-zA-Z0-9_.,=-]*' "$note" || true)
+		done
 	done < <(find "$artifact_output_root/bin" "$artifact_output_root/libexec" -type f 2>/dev/null | sort)
-	rm -f "$note"
 	if ((inconsistent)); then
 		echo "build-shared: the staged tree for $target holds a selection candidate no consumer was built against" >&2
 		echo "build-shared: clear it and build again:  rm -rf .build/image/$target && ./build.sh --arch $(public_arch "$target")" >&2
+		rm -f "$verdict_file"
 		return 1
+	fi
+	mkdir -p "$artifact_cache_dir"
+	# Only a pass whose every program `stat` answered for is kept; without them the next run checks
+	# everything again.
+	if ((${#program_keys[@]} == ${#programs[@]})); then
+		printf '%s\n' "$verdict" ${program_keys[@]+"${program_keys[@]}"} >"$verdict_file"
+	else
+		rm -f "$verdict_file"
 	fi
 }
 
@@ -782,8 +967,7 @@ targeted_plan_record() {
 }
 
 targeted_state_stat() {
-	local path="$1"
-	stat -Lc $'entry\t%n\t%F\t%s\t%i\t%y\t%z' "$path"
+	stat -Lc $'entry\t%n\t%F\t%s\t%i\t%y\t%z' "$@"
 }
 
 targeted_state_valid() {
@@ -911,12 +1095,16 @@ targeted_state_paths() {
 }
 
 write_targeted_state() {
-	local path temporary
+	local temporary
+	local -a paths=()
 	temporary="$targeted_state_file.tmp.$$"
+	# ONE `stat` FOR EVERY EDGE, as `targeted_state_valid` reads them back - not one per edge, which
+	# was sixty processes and a quarter of a second at the end of every one-file rebuild.
+	mapfile -t paths < <(targeted_state_paths)
 	{
 		printf 'format=liber-targeted-state-v2\n'
 		targeted_plan_record | sed 's/^/plan-entry\t/'
-		while read -r path; do targeted_state_stat "$path"; done < <(targeted_state_paths)
+		if ((${#paths[@]} > 0)); then targeted_state_stat "${paths[@]}"; fi
 	} >"$temporary"
 	mv "$temporary" "$targeted_state_file"
 }
@@ -1185,13 +1373,15 @@ fi | while read -r package; do
 done
 sort -u -o "$source_roots_file" "$source_roots_file"
 
+# ONE REDIRECTION FOR THE WHOLE INVENTORY, not an append per source: twelve hundred opens of the
+# same file were a tenth of a one-file rebuild.
 while IFS= read -r -d '' record; do
 	hash="${record%% *}"
 	source="${record#* }"
 	source="${source# }"
 	source="${source#./}"
 	source_file_hashes[$source]="$hash"
-	printf '%s\t%s\n' "$source" "$hash" >>"$source_inventory_file"
+	printf '%s\t%s\n' "$source" "$hash"
 done < <(
 	cd "$root"
 	{
@@ -1200,7 +1390,7 @@ done < <(
 		printf 'user/build.rs\0user/user.ld\0user/user-aarch64.ld\0user/user-riscv64.ld\0'
 		printf '../product.conf\0'
 	} | sort -z | xargs -0 sha256sum --zero
-)
+) >>"$source_inventory_file"
 source_inventory_seconds=$((SECONDS - source_inventory_started))
 timing_event source end
 
