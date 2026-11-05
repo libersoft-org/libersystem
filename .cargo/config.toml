@@ -1,2 +1,6 @@
 [build]
 target-dir = ".build/cargo/shared"
+# Every compile of this tree goes through it, so the same source gives the same bytes wherever the tree
+# is - in place or in a sealed copy at another path. Cargo resolves the path from this file's
+# directory's parent, the repository root, and the config of every crate below inherits it.
+rustc-wrapper = "src/tools/rustc-wrapper.sh"

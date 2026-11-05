@@ -414,6 +414,12 @@ declare -A GATES=(
 	# prove itself by re-invoking itself - a second full ELF sweep that accepted any nonzero status
 	# as proof. This tests its exit contract from outside, against a fixture, in seconds.
 	["dynamic-report-regressions"]="tools/check-dynamic-report-regressions.sh"
+	# The same source gives the same bytes wherever the tree is. Each crate is its own Cargo workspace
+	# reaching its neighbours by `../` paths, and cargo hashes such a path into every crate identity, so
+	# the release built from a sealed copy at another path differed from the same commit built in place.
+	# `rustc-wrapper.sh` takes the path out; this holds it to that against a fixture built at two paths,
+	# and proves the fixture reaches the defect by building it once without the wrapper.
+	["reproducible-build"]="tools/check-reproducible-build.sh"
 	["test-tags"]="harness/check-test-tags.sh"
 	# The harness that decides whether every other test passed, tested against fakes. An audit found
 	# four of its oracles reporting success without measuring their subject; each looked correct on a

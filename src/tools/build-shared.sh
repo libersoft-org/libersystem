@@ -541,6 +541,7 @@ fi
 
 mkdir -p "$build_scratch"
 provider_cargo_target="$build_root/cargo/provider-$target"
+rustc_wrapper_digest="$(sha256sum <"$root/tools/rustc-wrapper.sh" | awk '{print $1}')"
 cargo_target="$target"
 cargo_target_flags=()
 build_started=$SECONDS
@@ -708,6 +709,18 @@ if [[ "${LIBER_IMAGE_LOCK_HELD:-0}" != 1 ]]; then
 	exec 9>"$build_root/state/build-$target.lock"
 	flock 9
 fi
+# THE RUSTC WRAPPER DECIDES EVERY CRATE'S IDENTITY, and cargo's own freshness check never sees it: a
+# library compiled before the wrapper existed, or under another version of it, stays fresh and keeps
+# the identity it had. Its dependents then cannot derive theirs from it and keep cargo's, which is
+# the path-dependent one. So a wrapper that is not the one this directory was built with empties the
+# directory - under the lock, since another build of this target may be compiling into it - as the
+# image graph's below does on a change of its global configuration.
+if [[ -d "$provider_cargo_target" && "$(cat "$provider_cargo_target/.liber-rustc-wrapper" 2>/dev/null)" != "$rustc_wrapper_digest" ]]; then
+	verbose_log "build-shared: provider Cargo cache built with another rustc wrapper"
+	rm -rf "$provider_cargo_target"
+fi
+mkdir -p "$provider_cargo_target"
+printf '%s\n' "$rustc_wrapper_digest" >"$provider_cargo_target/.liber-rustc-wrapper"
 if [[ -z "$selected_artifact" ]]; then
 	find "$artifact_output_root" -type f \( -name '*.identity' -o -name '*.order' \) -delete 2>/dev/null || true
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name '*.order.sha256' -delete 2>/dev/null || true
@@ -751,10 +764,11 @@ targeted_plan_record() {
 	printf 'cargo-target\t%s\n' "$cargo_target"
 	printf 'spec\t%s\n' "${requested_arguments[*]}"
 	printf 'tool:rust-lld\t%s\n' "$lld"
+	printf 'tool:rustc-wrapper\t%s\n' "$rustc_wrapper_digest"
 	for tool in cargo rustc llvm-ar llvm-objcopy llvm-readelf llvm-strip; do
 		printf 'tool:%s\t%s\n' "$tool" "$(command -v "$tool")"
 	done
-	for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
+	for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTC_WORKSPACE_WRAPPER RUSTC_WRAPPER RUSTUP_TOOLCHAIN; do
 		printf 'environment:%s\t%s\n' "$variable" "${!variable-}"
 	done
 	jq -r --arg libraries "$library_names" --arg programs "$program_names" '
@@ -976,7 +990,7 @@ warm_input_inventory() {
 		for tool in "$(command -v cargo)" "$(command -v rustc)" "$(command -v llvm-mc)" "$lld" "$(command -v llvm-ar)" "$(command -v llvm-objcopy)" "$(command -v llvm-readelf)" "$(command -v llvm-strip)"; do
 			stat -c 'tool\t%n\t%s\t%y' "$tool"
 		done
-		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
+		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTC_WORKSPACE_WRAPPER RUSTC_WRAPPER RUSTUP_TOOLCHAIN; do
 			printf 'env-%s=%s\n' "$variable" "${!variable-}"
 		done
 		# THE CONFIGURATION IS AN INPUT, and leaving it out made the warm path answer for the wrong
@@ -991,7 +1005,7 @@ warm_input_inventory() {
 			stat -c 'input\t%n\t%s\t%y' "$quarantine"
 		done
 		find "$root/user" "$root/abi" "$root/boot/protocol" "$root/fs" "$root/proto" "$root/term" "$root/wasm" "$root/wire" "$root/tools/system-manifest" -type f -printf 'input\t%p\t%s\t%T@\n'
-		for input in "$root/tools/build-shared.sh" "$root/tools/build-consumer-object.sh" "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs" "$root/tools/system-manifest.sh" "$root/../product.conf"; do
+		for input in "$root/tools/build-shared.sh" "$root/tools/build-consumer-object.sh" "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs" "$root/tools/rustc-wrapper.sh" "$root/tools/system-manifest.sh" "$root/../product.conf"; do
 			stat -c 'input\t%n\t%s\t%y' "$input"
 		done
 	} | sort
@@ -1255,7 +1269,7 @@ if [[ ! "$rustc_commit" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 build_tool_digest="$({
-	sha256sum "$root/tools/build-shared.sh" "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs" "$lld"
+	sha256sum "$root/tools/build-shared.sh" "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs" "$root/tools/rustc-wrapper.sh" "$lld"
 	for tool in llvm-objcopy llvm-readelf llvm-strip; do
 		sha256sum "$(command -v "$tool")"
 	done
@@ -1987,6 +2001,7 @@ if grep -Fqx -- lsrt <<<"$requested_artifact_names"; then
 		printf 'workspace=%s\n' "$root"
 		printf 'rustc=%s\n' "$(rustc -vV | sha256sum | awk '{print $1}')"
 		printf 'cargo=%s\n' "$(cargo -V)"
+		printf 'rustc-wrapper=%s\n' "$rustc_wrapper_digest"
 		printf 'target=%s\n' "$target"
 		printf 'target-spec=%s\n' "$target_spec_digest"
 		printf 'profile=release\n'
@@ -2000,7 +2015,7 @@ if grep -Fqx -- lsrt <<<"$requested_artifact_names"; then
 				printf 'config=%s:%s\n' "${config#"$root/"}" "$(sha256sum "$config" | awk '{print $1}')"
 			fi
 		done
-		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
+		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTC_WORKSPACE_WRAPPER RUSTC_WRAPPER RUSTUP_TOOLCHAIN; do
 			printf 'env-%s=%s\n' "$variable" "${!variable-}"
 		done
 	} | sha256sum | awk '{print $1}')"

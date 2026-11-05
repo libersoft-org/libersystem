@@ -182,7 +182,7 @@ pub fn parse(text: &str) -> Result<Declaration, String> {
 	Ok(declaration)
 }
 
-pub const GATE_RESOURCES: [(&str, &str); 198] = [
+pub const GATE_RESOURCES: [(&str, &str); 199] = [
 	("acpi", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("aml-emitter", "host"),
 	("arch-profile-aarch64-gicv2-1", "guest stage:aarch64:r profile:shipping media"),
@@ -341,6 +341,7 @@ pub const GATE_RESOURCES: [(&str, &str); 198] = [
 	("qemu-pcie-hotplug", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("qemu-tpm-tool", "guest stage:x86_64:r profile:development media volume:x86_64:enforcing-required:r"),
 	("qemu-virtio-iommu-x86_64", "guest stage:x86_64:w profile:shipping media volume:x86_64:enforcing-required:w"),
+	("reproducible-build", "host"),
 	("rollback-floor-x86_64", "guest stage:x86_64:w profile:shipping media volume:x86_64:enforcing-required:w"),
 	("run-verdict", "host stage:x86_64:w profile:shipping marks:r"),
 	("secure-boot", "guest stage:x86_64:r profile:shipping media volume:x86_64:enforcing-required:r"),

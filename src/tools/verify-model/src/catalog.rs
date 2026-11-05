@@ -257,7 +257,7 @@ pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 // of its plan (`commands.rs`).
 pub const CHECKS_THAT_READ_THE_TEST_KERNELS: [&str; 3] = ["host.verify-model", "gate.verify-model-tests", "gate.host-tests"];
 
-const GATES: [(&str, &str); 197] = [
+const GATES: [(&str, &str); 198] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -738,6 +738,9 @@ const GATES: [(&str, &str); 197] = [
 	// The dynamic-report checker's own exit contract, mode dispatch and refusal
 	// behaviour, against a disposable fixture. The subject is that checker, which is harness tooling.
 	("dynamic-report-regressions", "harness.tools"),
+	// The same source compiles to the same bytes at two paths, against a fixture built with the tree's
+	// rustc wrapper and config. Its subject is that wrapper, which is harness tooling every build runs.
+	("reproducible-build", "harness.tools"),
 	// A frame a page table ever pointed at goes back through `frame::retire`,
 	// and every plain `deallocate` says why no core can still translate it. Its subject is the
 	// kernel, so a kernel change selects it. Registered here in the same commit as `check.sh` this

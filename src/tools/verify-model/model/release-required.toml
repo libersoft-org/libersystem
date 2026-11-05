@@ -189,6 +189,7 @@ keys = [
 	"gate.qemu-pcie-hotplug / host / host / default",
 	"gate.qemu-tpm-tool / host / host / default",
 	"gate.qemu-virtio-iommu-x86_64 / host / host / default",
+	"gate.reproducible-build / host / host / default",
 	"gate.rollback-floor-x86_64 / host / host / default",
 	"gate.run-verdict / host / host / default",
 	"gate.secure-boot / host / host / default",
