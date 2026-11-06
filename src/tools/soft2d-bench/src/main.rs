@@ -67,6 +67,21 @@ struct Scene {
 	list: u64,
 }
 
+/// HOW FAR A MEDIAN MAY STAND ABOVE ITS FROZEN BUDGET BEFORE IT IS OVER, as a fraction of the budget.
+///
+/// A budget is one measurement - the first accepted run - and a median taken on another day carries the
+/// same noise that one did. `image-convert` froze at 16.063 ms and measures 15.5 to 16.3 ms run alone on
+/// the reference host, so a comparison with no room failed one sealed release in two and passed the next
+/// with nothing changed (2026-11-06). Three percent is that spread; a regression larger than it still
+/// fails, the budget itself still only goes down, and the ceiling stays a hard limit. The owner's answer,
+/// 2026-11-06.
+const NOISE_TOLERANCE: f64 = 0.03;
+
+/// What a scene's median may reach: its budget and the noise above it, never past its ceiling.
+fn allowed_ms(scene: &Scene) -> f64 {
+	(scene.budget_ms * (1.0 + NOISE_TOLERANCE)).min(scene.ceiling_ms)
+}
+
 /// The scenes, with the frozen counts a fixture is checked against.
 ///
 /// `image-stress` WAS ONE SCENE AND IS TWO (2026-09-19), on the project owner's answer to the
@@ -333,8 +348,7 @@ fn main() {
 		let prepared = backend.prepare(&list, &description).expect("a preparation");
 		let prepare_ms = started.elapsed().as_secs_f64() * 1_000.0;
 		let (median, percentile) = replay(&mut backend, &prepared, &mut target);
-		let allowed = scene.budget_ms.min(scene.ceiling_ms);
-		let met = median <= allowed;
+		let met = median <= allowed_ms(scene);
 		failed |= check && !met;
 		println!("{}\t{}\t{}\t{prepare_ms:.3}\t{median:.3}\t{percentile:.3}\t{:.3}\t{:.1}\t{}\t{workers}\t{}\t{}", scene.name, scene.commands, scene.resources, scene.budget_ms, scene.ceiling_ms, if met { "met" } else { "OVER" }, prepared.lanes(), prepared.units());
 	}
@@ -762,4 +776,30 @@ fn image_convert() -> Result<DrawList, Error> {
 	let video = ImageRecord { identity: 4, layout_generation: 1, content_generation: 1 };
 	canvas.draw_image(video, RectF::new(0.0, 0.0, 320.0, 240.0), RectF::new(0.0, 0.0, 640.0, 480.0), ImageQuality::Bilinear)?;
 	canvas.finish()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn scene(budget_ms: f64, ceiling_ms: f64) -> Scene {
+		Scene { name: "fixture", ceiling_ms, budget_ms, commands: 0, resources: 0, list: 0 }
+	}
+
+	#[test]
+	fn a_median_within_the_noise_is_met_and_a_regression_past_it_is_not() {
+		let convert = scene(16.063, 16.7);
+		// The eighth sealed run's median, 1.5 % over the frozen budget.
+		assert!(16.305 <= allowed_ms(&convert));
+		// Past the three percent.
+		assert!(16.6 > allowed_ms(&convert));
+		assert!((allowed_ms(&convert) - 16.063 * 1.03).abs() < 1e-9);
+	}
+
+	#[test]
+	fn the_ceiling_stays_a_hard_limit() {
+		// A budget within three percent of its ceiling gets no room past the ceiling.
+		assert_eq!(allowed_ms(&scene(65.640, 66.7)), 66.7);
+		assert_eq!(allowed_ms(&scene(17.0, 16.7)), 16.7);
+	}
 }

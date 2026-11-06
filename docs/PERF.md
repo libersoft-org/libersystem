@@ -1338,6 +1338,15 @@ THE EXTENDED PHASE, measured in the same session by its own gate, which no floor
 The HDR postprocess - six downsamples, five upsamples and the resolve - is now the largest stage and the
 one that grows with the window; the shadow pass stays flat, as its map's extent is the light's.
 
+## The 2D floor's noise tolerance (2026-11-06)
+
+A frozen budget is one measurement, and a median taken on another day carries the same noise. `image-convert`
+froze at 16.063 ms and measures 15.5 to 16.3 ms run alone on the reference host, so a comparison with no room
+failed one sealed release in two with nothing changed. On the owner's answer the check allows a median three
+percent over its budget (`NOISE_TOLERANCE` in `soft2d-bench`) and never past its ceiling; the budgets themselves
+are unchanged and still only come down. `image-convert` may reach 16.545 ms; a regression past three percent
+fails as before.
+
 ## The 2D floor on the current tree (2026-10-12)
 
 Taken after the worker pool's mailbox protocol and the scaled present blit (both under "The 3D demo at its
