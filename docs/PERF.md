@@ -2015,6 +2015,22 @@ Loop budgets, measured against a persistent instance:
 | warm leaf, scenario phase | 2.30 s | 2.60 s | met |
 | warm leaf, total | 5.6-6.0 s | 6.00 s | met, with no margin |
 
+Restated on 2026-11-06, on the owner's word, after the loop was found at 47 s in every sealed run and
+brought back with its guarantees kept (whole-tree staged checks that read every note on every build, and
+a half-second prompt wait before every agent session):
+
+| path | measured (2026-11-05, three samples) | budget | verdict |
+| --- | ---: | ---: | --- |
+| warm no-change build | 0.58-0.63 s | 1.00 s | met |
+| warm leaf, build phase | 4.2-4.3 s | 4.70 s | met |
+| warm leaf, publish phase | 0.10 s | 0.60 s | met |
+| warm leaf, scenario phase | 2.50 s | 2.60 s | met |
+| warm leaf, total | 6.9-7.1 s | 7.50 s | met |
+
+The tree the first table was measured on held 61 libraries and 89 programs; this one holds 123 and
+245, and what the build phase spends beyond the earlier figure is some forty steps of a tenth of a
+second each, none of them dominant.
+
 The total was five seconds until 2026-07-30 and was restated against the measurement in that
 same row, not to turn a red gate green: the loop runs at 5.6 to 6.0 s, the one implemented
 optimization recovered a tenth of a second where most of the gap was expected, and the

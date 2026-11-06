@@ -625,6 +625,25 @@ def self_test(root, work):
 QUARANTINE_CONSUMERS = (("vkprobe", True, "Apache-2.0"), ("abiprobe", False, "project"))
 
 
+# THE RUSTC WRAPPER DECIDES EVERY CRATE'S IDENTITY, and cargo's freshness check never sees it - as
+# `build-shared.sh` says of its own cargo directories. The consumer's object is compiled here, in a
+# directory of its own, and calls the runtime the image's `lsrt` exports by the runtime's identity: a
+# directory built before the wrapper, or under another version of it, kept the runtime it had compiled
+# then, and the consumer named `rt` symbols no staged library exports. So a wrapper that is not the
+# one this directory was built with empties it.
+def reset_on_new_wrapper(root, target_dir):
+	digest = hashlib.sha256((root / "src/tools/rustc-wrapper.sh").read_bytes()).hexdigest()
+	marker = target_dir / ".liber-rustc-wrapper"
+	try:
+		recorded = marker.read_text().strip()
+	except OSError:
+		recorded = ""
+	if target_dir.exists() and recorded != digest:
+		shutil.rmtree(target_dir)
+	target_dir.mkdir(parents=True, exist_ok=True)
+	marker.write_text(digest + "\n")
+
+
 def build_quarantine(root, arch, settings, out_dir, archive, rlibs, name, with_loader):
 	"""Link the quarantine consumer: this tree's own program, against the audit-linked loader.
 
@@ -645,6 +664,7 @@ def build_quarantine(root, arch, settings, out_dir, archive, rlibs, name, with_l
 	object_file = out_dir / arch / f"{name}.o"
 	errors = out_dir / arch / f"{name}.stderr"
 	image_target = root / ".build/cargo/quarantine" / settings["triple"]
+	reset_on_new_wrapper(root, image_target)
 	spec = str(root / settings["spec"]) if settings["spec"].endswith(".json") else settings["spec"]
 	command = [
 		str(root / "src/tools/build-consumer-object.sh"), str(consumer_dir), str(image_target), "134217728",

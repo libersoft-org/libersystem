@@ -66,7 +66,16 @@ NO_CHANGE_BUDGET = 1.0
 # retained object generations, which was expected to close most of the gap, recovered a tenth of
 # a second at most, and the remaining proposals that would close it trade correctness for time.
 # Six is what the loop does, so it is what the gate holds it to.
-LEAF_TOTAL_BUDGET = 6.0
+#
+# SEVEN AND A HALF SINCE 2026-11-06, restated the same way on the owner's word. Every sealed run had
+# found the loop at 47 s: two whole-tree checks of the staged image, added after these budgets were
+# set, read every staged note on every build, and every development-agent session first waited half
+# a second for a settled shell prompt. Both were fixed with their guarantees kept, and the loop then
+# measured 6.9 to 7.1 s in three consecutive samples on an idle host, a freshly cycled instance, the
+# first iteration excluded - against a tree twice the size of the one the six was measured on (123
+# libraries and 245 programs, where there were 61 and 89). What remained was some forty steps of a
+# tenth of a second each, none dominant; seven and a half is the worst sample with a margin for noise.
+LEAF_TOTAL_BUDGET = 7.5
 # Set from the measured baseline with room for noise and no more, which is what makes a phase
 # budget worth having: it says which phase moved, and it can only do that if a phase can breach
 # it. The previous numbers were loose enough that publication could grow to two and a half times
@@ -80,7 +89,11 @@ LEAF_TOTAL_BUDGET = 6.0
 #
 # These sum to more than the total, and deliberately: they answer a different question. The total
 # asks whether the loop is fast enough to work in, and a phase budget asks which part changed.
-PHASE_BUDGETS = {'build': 3.6, 'publish': 0.6, 'run': 2.6}
+#
+# The build's restated on 2026-11-06 with the total, by the same rule: 4.2 to 4.3 s in the three
+# samples, a tenth over the worst. Publication (0.1 s) and the scenario (2.5 s) are inside theirs and
+# keep them.
+PHASE_BUDGETS = {'build': 4.7, 'publish': 0.6, 'run': 2.6}
 
 # What a proportional leaf rebuild costs in work rather than in time: its own object and its own
 # executable, and nothing else. A provider miss means the change reached further than the leaf;

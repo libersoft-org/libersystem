@@ -82,6 +82,14 @@ edition = "2021"
 [dependencies]
 base = { path = "../base" }
 EOF
+	# A build script whose output cargo appends after RUSTFLAGS: a native search path in the tree, and a
+	# `--cfg` - neither of which cargo puts into `-C metadata`.
+	cat >"$at/src/libs/mid/build.rs" <<'EOF'
+fn main() {
+	println!("cargo:rustc-link-search=native={}", std::env::var("CARGO_MANIFEST_DIR").unwrap());
+	println!("cargo:rustc-cfg=from_build_script");
+}
+EOF
 	cat >"$at/src/libs/mid/src/lib.rs" <<'EOF'
 pub fn total(values: &mut Vec<u16>) -> u32 {
 	base::grow(values, 7);
@@ -196,6 +204,23 @@ keeps_cargo_identity() {
 	[[ "$("$fixture/near-before/release/app")" == "13 2" ]]
 }
 check "a dependency compiled before the wrapper keeps cargo's identity for its dependents, and the build runs" keeps_cargo_identity
+
+# THE IDENTITY IS CARGO'S INPUTS, NOT EVERY ARGUMENT. Cargo leaves RUSTFLAGS out of `-C metadata`, and
+# the quarantine consumers rely on it: they are compiled with `-C force-unwind-tables=no` and call the
+# image's runtime by its identity. A hash of every argument gave the runtime two identities, and the
+# consumer named symbols no staged library exports.
+BUILD_FLAGS=(--release -q)
+rustflags_independent() {
+	local crate plain flagged
+	build "$near" "$fixture/near-flags-plain" >/dev/null || return 1
+	(cd "$near/src/apps/app" && env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_RUSTC_WRAPPER RUSTFLAGS="-C force-unwind-tables=no" CARGO_TARGET_DIR="$fixture/near-flags" cargo build --offline --release -q) >/dev/null 2>&1 || return 1
+	for crate in base mid; do
+		plain=("$fixture/near-flags-plain/release/deps/.liber-crate-id/lib$crate"-*)
+		flagged=("$fixture/near-flags/release/deps/.liber-crate-id/lib$crate"-*)
+		[[ -f "${plain[0]}" && -f "${flagged[0]}" && "$(<"${plain[0]}")" == stable:* && "$(<"${plain[0]}")" == "$(<"${flagged[0]}")" ]] || return 1
+	done
+}
+check "a library's identity does not depend on RUSTFLAGS or its build script's output, as cargo's does not" rustflags_independent
 
 passes_through() {
 	[[ "$("$wrapper" rustc -vV)" == "$(rustc -vV)" ]]
