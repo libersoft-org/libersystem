@@ -103,7 +103,9 @@ run_check() {
 	# check failed in a second, measuring nothing. This instance is the gate's own and nobody else
 	# types into it, so an empty line - one Return on the emulated keyboard - is safe here, where on
 	# a person's instance it could submit a half-typed line.
-	if ! ./dev.sh status 2>/dev/null | grep -q 'development instance ready'; then
+	local instance
+	instance="$(./dev.sh status 2>/dev/null || true)"
+	if [[ "$instance" != *'development instance ready'* ]]; then
 		./dev.sh key ret >/dev/null 2>&1 || true
 	fi
 	(cd src && "$script") >"$log" 2>&1 || status=$?

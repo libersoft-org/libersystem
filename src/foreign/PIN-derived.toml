@@ -80,9 +80,13 @@ inventory = "src/foreign/INVENTORY-pass2.json"
 # interface range it is required to record beside the symbols.
 # REFROZEN 2026-10-19, after the platform port took out the loader's direct-driver path: again only
 # the three ELF sizes moved, each smaller by that path, and nothing else in the inventory.
+# REFROZEN 2026-11-06 for the tool alone: the audit link empties its quarantine consumers' cargo directory
+# when the tree's rustc wrapper changes, as the image build does, so a runtime compiled there before keeps
+# no identity the staged one has lost. The inventory and the three ELF sizes did not move - the tool's
+# `--check` reproduced them.
 inventory_sha256 = "7ed14cdd03e39fb02cb8f3addf196e9b1ae8139cc001ba65137c6dae571b477f"
 tool = "src/tools/foreign-audit-link.py"
-tool_sha256 = "a087a519e787322878256e73901aab2c406ec62e2e8c839baae76457191bb9e8"
+tool_sha256 = "6e6a8a9448c1a477b21f59cf7b97cd83be24985a001cb1cc57f5825aa0788104"
 surface = 52
 # Of which forty-eight come from the substrate crates and four from the runtime; see the
 # compiler-runtime section, which the artifact check corrected.

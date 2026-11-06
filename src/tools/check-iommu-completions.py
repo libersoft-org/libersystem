@@ -24,7 +24,7 @@ def main():
     wire = source[source.index('pub struct Wire {'):source.index('\npub struct Controller {')]
     production = '\n'.join(function(source, name) for name in (
         'attach_endpoint', 'attach_for', 'attachment_quarantined', 'domain_of', 'retained_domain_of', 'faults_for', 'grants_for',
-        'quarantined_grants_for', 'requester_of', 'detach_for_inner', 'poll_faults',
+        'quarantined_grants_for', 'requester_of', 'teardown_deadline', 'detach_for_inner', 'poll_faults',
         'poll_faults_attributed', 'poll_faults_attributed_with', 'drain_faults',
         'attribution_trustworthy', 'with', 'map_for_device', 'map_for_device_within', 'map_device_buffer',
         'domain_for_generation', 'unmap_for_device'))
