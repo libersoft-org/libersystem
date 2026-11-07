@@ -133,7 +133,7 @@ pub fn replace() -> i64 {
 	}
 }
 
-pub use crate::sleep::image::{context_is_ours, replace_memory};
+pub use crate::sleep::image::{context_mismatch, replace_memory};
 // The resume context a snapshot carries, which the suite's restore cases hand the kernel as an image's.
 #[cfg(test)]
 pub use crate::sleep::image::context;

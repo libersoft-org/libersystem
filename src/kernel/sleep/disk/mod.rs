@@ -67,6 +67,15 @@ pub fn ram_top() -> u64 {
 	(0..crate::mem::memmap_len()).filter_map(crate::mem::memmap_get).filter(|region| class(region.kind) != Class::Never).map(|region| region.base + region.length).max().unwrap_or(0)
 }
 
+// THE TOP OF RAM AN IMAGE'S CONTEXT NAMES, for the same reason the frames are held under `ram_end`: the device tree's
+// banks where the port has them, which one machine keeps from boot to boot, and not the memory map's top alone, whose
+// last regions a UEFI firmware moves between boots of one machine. On aarch64 the image named 0x7f110000 and the boot
+// that read it 0x7f430000, so every restore there was refused as another kernel's image (2026-11-07). Where there are no
+// banks it is the memory map's, as it always was.
+pub fn image_top() -> u64 {
+	ram_end(&crate::arch::sleep::ram_banks())
+}
+
 // THE END OF RAM A RESTORE'S FRAMES ARE HELD UNDER: the memory map's, or the device tree's banks' where they reach further
 // - a firmware's own regions at the top of a bank are RAM an image may hold (`image_ram`).
 fn ram_end(banks: &Banks) -> u64 {
@@ -555,7 +564,11 @@ impl Restore {
 // A RESTORE BEGUN: its `count` frames, read by `frame_at` twice, checked - RAM of an image's classes, page-aligned, each
 // named once - and the list pages allocated outside them.
 pub fn begin(count: u64, context: [u8; SNAPSHOT_CONTEXT], mut frame_at: impl FnMut(u64) -> Result<u64, i64>) -> Result<(), i64> {
-	if count == 0 || !crate::arch::sleep::context_is_ours(&context) {
+	if count == 0 {
+		return Err(ERR_INVALID);
+	}
+	if let Some((what, theirs, mine)) = crate::arch::sleep::context_mismatch(&context) {
+		crate::serial_println!("hibernate: the image's {what} is {theirs:#x} and this kernel's {mine:#x} - it is not this kernel's image");
 		return Err(ERR_INVALID);
 	}
 	if let Some(old) = RESTORE.lock().take() {
@@ -573,7 +586,19 @@ pub fn begin(count: u64, context: [u8; SNAPSHOT_CONTEXT], mut frame_at: impl FnM
 				return Err(error);
 			}
 		};
-		if phys % PAGE != 0 || phys == 0 || phys >= top || !image_ram(phys, &banks) || targets.set(phys) != Some(false) {
+		let refused = if phys % PAGE != 0 || phys == 0 {
+			Some("not a page")
+		} else if phys >= top {
+			Some("above the top of RAM")
+		} else if !image_ram(phys, &banks) {
+			Some("not RAM an image may hold")
+		} else if targets.set(phys) != Some(false) {
+			Some("named twice")
+		} else {
+			None
+		};
+		if let Some(why) = refused {
+			crate::serial_println!("hibernate: the image's frame {index} ({phys:#x}) is {why} - the restore is refused");
 			targets.free();
 			return Err(ERR_INVALID);
 		}

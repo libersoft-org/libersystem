@@ -352,6 +352,7 @@ keys = [
 	"host.smbios / host / host / default",
 	"host.smpboot / host / host / default",
 	"host.soft2d / host / host / default",
+	"host.soft2d-bench / host / host / default",
 	"host.soft3d / host / host / default",
 	"host.soft3d-bench / host / host / default",
 	"host.spool-proto / host / host / default",

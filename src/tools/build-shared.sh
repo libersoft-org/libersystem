@@ -386,7 +386,10 @@ read_staged_notes() {
 	staged_note_digest=()
 	staged_note_providers=()
 	staged_note_selections=()
-	mapfile -t files < <({ find "$provider_output_dir/lib" -name '*.lslib' -type f 2>/dev/null; find "$artifact_output_root/bin" "$artifact_output_root/libexec" -type f 2>/dev/null; } | sort)
+	mapfile -t files < <({
+		find "$provider_output_dir/lib" -name '*.lslib' -type f 2>/dev/null
+		find "$artifact_output_root/bin" "$artifact_output_root/libexec" -type f 2>/dev/null
+	} | sort)
 	((${#files[@]} > 0)) || return 0
 	header="$(staged_notes_header)"
 	# READ FROM FILES, NOT PIPES: bash reads a pipe one byte at a time so as not to take a byte past
@@ -569,7 +572,7 @@ verify_staged_provider_chains() {
 				inconsistent=1
 			fi
 			recorded_providers[$provider]="$recorded"
-			if [[ -z "${manifest_providers[$artifact:$provider]:-}" ]]; then
+			if [[ -z "${manifest_providers["$artifact:$provider"]:-}" ]]; then
 				echo "build-shared: $artifact records an edge to $provider and the manifest declares no such dependency - the note is not the graph this build was described by" >&2
 				inconsistent=1
 			fi
@@ -674,7 +677,7 @@ verify_staged_selection_candidates() {
 				candidate="${entry%%=*}"
 				recorded="${entry##*=}"
 				artifact="${candidate%.lslib}"
-				if [[ -z "${manifest_candidates[$program:$slot_kind:$artifact]:-}" ]]; then
+				if [[ -z "${manifest_candidates["$program:$slot_kind:$artifact"]:-}" ]]; then
 					echo "build-shared: $program admits $artifact in its $slot_kind slot and the manifest declares no such candidate" >&2
 					inconsistent=1
 					continue
@@ -1518,7 +1521,10 @@ source_digest() {
 }
 
 executable_source_digest() {
-	local crate_dir="$1"
+	# RELATIVE TO THE TREE, AS EVERY NAME HASHED BELOW IS. Callers hand the package's directory as an absolute path,
+	# and the names the digest covers were then the tree's own path and the file - so the same sources gave every
+	# executable another `source-sha256` in a sealed copy than in place (2026-11-07).
+	local crate_dir="${1#"$root/"}"
 	local package="$2"
 	local artifact="$3"
 	if [[ "$package" == tools ]]; then
@@ -1552,8 +1558,8 @@ executable_source_digest() {
 	fi
 	{
 		printf 'dependency-closure=%s\n' "${package_source_digests[$package]:-$(source_digest "$crate_dir")}"
-		for source in "$root/user/build.rs" "$root/user/user.ld" "$root/user/user-aarch64.ld" "$root/user/user-riscv64.ld" "$root/../product.conf"; do
-			source_file_digest "$source"
+		for source in user/build.rs user/user.ld user/user-aarch64.ld user/user-riscv64.ld ../product.conf; do
+			source_file_digest "$root/$source" "$source"
 		done
 		if [[ "$package" == services ]]; then
 			printf 'manifest=%s\n' "$manifest_digest"
@@ -2607,13 +2613,16 @@ for spec in "$@"; do
 						exit 1
 					fi
 					printf '%s\n' "$patch"
-					sha256sum "$root/$crate_dir/$patch"
+					(cd "$root/$crate_dir" && sha256sum "$patch")
 				done < <(tr ',' '\n' <<<"$row_patches")
 			fi
 		} | sha256sum | awk '{print $1}')"
 		deps=""
 		rlib="${foreign_objects[0]}"
-		foreign_objects_digest="$(sha256sum "${foreign_objects[@]}" | sha256sum | awk '{print $1}')"
+		# BY NAME AND NOT BY PATH, as the audit link's own record is: `sha256sum` prints each file's path beside its
+		# digest, and a path under this tree's `.build` made the record of the same objects another number in a
+		# sealed copy than in place.
+		foreign_objects_digest="$(cd "$foreign_object_dir" && sha256sum "${foreign_objects[@]##*/}" | sha256sum | awk '{print $1}')"
 	elif [[ -n "$image_graph" ]]; then
 		deps="$image_target/$target/release/deps"
 		rlib="$(graph_archive "$crate_dir")"
@@ -2649,7 +2658,7 @@ for spec in "$@"; do
 	# has one path through the code below, and a cache key over it would miss a change in any other
 	# object the manifest lists.
 	if [[ "$row_producer" == foreign ]]; then
-		provider_compile_inputs="objects=$(sha256sum "${foreign_objects[@]}" | sha256sum | awk '{print $1}')"
+		provider_compile_inputs="objects=$foreign_objects_digest"
 	else
 		provider_compile_inputs="cargo=${image_target_config_value:-standalone} rlib=$(sha256sum "$rlib" | awk '{print $1}')"
 	fi
@@ -2706,10 +2715,17 @@ for spec in "$@"; do
 			mkdir -p "$object_root/$archive_name"
 			(cd "$object_root/$archive_name" && llvm-ar x "$archive_path")
 		done
-		while IFS= read -r -d '' object; do
-			llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memmove=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default --set-symbol-visibility=__udivti3=default --set-symbol-visibility=__umodti3=default "$object"
-			link_inputs+=("$object")
-		done < <(find "$object_root" -name '*.o' -print0)
+		# IN A FIXED ORDER: the archives as the closure lists them, and each one's members by name. `find` over the
+		# extracted tree answered in the directory's own order, which follows the names - and an archive's name
+		# carries cargo's `extra-filename`, which follows the path of the tree - so the link order, the padding
+		# between functions and the size of `lsrt` came out different in a sealed copy than in place: sixteen bytes
+		# on x86_64, every row of the dynamic report that names it (2026-11-07).
+		for archive in "${archives[@]}"; do
+			while IFS= read -r -d '' object; do
+				llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memmove=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default --set-symbol-visibility=__udivti3=default --set-symbol-visibility=__umodti3=default "$object"
+				link_inputs+=("$object")
+			done < <(find "$object_root/$(basename "$archive" .rlib)" -name '*.o' -print0 | sort -z)
+		done
 	elif [[ "$row_producer" == foreign ]]; then
 		# OBJECT FILES AND NOT AN ARCHIVE. `--whole-archive` is how a Rust rlib is kept whole through
 		# member selection; objects are already whole, and wrapping them in that pair would say

@@ -43,6 +43,7 @@
 #
 # usage: check-tickless-idle.py [--no-build] [x86_64|aarch64|riscv64 ...]   (default: all three)
 
+import itertools
 import json
 import os
 import re
@@ -238,9 +239,13 @@ def idle_states(serial, timeout):
 # The transaction's own steps, as ServiceManager prints them when each begins.
 FREEZE_STEP = re.compile(r'ServiceManager: sleep: step (flush|thaw) at tick (\d+)')
 
-# How far two consecutive counts' boot-minus-monotonic may move apart without sleeping between them: the counter reads
-# the two clocks one after the other, and a thread preempted between the reads shows a few milliseconds.
+# How far boot-minus-monotonic may move without a sleep, as a level that holds: the counter's timestamps are taken to
+# the millisecond and its two clocks read one after the other.
 CLOCK_READ_JITTER_MS = 100
+# How many counts a level has to hold to be one. A sample read across a preemption is one count high and back - the
+# counter reads the monotonic clock first and the boot-time clock second (`sleepcheck`'s `stamp`), so a thread stopped
+# between the two shows boot-time late and never early - while a sleep moves every count after it.
+LEVEL_COUNTS = 3
 
 
 def freeze_window(lines):
@@ -319,11 +324,28 @@ def sleep_clock_gap(rows, entered, resumed, reported_ms, margin_ms=IDLE_MARGIN_M
 	# behind: counts sampled before the freeze arrived after `sleep: resumed`, so "the last line before the entry and
 	# the first after the resume" were two samples from before the sleep, and the ports' check read a 0 ms step
 	# between them in every run while the kernel's clocks were right. So: the counts in their own order, and the one
-	# place where boot-minus-monotonic moved - exactly one, everywhere else within a clock read's jitter.
+	# place where boot-minus-monotonic moved to a new level and held it.
+	#
+	# A LEVEL, NOT A STEP BETWEEN TWO SAMPLES. Compared count to count, one sample read across a preemption is a step
+	# up and a step back down; under a sealed release's load on riscv64 that was 113 ms, and it failed the check
+	# beside a sleep measured to the millisecond (2026-11-07). A preempted read only ever shows boot-time late, so a
+	# level is the lowest offset over its counts: the sleep is the split where the level after it stands highest
+	# above the level before it, the first such split, and its size is the difference of the two levels. Exactly
+	# one: no stretch of LEVEL_COUNTS or more counts on either side holds a level of its own.
+	#
+	# THE FIRST SPLIT WITHIN THE NOISE OF THE BEST, not the best: the two clocks are printed to the millisecond, so a
+	# split later in the run can stand a millisecond higher than the true one only because its suffix missed a
+	# rounding - and taking it put the sleep inside the level after it.
 	ordered = sorted(rows, key=lambda row: row[2])
-	steps = [(after[4] - after[3]) - (before[4] - before[3]) for before, after in zip(ordered, ordered[1:])]
-	at = max(range(len(steps)), key=steps.__getitem__)
-	if any(abs(step) > CLOCK_READ_JITTER_MS for index, step in enumerate(steps) if index != at):
+	offsets = [row[4] - row[3] for row in ordered]
+	lowest_before = list(itertools.accumulate(offsets, min))
+	lowest_after = list(itertools.accumulate(reversed(offsets), min))[::-1]
+	rises = [lowest_after[split + 1] - lowest_before[split] for split in range(len(offsets) - 1)]
+	at = next(split for split, rise in enumerate(rises) if rise >= max(rises) - CLOCK_READ_JITTER_MS)
+	before, after = lowest_before[at], lowest_after[at + 1]
+	held_before = [min(offsets[start:at + 1]) - before for start in range(1, at + 2 - LEVEL_COUNTS)]
+	held_after = [min(offsets[start:]) - after for start in range(at + 2, len(offsets) + 1 - LEVEL_COUNTS)]
+	if any(abs(level) > CLOCK_READ_JITTER_MS for level in held_before + held_after):
 		raise GateError('the boot-time clock left the monotonic one at more than one point')
 	left, right = ordered[at], ordered[at + 1]
 	# WHAT THE WIRE STILL PROVES, which is one direction: a sample that counts the sleep was taken after it, so it
@@ -331,7 +353,8 @@ def sleep_clock_gap(rows, entered, resumed, reported_ms, margin_ms=IDLE_MARGIN_M
 	early = [row for row in ordered[at + 1:] if row[0] < resumed_at]
 	if early:
 		raise GateError(f'count {early[0][2]} counts the sleep and reached the serial line before `sleep: resumed`')
-	mono, boot = right[3] - left[3], right[4] - left[4]
+	mono = right[3] - left[3]
+	boot = mono + after - before
 	# AND THE PAIR SPANS THE FREEZE: the counter cannot sample between the transaction's flush (which begins after
 	# the freeze is answered) and its thaw, so the pair either side of the sleep is at least that far apart on the
 	# monotonic clock, which the ticks share. Two tick boundaries are the slack.
@@ -372,6 +395,16 @@ def clock_self_test():
 	left, right, _, _ = sleep_clock_gap(late, entered, resumed, 5000, frozen=(10, 100))
 	if (left[2], right[2]) != (2, 3):
 		raise GateError('the clock oracle did not find the pair that spans the sleep among late counter lines')
+	# A SAMPLE READ ACROSS A PREEMPTION, one count high and back: away from the sleep (the sealed release's 113 ms on
+	# riscv64), on the last count before it and on the first after it. Each is still the one sleep, at its size.
+	def run(offsets, before_entry):
+		return [(at if at < before_entry else at + 2, at * 0.1 if at < before_entry else 5.0 + at * 0.1, at + 1, at * 100, at * 100 + offset) for at, offset in enumerate(offsets)]
+	quiet, slept = [0] * 6, [5000] * 6
+	# AND THE MILLISECOND THE TWO CLOCKS ARE ROUNDED TO: a level after the sleep that reads 5001 everywhere but once.
+	for name, offsets in [('away from the sleep', [0, 0, 300, 0, 0, 0] + slept), ('on the last count before it', quiet[:5] + [400] + slept), ('on the first count after it', quiet + [5400] + slept[1:]), ('as a rounded millisecond', quiet + [5000] + [5001] * 8)]:
+		left, right, _, boot = sleep_clock_gap(run(offsets, 6), (6, 0.6, 10), (7, 5.6, 10), 5000)
+		if (left[2], right[2]) != (6, 7) or abs(boot - (right[3] - left[3]) - 5000) > 1:
+			raise GateError(f'the clock oracle took a preempted read {name} for part of the sleep')
 	early = (2, 0.1, 10), (3, 5.1, 10)
 	cases = [
 		('missing rebase', [ordinary[0], (3, 5.2, 2, 5200, 10200)], (entered, (2, 5.1, 510)), None),
@@ -382,6 +415,8 @@ def clock_self_test():
 		('missing after', [ordinary[0]], (entered, resumed), None),
 		('a step of the wrong size', [ordinary[0], (3, 5.2, 2, 200, 3200)], (entered, resumed), None),
 		('the clocks parting twice', ordinary + [(4, 5.3, 3, 300, 5800)], (entered, resumed), None),
+		('a second level held after the sleep', run(quiet + slept + [5900] * 4, 6), ((6, 0.6, 10), (7, 5.6, 10)), None),
+		('a level held before the sleep', run([0] * 4 + [700] * 4 + slept, 8), ((8, 0.8, 10), (9, 5.8, 10)), None),
 		('a sample counting the sleep before the resume', [(0, 0.0, 1, 0, 0), (1, 0.05, 2, 200, 5200), (4, 5.2, 3, 300, 5300)], early, None),
 		('a pair that does not span the freeze', ordinary, (entered, resumed), (10, 100)),
 	]
@@ -410,7 +445,7 @@ def clock_self_test():
 		except GateError:
 			continue
 		raise GateError(f'the freeze window accepted {name}')
-	note('clock oracle self-test PASS (six positive cases, ten rejected false outcomes, cut counter lines rejoined and two unrejoinable ones refused, the freeze window read and two malformed ones refused)')
+	note('clock oracle self-test PASS (ten positive cases, twelve rejected false outcomes, cut counter lines rejoined and two unrejoinable ones refused, the freeze window read and two malformed ones refused)')
 
 
 def suspend_to_idle(target, serial, scale):

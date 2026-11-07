@@ -46,7 +46,7 @@ fn words() -> [u64; 8] {
 		arch::resume::entry(),
 		arch::resume::record_address(0),
 		crate::mem::hhdm_offset(),
-		disk::ram_top(),
+		disk::image_top(),
 		arch::sleep::kernel_image().0,
 		crate::smp::lapic_id(0),
 	]
@@ -73,10 +73,27 @@ fn decode(context: &[u8; SNAPSHOT_CONTEXT]) -> [u64; 8] {
 // A CONTEXT THIS KERNEL WROTE: its magic, the same entry and boot record, the same direct map, the same top of RAM and
 // the same load address. The page tables' address is the image's own and is checked only for being a page; the core
 // it ran on is the one the replacement runs on.
-pub fn context_is_ours(context: &[u8; SNAPSHOT_CONTEXT]) -> bool {
+//
+// ANSWERED AS WHICH PART IS NOT, with the image's value and this kernel's - or `None` for one it wrote: a refused
+// restore answers one code for a context and a frame alike, and the boot log has to say which.
+pub fn context_mismatch(context: &[u8; SNAPSHOT_CONTEXT]) -> Option<(&'static str, u64, u64)> {
 	let [magic, root, entry, record, hhdm, top, image, _] = decode(context);
 	let ours = words();
-	magic == CONTEXT_MAGIC && root != 0 && root % 4096 == 0 && entry == ours[2] && record == ours[3] && hhdm == ours[4] && top == ours[5] && image == ours[6]
+	if magic != CONTEXT_MAGIC {
+		return Some(("magic", magic, CONTEXT_MAGIC));
+	}
+	if root == 0 || root % 4096 != 0 {
+		return Some(("page tables", root, ours[1]));
+	}
+	[
+		("resume entry", entry, ours[2]),
+		("boot record", record, ours[3]),
+		("direct map", hhdm, ours[4]),
+		("top of RAM", top, ours[5]),
+		("load address", image, ours[6]),
+	]
+	.into_iter()
+	.find(|&(_, theirs, mine)| theirs != mine)
 }
 
 // ------------------------------------------------------------------ the snapshot
