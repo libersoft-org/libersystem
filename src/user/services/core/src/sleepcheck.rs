@@ -10,6 +10,9 @@
 //   sleepcheck timer MS        a Timer armed MS from now on the monotonic clock, its arming and its firing each said
 //                              with both clocks - a sleep between the two is on the boot-time clock alone
 //   sleepcheck clocks          both clocks and the kernel's RTC read, once
+//   sleepcheck flood SECONDS   a line as fast as the terminal takes it, for SECONDS of the monotonic clock: output ready
+//                              at every one of the console's waits, which a command typed meanwhile has to get past -
+//                              the worst case of the counter the sleep gates type `sleepctl` over
 
 #![no_std]
 #![no_main]
@@ -32,7 +35,7 @@ fn say(text: &str) {
 }
 
 fn usage() -> ! {
-	say("usage: sleepcheck count SECONDS | timer MS | clocks");
+	say("usage: sleepcheck count SECONDS | timer MS | clocks | flood SECONDS");
 	exit()
 }
 
@@ -57,6 +60,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		["count", seconds] => count(number(seconds)),
 		["timer", ms] => timer(number(ms)),
 		["clocks"] => say(&format!("clocks {} rtc {}", stamp(), clock_rtc())),
+		["flood", seconds] => flood(number(seconds)),
 		_ => usage(),
 	}
 	exit();
@@ -80,6 +84,18 @@ fn count(seconds: u64) {
 	}
 	close(timer);
 	say("count done");
+}
+
+// NO TIMER AND NO PAUSE: each line is sent as soon as the last one went, and a full terminal channel holds the next one
+// back, so the console finds this output waiting every time it looks.
+fn flood(seconds: u64) {
+	let end: u64 = clock().saturating_add(seconds.saturating_mul(TICKS_PER_SECOND));
+	let mut n: u64 = 0;
+	while clock() < end {
+		n += 1;
+		say(&format!("flood {n}"));
+	}
+	say("flood done");
 }
 
 fn timer(ms: u64) {

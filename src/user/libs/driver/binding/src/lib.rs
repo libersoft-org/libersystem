@@ -1154,7 +1154,27 @@ impl<const N: usize> Publications<N> {
 // something to reason about inside a `no_std` binary nobody can drive.
 pub struct IncidentWindow;
 
+// WHICH CHAIN AN INCIDENT OPENS: a device the boot is bringing up, or the recovery of a binding that had come up.
+//
+// ONLY THE FIRST COMPETES WITH THE BOOT (2026-11-08). The kernel's recovery ladder reboots a machine whose chain has
+// not settled when its window runs out, so a bring-up bounded past that is a bind nothing would see the end of. A
+// binding that had come up and has just ended is a device the boot already had, and its recovery's window is its own
+// slice wherever it opens - inside the boot window too. The manager opened every incident against the boot's deadline,
+// and on riscv64 a suspend to RAM whose resume fell 10 s before that deadline gave the rebinds of the drivers that did
+// not come back from it what was left of the boot: under a second each, one a deadline already past at its `BIND`.
+// Three were failed with their `READY` waiting in the manager's channel, and the network did not come back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chain {
+	BringUp,
+	Recovery,
+}
+
 impl IncidentWindow {
+	// The deadline an incident of `chain` gets: a recovery's is never clamped by the boot's.
+	pub fn opened(chain: Chain, window: u64, share: u64, boot_deadline: u64, now: u64) -> u64 {
+		IncidentWindow::deadline(window, share, if chain == Chain::Recovery { 0 } else { boot_deadline }, now)
+	}
+
 	// The deadline one incident gets, given the boot window's length, the boot's own deadline and
 	// the instant the incident opens.
 	//

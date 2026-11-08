@@ -1249,6 +1249,19 @@ fn a_late_initial_bind_reserves_teardown_from_its_clamped_window() {
 }
 
 #[test]
+fn a_recovery_inside_the_boot_window_gets_its_own_slice() {
+	// MEASURED ON riscv64, 2026-11-08: the boot's deadline at tick 40209, a suspend to RAM resumed at 39156, and the
+	// drivers that did not come back from it rebound at about 39250 - against what was left of the boot.
+	let (window, share, boot_deadline, now) = (40_000, 3, 40_209, 39_250);
+	assert_eq!(IncidentWindow::opened(Chain::BringUp, window, share, boot_deadline, now), boot_deadline, "a bring-up still competes with the boot");
+	let recovery = IncidentWindow::opened(Chain::Recovery, window, share, boot_deadline, now);
+	assert_eq!(recovery, now + window / share, "a recovery is of a device the boot already had, and its slice is its own");
+	assert_eq!(IncidentWindow::teardown_reserve(recovery, now, share), window / share / share);
+	// And once the boot's deadline is behind, the two chains agree.
+	assert_eq!(IncidentWindow::opened(Chain::BringUp, window, share, boot_deadline, 50_000), IncidentWindow::opened(Chain::Recovery, window, share, boot_deadline, 50_000));
+}
+
+#[test]
 fn a_recovery_long_after_the_boot_is_not_born_already_expired() {
 	// THE DEFECT THIS ARITHMETIC EXISTS TO PREVENT, and it was live until 2026-08-27: the clamp was
 	// unconditional, so an hour after boot every recovery got a deadline in the PAST and every bind

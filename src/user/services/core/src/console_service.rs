@@ -841,6 +841,9 @@ unsafe fn run(console: &mut Console) -> ! {
 		// grow on demand, so the set has no fixed bound (the kernel's wait_any sanity
 		// bound is far above any real console).
 		let mut waits: Vec<u64> = Vec::new();
+		// THE SAME SET IN THE ORDER IT IS WAITED ON, beginning just past the channel the last pass served - see the wait.
+		let mut rotated: Vec<u64> = Vec::new();
+		let mut next: usize = 0;
 		// present the initial banner (the foreground term was rendered in __user_main).
 		present_fg(console);
 		loop {
@@ -904,7 +907,19 @@ unsafe fn run(console: &mut Console) -> ! {
 			if console.bell_until != 0 && console.bell_until < deadline {
 				deadline = console.bell_until;
 			}
-			let ready: i64 = if console.has_fb { wait_any_periodic(&waits, deadline) } else { wait_any(&waits, 0) };
+			// ONE ROUND OF THE SET BEFORE ANY CHANNEL IS SERVED TWICE (2026-11-08). `wait_any` answers the LOWEST ready
+			// index, so a fixed order is a strict priority, and a channel that is ready at every wait starves every
+			// channel behind it - which a terminal is whose program prints faster than one pass renders, presents and
+			// mirrors. The serial line's input came last: on riscv64 a counter printing every 100 ms, each pass taking
+			// longer than that, held a typed `sleepctl` back for thirty seconds, until the counter's last line. So the set
+			// is offered from just past the channel the last pass served, and a ready channel is served within one round
+			// of it, whatever the others do; within a round the order above stands.
+			let count: usize = waits.len();
+			let start: usize = next % count;
+			rotated.clear();
+			rotated.extend_from_slice(&waits[start..]);
+			rotated.extend_from_slice(&waits[..start]);
+			let ready: i64 = if console.has_fb { wait_any_periodic(&rotated, deadline) } else { wait_any(&rotated, 0) };
 			// The flash comes down on ANY wake past its deadline - a keystroke, a program's output
 			// or the tick - because holding it longer than asked serves nobody, and taking it down
 			// early on a keystroke is what the inline version did too.
@@ -924,7 +939,8 @@ unsafe fn run(console: &mut Console) -> ! {
 				continue;
 			}
 			if ready >= 0 {
-				let r: usize = ready as usize;
+				let r: usize = (ready as usize + start) % count;
+				next = r + 1;
 				if r == 0 {
 					// keystrokes from the kernel console input.
 					if let Received::Message { len, .. } = recv_blocking(console.input, &mut keys) {

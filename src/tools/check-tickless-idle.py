@@ -18,6 +18,9 @@
 #   3. A DEVICE PLUGGED OVER QMP INTO THE MACHINE'S EMPTY HOT-PLUG PORT WHILE IT IS IDLE IS SEEN BY THE
 #      KERNEL. In the same boot and after the typing, on every target: on riscv64 the UART and the slots
 #      are answered under one identity, and a slot event before the typing would be counted as the UART's.
+#   4. AND THE OPPOSITE OF IDLE, on x86_64: a command typed while a program floods the terminal is answered
+#      before the flood ends (`typed_under_flood`) - the property the ports' sleep below types `sleepctl` over a
+#      counter with.
 #
 # And it says how often each idle core woke, per second, from the same records - the number the part is
 # for, which `docs/PERF.md` carries.
@@ -549,6 +552,84 @@ def wakes_on(rows, identity):
 	return sum(row['sources'].get(identity, 0) for row in rows.values())
 
 
+# 4. A COMMAND TYPED WHILE A PROGRAM FLOODS THE TERMINAL IS ANSWERED WHILE THE FLOOD RUNS.
+#
+# ConsoleService waits on the keyboard, every terminal's output, the display's events and the serial line's input at
+# once and serves one of them a pass; `wait_any` answers the LOWEST ready index, and the serial line's input was the
+# last - so output that was ready at every wait kept a typed command unread until the output stopped. On riscv64 a
+# counter printing every 100 ms did that for thirty seconds (`system-suspend-riscv64`, 2026-11-08): each pass took
+# longer than the counter's period, and the `sleepctl` typed over it was read only after the counter's last line.
+# `sleepcheck flood` is that output at its worst - ready at every wait on any machine - and `uname` typed into it has to
+# be answered before it ends: until ConsoleService took its channels in turn, the echo arrived after `flood done`.
+# ConsoleService is the same program on every target; x86_64 runs it fastest, so it is asked there.
+FLOOD_S = 45
+# The program's own lines, not the echo of the command that started it - which says `flood 45` too.
+FLOOD_LINE = b'sleepcheck: flood '
+# How many of them are on the wire before the command is typed: the console is busy with the flood by then.
+FLOOD_STARTED = 50
+FLOOD_ANSWER = b'LiberSystem'
+FLOOD_END = b'flood done'
+
+
+# The verdict on where the answer and the flood's last line landed, as offsets into the serial output: None when the
+# command was answered while the flood ran, the failure in words otherwise.
+def flood_verdict(typed, answered, ended):
+	if ended is not None and ended < typed:
+		return 'the flood\'s output reached the serial line only once it had ended - the console mirrored nothing while a program printed faster than it rendered'
+	if answered is None:
+		return '`uname`, typed while `sleepcheck flood` printed, was never answered'
+	if ended is not None and answered > ended:
+		return '`uname`, typed while `sleepcheck flood` printed, was answered only after the flood ended - typed input waited behind a terminal that kept printing'
+	return None
+
+
+def flood_self_test():
+	if flood_verdict(100, 150, 900) is not None:
+		raise GateError('the flood verdict refused an answer that came while the flood ran')
+	for name, (typed, answered, ended) in [('an answer after the flood', (100, 950, 900)), ('a flood that ended before the command was typed', (100, 950, 50)), ('no answer at all', (100, None, 900))]:
+		if flood_verdict(typed, answered, ended) is None:
+			raise GateError(f'the flood verdict accepted {name}')
+	note('flood verdict self-test PASS (an answer inside the flood accepted, three false outcomes refused)')
+
+
+def typed_under_flood(target, serial, scale):
+	flood_self_test()
+	mark = len(serial.data)
+	serial.type(f'sleepcheck flood {FLOOD_S} &\n'.encode())
+	serial.wait_for(mark, lambda seen: seen.count(FLOOD_LINE) >= FLOOD_STARTED, 60 * scale, f'{FLOOD_STARTED} lines of `sleepcheck flood`')
+	typed = len(serial.data)
+	typed_at = time.time()
+	serial.type(b'uname\n')
+	# SEARCHED AS IT ARRIVES, each token from where the last look ended less its own length: the flood is megabytes, and
+	# `wait_for` reads everything since its mark again at every look.
+	found = {}
+	scanned = typed
+	deadline = time.monotonic() + (FLOOD_S + 120) * scale
+	while FLOOD_ANSWER not in found or FLOOD_END not in found:
+		for token, start in ((FLOOD_ANSWER, typed), (FLOOD_END, mark)):
+			if token not in found:
+				at = serial.data.find(token, max(start, scanned - len(token)) if scanned > typed else start)
+				if at >= 0:
+					found[token] = at
+		scanned = len(serial.data)
+		if FLOOD_END in found and found[FLOOD_END] < typed:
+			break
+		if time.monotonic() >= deadline:
+			break
+		serial.pump(0.05)
+	failure = flood_verdict(typed, found.get(FLOOD_ANSWER), found.get(FLOOD_END))
+	if failure is not None:
+		raise GateError(failure)
+	if FLOOD_END not in found:
+		raise GateError(f'`sleepcheck flood {FLOOD_S}` did not end within {FLOOD_S + 120} s')
+	answered_at = next(stamp for end, stamp in serial.stamps if end > found[FLOOD_ANSWER])
+	lines = serial.data.count(b'\n', mark, found[FLOOD_END])
+	note(f'{target}: `uname` typed into a {FLOOD_S} s flood of output ({lines} lines) was answered {(answered_at - typed_at) * 1000:.0f} ms later, while the flood ran')
+	mark = len(serial.data)
+	serial.type(b'\n')
+	serial.wait_prompt(mark, 60 * scale, 'the prompt after the flood')
+
+
 # THE IDENTITY TYPED INPUT RAISES NOW, which is not always the one the boot armed (corrected 2026-10-26). On riscv64
 # a claim that takes the console UART arms its APLIC source to an identity of the claim's own window, and every typed
 # byte from then on wakes the machine under that identity - so counting the boot's identity found none of them, and
@@ -788,6 +869,9 @@ def check(target, serial, qmp_path, scale):
 	qmp(qmp_path, 'device_add', {'driver': 'virtio-serial-pci', 'bus': 'hotplug0', 'id': 'tickless0'}, 30)
 	took = serial.wait_for(mark, lambda seen: ARRIVED in seen, 60 * scale, 'the arrival of a device plugged into the idle machine')
 	note(f'{target}: a device plugged into the idle machine was seen {took * 1000:.0f} ms later')
+	if target == 'x86_64':
+		serial.settle(1.0 * scale, 30 * scale)
+		typed_under_flood(target, serial, scale)
 	if target != 'x86_64':
 		serial.settle(2.0 * scale, 120 * scale)
 		suspend_to_idle(target, serial, scale)
@@ -799,6 +883,7 @@ def main():
 	if args == ['--self-test']:
 		clock_self_test()
 		arm_refusal_self_test()
+		flood_self_test()
 		return 0
 	skip_build = '--no-build' in args
 	targets = [a for a in args if not a.startswith('--')] or list(TARGETS)

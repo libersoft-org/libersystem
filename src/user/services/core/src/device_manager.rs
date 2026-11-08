@@ -194,8 +194,9 @@ struct Incident {
 }
 
 impl Incident {
-	// Open a window from now, clamped by the boot's own deadline while that is still in hand.
-	fn open() -> Incident {
+	// Open a window from now - a bring-up's clamped by the boot's own deadline while that is still in hand, a
+	// recovery's never (see `driver_binding::Chain`).
+	fn open(chain: driver_binding::Chain) -> Incident {
 		let window: u64 = BOOT_WINDOW.load(core::sync::atomic::Ordering::Relaxed);
 		if window == 0 {
 			return Incident { opened: true, deadline: 0, teardown_reserve: 0 };
@@ -205,7 +206,7 @@ impl Incident {
 		// to reason about inside a binary nobody can run on a host - which is how the clamp
 		// came to be unconditional and every recovery an hour after boot born already expired.
 		let now = clock();
-		let deadline: u64 = driver_binding::IncidentWindow::deadline(window, BIND_SHARE_OF_WINDOW, BOOT_DEADLINE.load(core::sync::atomic::Ordering::Relaxed), now);
+		let deadline: u64 = driver_binding::IncidentWindow::opened(chain, window, BIND_SHARE_OF_WINDOW, BOOT_DEADLINE.load(core::sync::atomic::Ordering::Relaxed), now);
 		Incident { opened: true, deadline, teardown_reserve: driver_binding::IncidentWindow::teardown_reserve(deadline, now, TEARDOWN_SHARE_OF_BIND) }
 	}
 
@@ -3610,6 +3611,15 @@ fn resolve_teardown(node: &mut Node, driver_name: &[u8], now: u64) -> Option<Bin
 		node.ended_at = began_at;
 		print(b"DeviceManager: restarting ");
 		print_driver_name(driver_name);
+		// WHAT ITS CHAIN HAS LEFT, said with it: a recovery the boot's deadline had clamped to under a second looked
+		// in the log exactly like one with two minutes in hand, until its driver was failed with its answer unread.
+		if node.incident.deadline != 0 {
+			let mut number = [0u8; 20];
+			let n = decimal(node.incident.deadline.saturating_sub(now), &mut number);
+			print(b", ");
+			print(&number[..n]);
+			print(b" tick(s) of its window left");
+		}
 		print(b"\n");
 		return Some(BindingState::Backoff);
 	}
@@ -4510,7 +4520,7 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	// failed attempts. Expiry does not mean no incident exists. A successful binding,
 	// an operator request, or the next online failure establishes the next incident.
 	if !node.incident.opened {
-		node.incident = Incident::open();
+		node.incident = Incident::open(driver_binding::Chain::BringUp);
 	}
 	// THE TEARDOWN SLICE THIS ATTEMPT'S ROLLBACK GETS, computed once from the window rather than
 	// at each failure point - so every exit from this function gives its rollback the same
@@ -5368,8 +5378,12 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 		// questions: a bind attempt that fails after its chain's window ran out MUST end the
 		// chain, and reopening there would make the absolute deadline unreachable. What starts a
 		// new chain is a binding that had come up.
+		//
+		// AND ITS WINDOW IS ITS OWN, NOT WHAT IS LEFT OF THE BOOT'S (2026-11-08) - see
+		// `driver_binding::Chain`: a suspend to RAM resumed ten seconds before the boot's deadline
+		// failed the rebinds of every driver that did not come back from it.
 		if matches!(node.record.state, BindingState::Online | BindingState::Suspended) {
-			node.incident = Incident::open();
+			node.incident = Incident::open(driver_binding::Chain::Recovery);
 			// The time window is fresh; previously admitted automatic attempts remain spent.
 		}
 		if let Some(next) = next_state {
@@ -6225,7 +6239,7 @@ fn apply_policy(nodes: &mut [Node], at: usize, verb: proto::system::PolicyVerb, 
 			if node.record.move_to(BindingState::Unbound, None) {
 				// Enable lifts the policy; it does not grant more automatic attempts.
 				node.finish_operator_attempt();
-				node.incident = Incident::open();
+				node.incident = Incident::open(driver_binding::Chain::BringUp);
 				// AND THE CURSOR IS REWOUND WHEN THERE IS NOTHING LEFT TO TRY, exactly as
 				// `PolicyVerb::Retry` does it and for the same reason: `start_candidate` returns
 				// immediately at an exhausted cursor, so an enable that only lifted the desire
@@ -6276,7 +6290,7 @@ fn apply_policy(nodes: &mut [Node], at: usize, verb: proto::system::PolicyVerb, 
 			// Preserve automatic spending. The pending grant is consumed only after a claim
 			// succeeds; retry_once then keeps failure from opening an automatic chain.
 			let granted = driver_binding::one_more_attempt(node.candidate, node.candidates.len(), node.preferred, MAX_AUTOMATIC_ATTEMPTS);
-			node.incident = Incident::open();
+			node.incident = Incident::open(driver_binding::Chain::BringUp);
 			// AND THE CURSOR IS REWOUND WHEN THERE IS NOTHING LEFT TO TRY, which is the case this
 			// granted zero attempts in.
 			//
