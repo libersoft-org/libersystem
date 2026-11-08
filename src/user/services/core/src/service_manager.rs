@@ -705,13 +705,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//
 	//     LAST in the sequence, because the bootstrap is read positionally and anything
 	//     inserted in the middle shifts every read after it.
-	let mut console_caps: [u64; MAX_MESSAGE_CAPS] = [0; MAX_MESSAGE_CAPS];
 	// FOUR now: the device authority joined them, appended after the three so every reader that
 	// counted three still finds the same three in the same places. A boot that hands over fewer
 	// leaves the missing ones zero, which each holder already treats as "not granted".
-	let (display_ctl, console_input, console_sink, device_manager): (u64, u64, u64, u64) = match recv_message_caps(bootstrap, &mut buf, &mut console_caps) {
-		(len, 4) if len >= 11 && &buf[..11] == b"CONSOLECAPS" => (console_caps[0], console_caps[1], console_caps[2], console_caps[3]),
-		(len, 3) if len >= 11 && &buf[..11] == b"CONSOLECAPS" => (console_caps[0], console_caps[1], console_caps[2], 0),
+	//
+	// A BLOCKING RECEIVE, like every other read of this sequence. It was `recv_message_caps`, which
+	// answers at once when the queue is empty - and SystemManager sends this message after MODE, with
+	// nothing ordering its send before this read. When the read won, this message stayed queued and
+	// every read below took the one before its own: no display, no console, no device or firmware
+	// privilege and no boot window, a boot with no shell, and nothing in the log said why.
+	let (display_ctl, console_input, console_sink, device_manager): (u64, u64, u64, u64) = match recv_caps_blocking(bootstrap, &mut buf) {
+		ReceivedCaps::Message { len, handles } if len >= 11 && &buf[..11] == b"CONSOLECAPS" => match *handles.as_slice() {
+			[display, input, sink, device] => (display, input, sink, device),
+			[display, input, sink] => (display, input, sink, 0),
+			_ => (0, 0, 0, 0),
+		},
 		_ => (0, 0, 0, 0),
 	};
 

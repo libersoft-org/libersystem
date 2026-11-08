@@ -89,9 +89,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     sequence too. The bootstrap is read positionally - `recv_tagged` checks the tag of the
 	//     NEXT message rather than searching for it - so anything inserted in the middle shifts
 	//     every read after it and stops the boot chain where it stands.
+	//
+	//     A BLOCKING RECEIVE, as every read of a positional sequence has to be: a read that answers
+	//     at once on an empty queue leaves a message that arrives after it for the NEXT read.
 	let mut console_caps: [u64; MAX_MESSAGE_CAPS] = [0; MAX_MESSAGE_CAPS];
-	let console_cap_count: usize = match recv_message_caps(bootstrap, &mut buf, &mut console_caps) {
-		(len, count) if len >= 11 && &buf[..11] == b"CONSOLECAPS" => count,
+	let console_cap_count: usize = match recv_caps_blocking(bootstrap, &mut buf) {
+		ReceivedCaps::Message { len, handles } if len >= 11 && &buf[..11] == b"CONSOLECAPS" => {
+			let count = handles.len().min(MAX_MESSAGE_CAPS);
+			console_caps[..count].copy_from_slice(&handles.as_slice()[..count]);
+			count
+		}
 		_ => 0,
 	};
 
@@ -214,7 +221,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// harmless while this was the last message and stopped being harmless the moment one was
 		// added after it. An empty CONSOLECAPS is what "the boot granted none" looks like on the
 		// wire, and every reader downstream already treats a zero capability as not granted.
-		send_caps(sm_side, b"CONSOLECAPS", &console_caps[..console_cap_count]);
+		//
+		// AND SENT, with the blocking discipline of every other send here: `send_caps` refuses an
+		// empty list and answers a full queue without waiting, and its answer was not read - so the
+		// promise above held only while there were capabilities and room for them.
+		send_caps_blocking(sm_side, b"CONSOLECAPS", &console_caps[..console_cap_count]);
 		// The boot window, last, in the position it arrived in.
 		let mut window_msg: [u8; 7 + 16] = [0u8; 7 + 16];
 		window_msg[..7].copy_from_slice(b"BOOTWIN");
