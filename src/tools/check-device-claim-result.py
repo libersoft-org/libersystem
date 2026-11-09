@@ -194,7 +194,9 @@ def fixture(source):
     # THE ANCHORS LOST THEIR `unsafe` WITH THE SOURCE (P02M0178 removed propagated unsafe from the
     # runtime wrappers), and the two guards below lost a tab with the block that wrapped them. What
     # each names is unchanged. `start_candidate` is still unsafe and still spelled that way.
-    functions = ['impl driver_binding::Closes for Syscalls', 'fn give_up_retryable(', 'fn give_up_with_budget(', 'fn resolve_teardown(', 'fn observe_claim(', 'fn observe_claim_snapshot(', 'fn bind_start_of(', 'fn may_try_again(', 'unsafe fn start_candidate(', 'fn decide_policy(']
+    # `resolve_teardown` SAYS HOW MUCH OF ITS CHAIN'S WINDOW IS LEFT when it restarts a driver, in the program's own
+    # `decimal` - taken with it, so the line the fixture prints is the one the program prints.
+    functions = ['impl driver_binding::Closes for Syscalls', 'fn give_up_retryable(', 'fn give_up_with_budget(', 'fn resolve_teardown(', 'fn decimal(', 'fn observe_claim(', 'fn observe_claim_snapshot(', 'fn bind_start_of(', 'fn may_try_again(', 'unsafe fn start_candidate(', 'fn decide_policy(']
     methods = ['fn new(index: u64, info:', 'fn has_bind_allowance(', 'fn admit_bind_attempt(', 'fn refund_unclaimed_attempt(', 'fn claim_admitted(']
     begin = source.index('let mut txn = Attempt::new();', source.index('fn begin_bind('))
     end = source.index('let (dm_side, driver_side):', begin)

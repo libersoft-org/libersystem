@@ -172,7 +172,7 @@ PROFILES = {
 # `caps less`: the 15 V offer and above withdrawn.
 LESS = [fixed(5000, 3000), fixed(9000, 3000)]
 # The scripts `script NAME` arms for the next step they apply to.
-SCRIPTS = ('wait', 'reject', 'no-answer', 'no-ps-rdy', 'overshoot', 'vbus-stays-off', 'detach-mid', 'no-caps')
+SCRIPTS = ('wait', 'reject', 'no-answer', 'no-ps-rdy', 'overshoot', 'vbus-stays-off', 'detach-mid', 'no-caps', 'back-on-cc-read')
 
 
 class Scheduler:
@@ -367,7 +367,10 @@ class Tcpc:
         view = self.register_bytes()
         if self.pointer == POWER_STATUS and self.initialising:
             self.initialising -= 1
-        return bytes(view[(self.pointer + at) & 0x7F] for at in range(length))
+        answer = bytes(view[(self.pointer + at) & 0x7F] for at in range(length))
+        if self.pointer <= CC_STATUS < self.pointer + length and self.partner:
+            self.partner.cc_read()
+        return answer
 
     def write(self, data, combined=False):
         if not data:
@@ -549,6 +552,15 @@ class Source:
         self.set_vbus(0)
         if was and not quiet:
             self.say('detached')
+
+    def cc_read(self):
+        """THE SINK HAS JUST READ CC_STATUS. Armed with `back-on-cc-read`, a partner that is unplugged is plugged back in
+        now - after the read and before whatever the sink does next with its alert, which is where a sink that clears
+        the alert last loses the change: the bit this raises is the one its clear takes away."""
+        if 'back-on-cc-read' in self.scripts and not self.cc_attached and self.profile:
+            self.scripts.discard('back-on-cc-read')
+            self.say(f'plugged back in as {self.profile} the moment the sink read CC')
+            self.attach(self.profile)
 
     def rd_changed(self, present):
         """The sink's Rd came or went - error recovery opens CC."""

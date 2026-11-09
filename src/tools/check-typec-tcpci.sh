@@ -402,6 +402,23 @@ probe source 1 offline >/dev/null
 no_violations
 echo "typec-tcpci: $case_name: detached in the middle of a negotiation, the supply offline"
 
+# BACK BEFORE THE ALERT WAS CLEARED. The partner goes and comes back the moment the sink reads CC for its going: a
+# change after the sink's read and before its clear of the alert, which a sink that clears the alert last loses - and
+# then waits unattached for an alert nothing raises again. Met by chance in a sealed run on aarch64 (2026-11-08), at the
+# hand-over from `vbus-stays-off` to `detach-mid`: the sink detached on its own, and the gate's detach and next attach
+# came 24 ms apart. The detach is awaited before the contract, so the contract judged is the one made after it.
+case_name="back-mid-service"
+attach charger31
+contracted 15000
+detached_before=$(seen ": detached")
+tcpc_ok script back-on-cc-read >/dev/null
+tcpc_ok detach >/dev/null
+await_line ": detached" "the sink must see its partner go" "$detached_before" 20
+grep -a -q -F "plugged back in as charger31 the moment the sink read CC" "$fixture/tcpc.log" || fail "$case_name: the partner was not plugged back in as the sink read CC - the case did not happen"
+contracted 15000
+no_violations
+echo "typec-tcpci: $case_name: unplugged and back while the sink serviced its alert - seen, and the contract made anew"
+
 # ------------------------------------------------------------------ the other partners
 
 case_name="charger20"

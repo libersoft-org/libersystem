@@ -60,7 +60,8 @@ impl Offers { fn push(&mut self, _: u16, _: u16, _: &[u8], _: u64) -> bool { pan
 fn decimal(value: u64, out: &mut [u8; 20]) -> usize { let text = value.to_string(); let bytes = text.as_bytes(); out[..bytes.len()].copy_from_slice(bytes); bytes.len() }
 struct Binding { channel: u64 }
 struct Incident { teardown_reserve: u64 }
-impl Incident { fn open() -> Self { Self { teardown_reserve: 20 } } }
+// An incident opens for a chain - a bring-up or a recovery - as the manager's does; the fixture's window is fixed.
+impl Incident { fn open(_: driver_binding::Chain) -> Self { Self { teardown_reserve: 20 } } }
 struct Teardown { intent: StopIntent, landed: Option<BindingState>, retrying: bool }
 struct Entry { requires: &'static [u16], provides: &'static [(u16, u16, u16)] }
 static PROVIDER: Entry = Entry { requires: &[], provides: &[(1, 0, 1)] };
@@ -88,7 +89,7 @@ impl Node {
         let mut record = BindingRecord::new(); assert!(record.move_to(BindingState::Binding, None));
         Self { record, id: BindingId::new(0, channel as u8, 0, 1), binding: Some(Binding { channel }), teardown: None,
             stop_intent: StopIntent::Fault, stop_deadline: 0, ready_deadline: 100, queue: BindingQueue::new(),
-            last_opcode: 0, last_frame_at: 0, beat: Heartbeat::default(), offers: Offers, incident: Incident::open(),
+            last_opcode: 0, last_frame_at: 0, beat: Heartbeat::default(), offers: Offers, incident: Incident::open(driver_binding::Chain::BringUp),
             candidates: vec![entry], candidate: 0, running: Some(0), preferred: None,
             disabled_by_policy: false, retry_pending: false, restart_requested: false, retry_once: false,
             retry_at: 0, selection_pending: false, bind_at: 0, ended_at: 0,
