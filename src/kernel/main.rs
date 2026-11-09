@@ -1144,6 +1144,8 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		// it - so this is the boot log and the backpressure relief in one loop.
 		let mut listening = false;
 		let mut gone = false;
+		// WHETHER THE CHAIN SAID ANYTHING AT ALL in this window - see the silent-window dump below.
+		let mut heard = false;
 		loop {
 			// BOUNDED, and bounded by a SLICE rather than by the window.
 			//
@@ -1161,6 +1163,7 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 			// programs its device, so it is where a fault first arrives.
 			drive_slice(settle_slice(deadline));
 			while let Ok(message) = reports.recv() {
+				heard = true;
 				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
 			}
 			if console_input::shell_listening() {
@@ -1195,6 +1198,22 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 			continue;
 		}
 		serial_println!("recovery: no interactive shell within this target's boot window of {} tick(s)", window_ticks);
+		// A CHAIN THAT NEVER SPOKE IS ITS OWN CASE, and the only evidence of it is what was parked.
+		//
+		// A window that closes without a shell is common and mostly harmless: a CD-ROM volume, a
+		// console that attaches late, a loaded host - and in every one of those the chain has said
+		// plenty, starting with the log service. A window in which it said NOTHING is a boot that
+		// stopped before its first service, and on 2026-11-08 one did - the only one in every boot
+		// log kept - on an aarch64 guest that sixty-one targeted boots afterwards could not stop
+		// again. Its log had nothing after the kernel's own lines, so nothing could be said about
+		// where it stopped.
+		//
+		// So the scheduler's list of parked threads, with their processes' names, is printed HERE
+		// and only here: no other boot changes, and the next one that stops this way says where.
+		if !heard {
+			serial_println!("recovery: and the chain reported nothing in the whole window - what every parked thread waits on:");
+			sched::dump_blocked("the boot chain was silent for its whole window");
+		}
 		// A LIVE CONTROL PLANE IS NOT A FAILED BOOT, and treating it as one reboots a working
 		// machine.
 		//

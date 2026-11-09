@@ -167,6 +167,21 @@ impl ObjectHeader {
 		f(guard.as_deref())
 	}
 
+	// This object's label copied into `out`, answering the length copied - or None when the label's
+	// lock is held, which is not waited for.
+	//
+	// FOR A READER UNDER ANOTHER LOCK. `with_name` waits, and its callers print under it; a reader
+	// holding a scheduler lock that then waited for this one would be the second half of a lock
+	// order nobody wrote down. A label that cannot be had at once is reported as such, and the
+	// reader goes on without it. Cut at `out`'s length.
+	pub fn try_copy_name(&self, out: &mut [u8]) -> Option<usize> {
+		let guard = self.name.try_lock()?;
+		let bytes = guard.as_deref().unwrap_or("").as_bytes();
+		let len = bytes.len().min(out.len());
+		out[..len].copy_from_slice(&bytes[..len]);
+		Some(len)
+	}
+
 	// Current revocation generation. Capabilities snapshot this at mint time and
 	// lookup compares, so a single bump invalidates every existing capability.
 	pub fn generation(&self) -> u32 {

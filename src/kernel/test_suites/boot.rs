@@ -936,6 +936,55 @@ fn system_manager_recovery_survives_a_clean_start() {
 	assert_eq!(attempts, 4, "an ending is a failed attempt, so the ladder runs out rather than stopping at the first");
 }
 
+tagged_test!(a_silent_boot_window_lists_what_every_parked_thread_waits_on, [Process], id = "kernel.boot.a_silent_boot_window_lists_what_every_parked_thread_waits_on", covers = ["kernel"]);
+fn a_silent_boot_window_lists_what_every_parked_thread_waits_on() {
+	// A WINDOW THAT CLOSES WITHOUT A SHELL AND WITHOUT A WORD from the chain prints the scheduler's
+	// parked threads; one that heard even a single report does not. Both run against a manager that
+	// stays up, with no shell listening, so the round ends on the window and is "up without an
+	// attached shell" either way - the dump is the only difference, and it is what is asserted.
+	use object::KernelObject;
+	extern "C" fn resident_body(_arg: u64) {
+		// Parked on its own process koid until `terminate` wakes it - see the clean-start test.
+		let Some(thread) = sched::current_thread() else { return };
+		let process = thread.process().clone();
+		let koid = process.header().koid();
+		while !process.is_terminated() {
+			sched::block_on(koid, sched::NO_DEADLINE);
+		}
+	}
+	let (crash_tx, crash_rx) = object::channel::Channel::create();
+	fault::set_crash_notify(crash_tx);
+	// A CONSOLE WHOSE OTHER END IS GONE: registered, and not listening, so no round ends on a shell.
+	let (console_far, console_near) = object::channel::Channel::create();
+	console_input::attach(console_far);
+	drop(console_near);
+	assert!(!console_input::shell_listening(), "the stand-in console must not count as a shell");
+	for says in [None, Some(&b"log_service online"[..])] {
+		let mut resident: Option<alloc::sync::Arc<object::process::Process>> = None;
+		let before = sched::blocked_dumps();
+		let up = supervise(&crash_rx, 3, 8, |_, _| {
+			let process = sched::spawn(resident_body, 0).process().clone();
+			resident = Some(process.clone());
+			let (reports, peer) = object::channel::Channel::create();
+			if let Some(report) = says {
+				peer.send(object::channel::Message::new(report.to_vec(), alloc::vec::Vec::new())).expect("the stand-in's report should queue");
+			}
+			Some((reports, process))
+		});
+		let dumps = sched::blocked_dumps() - before;
+		if let Some(process) = resident.take() {
+			process.terminate();
+		}
+		sched::run_until_idle();
+		assert!(up, "a manager still running when the window closes is a system up without an attached shell");
+		match says {
+			None => assert_eq!(dumps, 1, "a window in which the chain said nothing must list what every parked thread waits on, once"),
+			Some(_) => assert_eq!(dumps, 0, "a chain that reported anything is not silent, and its boot must not carry the dump"),
+		}
+	}
+	fault::clear_crash_notify();
+}
+
 tagged_test!(embedded_root_still_classifies_block_providers, [Boot, Storage], id = "kernel.boot.embedded_root_still_classifies_block_providers", covers = ["bin.storage_service", "liberfs"]);
 fn embedded_root_still_classifies_block_providers() {
 	let package = pkg::Package::parse(init_package_bytes().expect("init package present")).expect("init package parses");

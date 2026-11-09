@@ -136,10 +136,6 @@ fn check_unread() {
 	// the boot log it is meant to be read in.
 	if !UNREAD_SAID.swap(true, core::sync::atomic::Ordering::AcqRel) {
 		crate::serial_println!("platform: event {kind} reached its listener and NOBODY READ IT - {queued} message(s) still queued {UNREAD_TICKS} tick(s) later, so the button works and its consumer does not");
-		// NOT IN THE TEST KERNEL, WHICH DOES NOT CARRY IT. `dump_blocked` is `cfg(not(test))` because
-		// its one other caller is the panic handler the test build replaces - and a symbol a second
-		// compilation does not have turns this line into a build failure of the whole test kernel.
-		#[cfg(not(test))]
 		crate::sched::dump_blocked("a platform event nobody read");
 	}
 }

@@ -1159,9 +1159,6 @@ fn enqueue(thread: Arc<Thread>, cause: u8) {
 // integer).
 static IDLE_HOOK: AtomicU64 = AtomicU64::new(0);
 
-// Register the idle hook the BSP runs while spinning for the next deadline.
-// Called from the panic handler, which the test build replaces with its own.
-#[cfg(not(test))]
 // EVERY BLOCKED THREAD AND WHAT IT IS WAITING FOR, on the serial line.
 //
 // The scheduler knows this and nothing could ask it. When a thread does not come back, the only
@@ -1176,16 +1173,27 @@ static IDLE_HOOK: AtomicU64 = AtomicU64::new(0);
 //
 // Locks are taken one bucket at a time and released before printing, because the serial write is
 // slow and a bucket lock is on the wake path.
+//
+// AND EACH PROCESS IS NAMED, not only numbered (2026-11-09). A koid says which process; nothing in
+// a log that stopped early says which koid was which, so a dump taken where it is needed most - a
+// boot whose chain never spoke - was a list of numbers to be matched against a run that had not
+// printed them. The name is copied under the bucket lock with a TRIED lock of its own: the name's
+// lock is taken elsewhere around serial output, and waiting for it here would be one more lock
+// order for a wake to deadlock against. A name that is busy is printed as `?`.
+//
+// IN BOTH BUILDS. It was `cfg(not(test))` while its one caller was the panic handler the test build
+// replaces; `supervise` calls it now, and the test kernel runs `supervise`.
 pub fn dump_blocked(reason: &str) {
+	BLOCKED_DUMPS.fetch_add(1, Ordering::Relaxed);
 	crate::serial_println!("sched: blocked threads ({reason}):");
 	let mut total = 0usize;
 	for bucket in WAIT_BUCKETS.iter() {
 		// Copied out under the lock, printed after it: a serial write with a wake-path lock held
 		// would be a stall every core could see.
-		// ALLOC-OK: a diagnostic, called by hand from a test or a debug path.
-		let entries: Vec<(u64, u64, u64, ThreadState)> = bucket.lock().iter().map(|w| (w.thread.header().koid(), w.koid, w.thread.process().header().koid(), w.thread.state())).collect();
-		for (thread, waits_on, process, state) in entries {
-			crate::serial_println!("sched:   thread {thread} of process {process} waits on koid {waits_on} ({state:?})");
+		// ALLOC-OK: a diagnostic - a test, a debug path, a panic, or a boot whose chain never spoke.
+		let entries: Vec<(u64, u64, u64, ProcessLabel, ThreadState)> = bucket.lock().iter().map(|w| (w.thread.header().koid(), w.koid, w.thread.process().header().koid(), ProcessLabel::of(&w.thread), w.thread.state())).collect();
+		for (thread, waits_on, process, label, state) in entries {
+			crate::serial_println!("sched:   thread {thread} of process {process} ({}) waits on koid {waits_on} ({state:?})", label.as_str());
 			total += 1;
 		}
 	}
@@ -1193,9 +1201,9 @@ pub fn dump_blocked(reason: &str) {
 	// whichever comes first - so it is named twice on purpose rather than deduplicated into a
 	// half-truth.
 	// ALLOC-OK: as above.
-	let timed: Vec<(u64, u64, u64, bool)> = TIMED_WAITERS.lock().iter().map(|w| (w.thread.header().koid(), w.thread.process().header().koid(), w.deadline, w.periodic)).collect();
-	for (thread, process, deadline, periodic) in timed {
-		crate::serial_println!("sched:   thread {thread} of process {process} waits until tick {deadline}{}", if periodic { " (periodic)" } else { "" });
+	let timed: Vec<(u64, u64, ProcessLabel, u64, bool)> = TIMED_WAITERS.lock().iter().map(|w| (w.thread.header().koid(), w.thread.process().header().koid(), ProcessLabel::of(&w.thread), w.deadline, w.periodic)).collect();
+	for (thread, process, label, deadline, periodic) in timed {
+		crate::serial_println!("sched:   thread {thread} of process {process} ({}) waits until tick {deadline}{}", label.as_str(), if periodic { " (periodic)" } else { "" });
 		total += 1;
 	}
 	if total == 0 {
@@ -1203,6 +1211,49 @@ pub fn dump_blocked(reason: &str) {
 	}
 }
 
+// How many times `dump_blocked` has run. Read by the test that asks whether a boot window that
+// heard nothing from its chain says what the chain is waiting on.
+static BLOCKED_DUMPS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub fn blocked_dumps() -> u64 {
+	BLOCKED_DUMPS.load(Ordering::Relaxed)
+}
+
+// A process's label, copied by value so it can leave the lock it was read under.
+struct ProcessLabel {
+	bytes: [u8; 32],
+	len: usize,
+	busy: bool,
+}
+
+impl ProcessLabel {
+	fn of(thread: &Thread) -> Self {
+		let mut bytes = [0u8; 32];
+		match thread.process().header().try_copy_name(&mut bytes) {
+			Some(len) => Self { bytes, len, busy: false },
+			None => Self { bytes, len: 0, busy: true },
+		}
+	}
+
+	fn as_str(&self) -> &str {
+		if self.busy {
+			return "?";
+		}
+		if self.len == 0 {
+			return "unnamed";
+		}
+		// A label cut at the buffer's end can end inside a character; what came before it is kept.
+		let bytes = &self.bytes[..self.len];
+		match core::str::from_utf8(bytes) {
+			Ok(text) => text,
+			Err(error) => core::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or("?"),
+		}
+	}
+}
+
+// Register the idle hook the BSP runs while spinning for the next deadline.
+// Called from the panic handler, which the test build replaces with its own.
 #[cfg(not(test))]
 pub fn set_idle_hook(hook: fn()) {
 	IDLE_HOOK.store(hook as usize as u64, Ordering::Release);
