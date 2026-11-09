@@ -333,13 +333,25 @@ impl Port {
 
 	// ------------------------------------------------------------------ the alert
 
-	// EVERY ALERT PENDING: its registers read and a received message taken, the bits cleared, and only then the engine
+	// EVERY ALERT PENDING: its bits cleared, its registers read and a received message taken, and only then the engine
 	// told - the connection first, then transmissions, then what was received, then the alarms.
+	//
+	// CLEARED BEFORE ITS STATUS IS READ, all but the receive's (2026-11-08). A bit is raised when its status changes, and
+	// one cleared after the read also cleared a change that came between the read and the clear: a partner that went
+	// and came back inside one service left CC_STATUS's bit cleared over the open CC this had read, and the engine
+	// waited unattached for an alert nothing would raise again - the source's capabilities went unacknowledged and no
+	// contract was made. Cleared first, a change after the read raises the bit anew and the next round reads it. The
+	// receive's bit is cleared once its message is taken: clearing it is what hands the buffer to the next message. The
+	// overflow bit stays with it, cleared after the message as it always was - it says something of the same buffer.
 	fn service(&mut self) {
 		for _ in 0..ALERT_ROUNDS {
 			let alert = self.read16(tcpci::ALERT) & tcpci::ALERT_ALL;
 			if alert == 0 {
 				return;
+			}
+			let receive = if alert & tcpci::ALERT_RX_STATUS != 0 { alert & (tcpci::ALERT_RX_STATUS | tcpci::ALERT_RX_OVERFLOW) } else { 0 };
+			if alert & !receive != 0 {
+				self.write16(tcpci::ALERT, alert & !receive);
 			}
 			let mut events = Vec::new();
 			if alert & tcpci::ALERT_CC_STATUS != 0 {
@@ -367,6 +379,7 @@ impl Port {
 			if alert & tcpci::ALERT_RX_STATUS != 0 {
 				let mut buffer = [0u8; RECEIVE_BYTES];
 				self.read(tcpci::RECEIVE_BUFFER, &mut buffer);
+				self.write16(tcpci::ALERT, receive);
 				match tcpci::received(&buffer).map(message::decode) {
 					Some(Ok(message)) => events.push(Event::Received(message)),
 					Some(Err(refusal)) => {
@@ -388,7 +401,6 @@ impl Port {
 			if alarm != 0 {
 				events.push(Event::Alarm);
 			}
-			self.write16(tcpci::ALERT, alert);
 			for event in events {
 				// AN ALARM IS ANSWERED FIRST - the sink path off - and said after, where it meant something: to an attached
 				// port, after this alert's connection changes.
