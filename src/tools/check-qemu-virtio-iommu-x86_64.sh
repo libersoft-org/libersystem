@@ -80,18 +80,11 @@ done
 # fallback bootstrap set, `product.conf` and the builders - and records the key each published image
 # was built from beside it. This asks the builder for today's key and compares the two.
 # THE IMAGE THIS RUN PRODUCED, when a run is collecting evidence; the tree's own otherwise. The
-# receipts travel with the stored artifact, so the freshness check below reads the run's copy.
+# receipts travel with the stored artifact, so the checks below read the run's copy.
 ISO="$(evidence_image libersystem.iso)" || fail "no libersystem.iso produced by this run"
 [[ -f "$ISO" ]] || fail "no $ISO - run ./image.sh --format iso, which is what the ordinary-traffic half boots"
 echo "qemu-virtio-iommu: medium $ISO sha256=$(sha256sum "$ISO" | cut -d' ' -f1)"
 [[ -f "$ISO.build-key" ]] || fail "$ISO carries no build receipt, so nothing about it can be checked - rebuild it:  ./image.sh --format iso"
-KERNEL_ELF="$BUILD_ROOT/cargo/kernel/x86_64-unknown-none/debug/kernel"
-[[ -f "$KERNEL_ELF" ]] || fail "no built kernel at $KERNEL_ELF, so this gate cannot tell whether $ISO carries this tree - build first:  ./build.sh --arch x86_64"
-# `$HERE`, not `dirname "$0"`: this script has already `cd`-ed to the repository root. stderr is kept
-# because a builder that cannot answer has a reason, and swallowing it turns a diagnosable refusal
-# into a blank one.
-current_key="$(LIBER_IMAGE_PRINT_KEY=1 "$HERE/../harness/mkimage.sh" iso "$KERNEL_ELF" || true)"
-[[ -n "$current_key" ]] || fail "the image builder could not compute this tree's image key - build first:  ./build.sh --arch x86_64"
 # AND THE BYTES, NOT ONLY THE KEY THEY WERE BUILT FROM.
 #
 # The key describes the INPUTS. `mkimage.sh` records `$ISO.build-digest` separately, and verifies it
@@ -111,14 +104,42 @@ if [[ -f "$ISO.build-digest" ]]; then
 else
 	fail "$ISO carries no build digest, so its bytes cannot be checked - rebuild it:  ./image.sh --format iso"
 fi
-if [[ "$current_key" != "$(<"$ISO.build-key")" ]]; then
-	echo "qemu-virtio-iommu: $ISO was not built from this tree" >&2
-	echo "qemu-virtio-iommu:   the image was built from $(<"$ISO.build-key")" >&2
-	echo "qemu-virtio-iommu:   this tree computes     $current_key" >&2
-	echo "qemu-virtio-iommu:   rebuild the image from this tree:  ./image.sh --format iso" >&2
-	exit 1
+# INSIDE A RUN THE IMAGE IS THE RUN'S, AND THE STAGING IS NOT THE TREE (2026-11-10).
+#
+# The key below is computed over the STAGED artifacts - the kernel ELF, the bootable volume and its
+# pairing - and inside a run those are shared with every other step, which rebuild them on purpose:
+# the runner brings the staging to each step's declared profile and DMA mode, and gates such as
+# `build-order` rebuild the bootable volume themselves. None of those rebuilds is the image's: the
+# producer's `./image.sh` puts a STRIPPED kernel on the volume and `./build.sh` an unstripped one, the
+# volume's identity is derived from what it holds, and so after any one of them no build of this tree
+# computes the image's key again. A sealed run met it on 2026-11-09, when `build-order` ran after
+# the producer for the first time and this gate refused an image the run had built a few minutes
+# before. What answers "is this the tree's image" inside a run is the run: the image is the artifact
+# its own producer stored from the run's sources - `evidence_image` refuses any other - and its
+# bytes are the ones recorded, checked above. So inside a run the live staging is not compared, and
+# the default-machine phase boots that same artifact (`--image`) rather than `.build/boot`'s. Outside
+# a run, where the medium is whatever the last `./image.sh` left, the comparison is the check.
+default_image=()
+if evidence_active; then
+	echo "qemu-virtio-iommu: the shipping image is this run's own ($(<"$ISO.build-key")), stored by its producer - the run's staging, which its other steps rebuild, is not compared"
+	default_image=(--image "$ISO")
+else
+	KERNEL_ELF="$BUILD_ROOT/cargo/kernel/x86_64-unknown-none/debug/kernel"
+	[[ -f "$KERNEL_ELF" ]] || fail "no built kernel at $KERNEL_ELF, so this gate cannot tell whether $ISO carries this tree - build first:  ./build.sh --arch x86_64"
+	# `$HERE`, not `dirname "$0"`: this script has already `cd`-ed to the repository root. stderr is kept
+	# because a builder that cannot answer has a reason, and swallowing it turns a diagnosable refusal
+	# into a blank one.
+	current_key="$(LIBER_IMAGE_PRINT_KEY=1 "$HERE/../harness/mkimage.sh" iso "$KERNEL_ELF" || true)"
+	[[ -n "$current_key" ]] || fail "the image builder could not compute this tree's image key - build first:  ./build.sh --arch x86_64"
+	if [[ "$current_key" != "$(<"$ISO.build-key")" ]]; then
+		echo "qemu-virtio-iommu: $ISO was not built from this tree" >&2
+		echo "qemu-virtio-iommu:   the image was built from $(<"$ISO.build-key")" >&2
+		echo "qemu-virtio-iommu:   this tree computes     $current_key" >&2
+		echo "qemu-virtio-iommu:   rebuild the image from this tree:  ./image.sh --format iso" >&2
+		exit 1
+	fi
+	echo "qemu-virtio-iommu: the shipping image was built from this tree ($current_key)"
 fi
-echo "qemu-virtio-iommu: the shipping image was built from this tree ($current_key)"
 
 work="$(mktemp -d)"
 trap 'evidence_keep_gate "$work"/*.log; rm -rf "$work"' EXIT
@@ -311,7 +332,7 @@ echo "qemu-virtio-iommu:   the system volume was read through virtio-blk at $blk
 #    developer does, with no flags, and asks the boot what machine it is.
 echo "qemu-virtio-iommu: booting the DEFAULT machine, the way an ordinary run does"
 default_log="$work/default.log"
-src/tools/guest-verdict.py iommu-default "$default_log" -- ./run.sh --smp 4 --serial "file:$default_log"
+src/tools/guest-verdict.py iommu-default "$default_log" -- ./run.sh --smp 4 "${default_image[@]}" --serial "file:$default_log"
 [[ -s "$default_log" ]] || fail "the default run produced no serial output"
 # AND IT DID NOT DIE AFTER SAYING SO.
 #

@@ -1054,7 +1054,10 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 
 	// THE GRAPHICAL STREAM SNAPSHOTS ON THE VALID PROOF, and releases on focus loss.
 	let focused = call(&service_client, 4, 62, Some(proof), &mut pump).expect("the focus owner's proof opens the gamepad stream");
-	let snapshot = events(&focused);
+	// SETTLED, LIKE THE CONSOLE STREAM'S OPENING ABOVE (2026-11-10). The service answers with the stream first and writes
+	// its snapshot after: read at once, on a target where the service runs on another core, the stream can still be
+	// empty - which a sealed riscv64 run met.
+	let snapshot = settled(&focused, 2, &mut pump);
 	assert!(matches!(snapshot.first(), Some(GamepadEvent::Present(pad)) if pad.id == a2), "{snapshot:?}");
 	assert_eq!(snapshot.iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 1, alloc::vec![8])], "at the gamepad's current state");
 	focus_display.send(Message::new(b"CLEAR".to_vec(), alloc::vec::Vec::new())).expect("revoke focus");
@@ -1163,7 +1166,8 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	pump();
 	let _ = focus_display.recv();
 	let after_session = call(&service_client, 4, 69, Some(proof), &mut pump).expect("the graphical stream opens again once the session is over");
-	let snapshot = events(&after_session);
+	// Settled as well, for the reason the first graphical stream's snapshot is.
+	let snapshot = settled(&after_session, 2, &mut pump);
 	assert!(snapshot.iter().filter_map(state_of).any(|(id, buttons, _)| id == a2 && buttons == 1 << 7), "the state reported during the session was tracked: {snapshot:?}");
 	// AND ARMED AGAIN, THE GRAPHICAL STREAM CLOSES TOO.
 	key(0xe0, true);

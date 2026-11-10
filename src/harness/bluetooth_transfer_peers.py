@@ -189,6 +189,22 @@ class TransferPeer:
             self.peer.observe('opp-sent', **result)
             return result
         finally:
+            # THE PEER'S CLOSE REQUEST MAY ALSO CROSS OURS (2026-11-10). The guest closes L2CAP itself
+            # once it has answered the multiplexer's DISC, as BlueZ does. When that request arrives
+            # after ours has left, Bumble answers it and closes and removes the channel - and leaves
+            # the disconnect it is awaiting unresolved, because the guest's answer to OUR request then
+            # finds no channel and is dropped. The channel is closed either way; a close while our
+            # request is pending completes the wait, which otherwise lasts for ever.
+            channel = client.l2cap_channel
+
+            def crossed_close():
+                pending = channel.disconnection_result
+                if pending is not None and not pending.done():
+                    pending.set_result(None)
+                    channel.disconnection_result = None
+
+            if channel is not None:
+                channel.on(channel.EVENT_CLOSE, crossed_close)
             try:
                 await client.shutdown()
             except core.InvalidStateError:
@@ -199,6 +215,9 @@ class TransferPeer:
                         or client.l2cap_channel.state != l2cap.ClassicChannel.State.CLOSED):
                     raise
                 client.l2cap_channel = None
+            finally:
+                if channel is not None:
+                    channel.remove_listener(channel.EVENT_CLOSE, crossed_close)
 
     async def pan_start(self):
         if self.network:

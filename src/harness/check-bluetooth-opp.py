@@ -30,7 +30,7 @@ async def exercise_send_cleanup(work):
     payload = bytes((index * 37 + 11) % 251 for index in range(963))
     expected = dict(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
     completed = []
-    for mode in ('closed-during-mux', 'open', 'exchange-error', 'obex-refusal',
+    for mode in ('closed-during-mux', 'open', 'crossed-close', 'exchange-error', 'obex-refusal',
                  'mux-error', 'waiting-channel', 'other-cleanup-error', 'open-invalid-state'):
         case = work / ('send-cleanup-' + mode)
         case.mkdir()
@@ -39,6 +39,7 @@ async def exercise_send_cleanup(work):
                     else RuntimeError(mode))
         loop = asyncio.get_running_loop()
         channels = []
+        removed = set()
 
         class Wire:
             def next_identifier(self, connection):
@@ -46,6 +47,7 @@ async def exercise_send_cleanup(work):
 
             def on_channel_closed(self, channel):
                 events.append(('closed', channels.index(channel)))
+                removed.add(channels.index(channel))
 
             def send_control_frame(self, connection, cid, frame):
                 assert cid == 1 and isinstance(frame, (l2cap.L2CAP_Disconnection_Request, l2cap.L2CAP_Disconnection_Response))
@@ -56,10 +58,26 @@ async def exercise_send_cleanup(work):
                     if mode == 'open-invalid-state':
                         channels[0]._change_state(l2cap.ClassicChannel.State.OPEN)
                         raise sentinel
-                target = channels[1 - connection.side]
-                handler = (target.on_disconnection_request if isinstance(frame, l2cap.L2CAP_Disconnection_Request)
-                           else target.on_disconnection_response)
-                loop.call_soon(handler, frame)
+                if (mode == 'crossed-close' and connection.side == 0
+                        and isinstance(frame, l2cap.L2CAP_Disconnection_Request)):
+                    # THE PEER'S OWN CLOSE REQUEST CROSSES THIS ONE (2026-11-10): it was sent after the
+                    # UA, but leaves before the peer has read the request now on the wire - as a loaded
+                    # guest's did in a sealed run.
+                    channels[1]._disconnect_sync()
+                target_side = 1 - connection.side
+
+                def deliver():
+                    # A FRAME FOR A CHANNEL ITS MANAGER HAS REMOVED IS DROPPED, as Bumble's
+                    # ChannelManager drops one whose CID it no longer finds.
+                    if target_side in removed:
+                        events.append(('dropped', [target_side, type(frame).__name__]))
+                        return
+                    target = channels[target_side]
+                    handler = (target.on_disconnection_request if isinstance(frame, l2cap.L2CAP_Disconnection_Request)
+                               else target.on_disconnection_response)
+                    handler(frame)
+
+                loop.call_soon(deliver)
 
             def send_pdu(self, connection, cid, data, fcs):
                 assert not fcs
@@ -143,12 +161,16 @@ async def exercise_send_cleanup(work):
             error=repr(error) if error else None, events=events, control_frames=requests,
             channel_states=[channel.state.name for channel in channels],
             multiplexer_cleared=client.multiplexer is None, channel_cleared=client.l2cap_channel is None), indent=2) + '\n')
-        if mode in ('closed-during-mux', 'open'):
+        if mode in ('closed-during-mux', 'open', 'crossed-close'):
             assert error is None and result == expected, (mode, result, repr(error))
             assert sent == [expected] and receiver.received == payload and receiver.opp_complete and receiver.received_name == 'cleanup.bin'
             assert client.multiplexer is None and client.l2cap_channel is None
             assert channels[0].state == channels[1].state == l2cap.ClassicChannel.State.CLOSED
-            assert ((0, 'L2CAP_Disconnection_Request') in requests) == (mode == 'open')
+            assert ((0, 'L2CAP_Disconnection_Request') in requests) == (mode in ('open', 'crossed-close'))
+            # The crossing happened: each side asked, and the answer to the peer's request was the one that could
+            # not be delivered.
+            assert ((1, 'L2CAP_Disconnection_Request') in requests) == (mode in ('closed-during-mux', 'crossed-close'))
+            assert any(event[0] == 'dropped' for event in events) == (mode == 'crossed-close'), events
         elif mode == 'obex-refusal':
             assert type(error) is ValueError and str(error) == 'OBEX refusal code 0xc3', repr(error)
             assert not sent and client.multiplexer is None and client.l2cap_channel is None
