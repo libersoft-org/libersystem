@@ -2848,3 +2848,141 @@ fn two_deliveries_at_once_hand_the_console_every_byte_once_and_in_order() {
 	drop(near);
 	assert!(!crate::console_input::shell_listening(), "the stand-in goes away with the test");
 }
+
+tagged_test!(a_program_is_never_given_memory_its_previous_owner_wrote, [Memory, Dma], id = "kernel.kernel.a_program_is_never_given_memory_its_previous_owner_wrote", covers = ["kernel"]);
+fn a_program_is_never_given_memory_its_previous_owner_wrote() {
+	use object::dma_buffer::DmaBuffer;
+	use object::domain::Domain;
+	use object::memory_object::MemoryObject;
+	// THE FRAMES A PROGRAM MAPS COME TO IT ZEROED (2026-11-10). Each case dirties frames with a pattern, gives them
+	// back, and asks for exactly the object a program would be given next - then requires that at least one frame
+	// really was reused (or the case proves nothing) and that none of them still holds the pattern. Before
+	// `frame::scrub`, a fresh memory object got all sixty-four dirtied frames back with the pattern in every one.
+	const PAGES: usize = 64;
+	const PATTERN: u8 = 0xAB;
+	let direct = mem::hhdm_offset();
+	let page = mem::frame::PAGE_SIZE as usize;
+	let dirty_page = |frame: u64| unsafe { core::ptr::write_bytes((direct + frame) as *mut u8, PATTERN, page) };
+	let residue = |frames: &[u64], dirtied: &[u64]| -> (usize, usize) {
+		let reused = frames.iter().filter(|frame| dirtied.contains(frame)).count();
+		let holding = frames.iter().filter(|&&frame| (0..page).any(|at| unsafe { core::ptr::read_volatile((direct + frame + at as u64) as *const u8) } == PATTERN)).count();
+		(reused, holding)
+	};
+	// Single frames, the way a memory object takes them.
+	let mut dirtied: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	for _ in 0..PAGES {
+		let frame = mem::frame::allocate().expect("a frame to dirty");
+		dirty_page(frame);
+		dirtied.push(frame);
+	}
+	for &frame in &dirtied {
+		// SAFETY: taken above, never mapped, given back once.
+		unsafe { mem::frame::deallocate(frame) };
+	}
+	let object = MemoryObject::create(PAGES * page).expect("a memory object");
+	let (reused, holding) = residue(object.frames(), &dirtied);
+	assert!(reused > 0, "the memory object reused none of the dirtied frames, so this case shows nothing");
+	assert_eq!(holding, 0, "a fresh memory object reused {reused} dirtied frame(s) and {holding} still hold the previous owner's bytes");
+	drop(object);
+	// A contiguous span, the way a DMA buffer takes one.
+	let base = mem::frame::allocate_contiguous(PAGES).expect("a span to dirty");
+	let span: alloc::vec::Vec<u64> = (0..PAGES as u64).map(|i| base + i * mem::frame::PAGE_SIZE).collect();
+	for &frame in &span {
+		dirty_page(frame);
+	}
+	for &frame in &span {
+		// SAFETY: taken above, never mapped, given back once.
+		unsafe { mem::frame::deallocate(frame) };
+	}
+	let domain = Domain::new(1 << 24, 8, 4);
+	let Ok(dma) = DmaBuffer::create_in(&domain, PAGES * page) else { panic!("a DMA buffer") };
+	let (reused, holding) = residue(dma.frames(), &span);
+	assert!(reused > 0, "the DMA buffer reused none of the dirtied span, so this case shows nothing");
+	assert_eq!(holding, 0, "a fresh DMA buffer reused {reused} dirtied frame(s) and {holding} still hold the previous owner's bytes");
+}
+
+// THE TARGET A RING-3 PROBE JUMPS TO: kernel text whose first instruction EL0 may not execute, so a fetch that is
+// allowed is told apart from one that is refused - an undefined instruction at EL0 against an instruction abort.
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(".section .text.kernel_text_el0_probe, \"ax\"", ".balign 4", ".global kernel_text_el0_probe", "kernel_text_el0_probe:", "mrs x0, tpidr_el1", "ret", ".previous");
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" {
+	fn kernel_text_el0_probe();
+}
+#[cfg(target_arch = "aarch64")]
+static KTEXT_GOT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+#[cfg(target_arch = "aarch64")]
+static KTEXT_KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static KTEXT_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static KTEXT_IP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static KTEXT_CODE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Kernel-thread body that drops to ring 3 running a program that branches to `target`: four moves building the
+// address in x16 and a `br x16`. Mirrors `user_nx_thread_body`.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn user_kernel_text_thread_body(target: u64) {
+	use core::sync::atomic::Ordering;
+	use mem::frame::{self, PAGE_SIZE};
+	let mut words: [u32; 5] = [0; 5];
+	for (hw, word) in words.iter_mut().take(4).enumerate() {
+		let imm16 = ((target >> (16 * hw)) & 0xFFFF) as u32;
+		let opcode: u32 = if hw == 0 { 0xD280_0000 } else { 0xF280_0000 };
+		*word = opcode | ((hw as u32) << 21) | (imm16 << 5) | 16;
+	}
+	words[4] = 0xD61F_0000 | (16 << 5);
+	let mut program = [0u8; 20];
+	for (at, word) in words.iter().enumerate() {
+		program[at * 4..at * 4 + 4].copy_from_slice(&word.to_le_bytes());
+	}
+	let code = frame::allocate().expect("user code frame");
+	let stack = frame::allocate().expect("user stack frame");
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	arch::paging::map_page(USER_CODE_VA, code, flags);
+	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
+	unsafe {
+		arch::paging::copy_to_user_page(USER_CODE_VA, &program);
+		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, 0);
+	}
+	let mut info = fault::FaultInfo { kind: 0, error_code: 0, address: 0, instruction_pointer: 0 };
+	let got = unsafe { arch::syscall::invoke(syscall::SYS_FAULT_INFO_GET, &mut info as *mut fault::FaultInfo as u64, core::mem::size_of::<fault::FaultInfo>() as u64, 0, 0) };
+	KTEXT_GOT.store(got as i64, Ordering::SeqCst);
+	KTEXT_KIND.store(info.kind, Ordering::SeqCst);
+	KTEXT_ADDR.store(info.address, Ordering::SeqCst);
+	KTEXT_IP.store(info.instruction_pointer, Ordering::SeqCst);
+	KTEXT_CODE.store(info.error_code, Ordering::SeqCst);
+	arch::paging::unmap_page(USER_CODE_VA);
+	arch::paging::unmap_page(USER_STACK_VA);
+	unsafe { frame::deallocate(code) };
+	unsafe { frame::deallocate(stack) };
+}
+
+tagged_test!(
+	#[cfg(target_arch = "aarch64")]
+	a_ring_three_branch_into_kernel_text_is_refused_at_its_target,
+	[Kernel, ArchAarch64],
+	id = "kernel.kernel.a_ring_three_branch_into_kernel_text_is_refused_at_its_target",
+	covers = ["kernel"]
+);
+#[cfg(target_arch = "aarch64")]
+fn a_ring_three_branch_into_kernel_text_is_refused_at_its_target() {
+	use core::sync::atomic::Ordering;
+	use object::domain::Domain;
+	// KERNEL TEXT IS NOT EXECUTABLE AT EL0 (2026-11-10). EL0's right to execute is UXN's alone, and the text blocks
+	// were mapped read-only without it - execute-only memory for every program. The probe branches to kernel text
+	// whose first instruction EL0 may not run: without UXN it is fetched and executed, and the process dies of an
+	// undefined instruction (ESR 0x02000000) at a kernel address - the signature a sealed run's service died of. With
+	// UXN the FETCH is refused, an instruction abort at the target itself.
+	let target = kernel_text_el0_probe as *const () as usize as u64;
+	let domain = Domain::new(1 << 20, 8, 4);
+	sched::spawn_in(domain.clone(), user_kernel_text_thread_body, target).expect("spawn the kernel-text probe thread");
+	sched::run_until_idle();
+	assert_eq!(KTEXT_GOT.load(Ordering::SeqCst), 1, "fault info should be recorded");
+	let (kind, address, ip, code) = (KTEXT_KIND.load(Ordering::SeqCst), KTEXT_ADDR.load(Ordering::SeqCst), KTEXT_IP.load(Ordering::SeqCst), KTEXT_CODE.load(Ordering::SeqCst));
+	assert_eq!(kind, fault::FAULT_PAGE, "ring 3 branched to kernel text at {target:#x} and was not refused the fetch: kind {kind}, ESR {code:#x}, pc {ip:#x}");
+	assert_eq!((address, ip), (target, target), "the refusal is the fetch of the target itself");
+	assert_eq!((code >> 26) & 0x3f, 0x20, "an instruction abort from a lower exception level: ESR {code:#x}");
+	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
+}

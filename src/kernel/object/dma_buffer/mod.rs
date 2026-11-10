@@ -261,6 +261,8 @@ impl DmaBuffer {
 			return Err(MemoryError::OutOfMemory);
 		}
 		frames.extend((0..pages as u64).map(|i| base + i * PAGE_SIZE));
+		// Zeroed before the driver or its device can reach it: see `frame::scrub`.
+		frame::scrub(&frames);
 
 		// THE TRANSLATION IS INSTALLED AND CONFIRMED BEFORE THE HANDLE EXISTS, which is the ordering
 		// the whole milestone turns on: a driver that has a handle has an address, and an address

@@ -46,6 +46,8 @@ impl MemoryObject {
 	pub fn create(size: usize) -> Option<Arc<Self>> {
 		let pages = frame::pages_for(size);
 		let frames = frame::allocate_pages(pages)?;
+		// Zeroed before anyone can map it: see `frame::scrub`.
+		frame::scrub(&frames);
 		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: None })
 	}
 
@@ -76,6 +78,8 @@ impl MemoryObject {
 				return Err(MemoryError::OutOfMemory);
 			}
 		};
+		// Zeroed before the program can map it: see `frame::scrub`.
+		frame::scrub(&frames);
 		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: Some(domain.clone()) }).ok_or(MemoryError::OutOfMemory)
 	}
 

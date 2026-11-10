@@ -1726,6 +1726,30 @@ pub unsafe fn deallocate(phys: u64) {
 	ALLOCATOR.lock().insert(phys, 1);
 }
 
+// EVERY FRAME A PROGRAM IS GIVEN IS ZEROED FIRST (2026-11-10).
+//
+// The allocator hands a frame back exactly as its last owner left it - another process's memory, a
+// kernel stack with its return addresses, a page of the kernel heap - and the memory objects and DMA
+// buffers a program maps were made of such frames as they came. Measured in place: sixty-four frames
+// filled with a pattern and freed came back in a fresh memory object, all sixty-four with the pattern
+// in them. That is every program able to read what any other, and the kernel, left behind; and a
+// program that trusts fresh memory to be empty - a ring's indices, a table not yet filled - reads it
+// as data. A sealed aarch64 run met a service running kernel code four instructions past a kernel
+// return address - the kind of value a freed kernel stack holds.
+//
+// So the frames are cleared where they become a program's, through the direct map, which covers
+// every frame the allocator hands out (plugged memory is mapped into it before it is offered). The
+// cost is one pass over each page at creation, which is what a program that had cleared it itself
+// would have paid.
+pub fn scrub(frames: &[u64]) {
+	let direct = super::hhdm_offset();
+	for &phys in frames {
+		// SAFETY: the caller has just taken `phys` from the allocator and owns it; nothing else
+		// maps or holds it, and the direct map translates it.
+		unsafe { core::ptr::write_bytes((direct + phys) as *mut u8, 0, PAGE_SIZE as usize) };
+	}
+}
+
 // The number of whole pages needed to hold `bytes` (at least one).
 pub fn pages_for(bytes: usize) -> usize {
 	bytes.div_ceil(PAGE_SIZE as usize).max(1)

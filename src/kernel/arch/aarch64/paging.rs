@@ -167,7 +167,8 @@ pub fn usable_region(ram_top: u64) -> (u64, u64) {
 // This replaces each of those blocks with a table of 2 MiB blocks and gives each block one of two
 // shapes:
 //
-//   [__boot_phys_end, __kernel_rx_end)   read-only, executable   - `.text`, `.rodata`, `.extable`
+//   [__boot_phys_end, __kernel_rx_end)   read-only, executable   - `.text`, `.rodata`, `.extable`;
+//                                        at EL1 only (UXN)
 //   everything else                      writable, execute-never - all other RAM, including the
 //                                                                  boot section that holds these
 //                                                                  very tables
@@ -234,7 +235,12 @@ pub fn harden_direct_map() {
 			let executable = block >= rx_start && block + TWO_MB <= rx_end;
 			let mut bits = VALID | AF | ATTR_NORMAL | SH_INNER | block;
 			if executable {
-				bits |= 1 << 7; // AP[2] - read-only at EL1
+				// AP[2] - read-only at EL1. AND NEVER EXECUTABLE AT EL0 (2026-11-10): EL0's right to execute
+				// is UXN's alone, whatever AP says about reading, so text with UXN clear is execute-only
+				// memory for every program - one that jumps into it runs the kernel's code at EL0. A sealed
+				// aarch64 run met a service doing exactly that, four instructions past a kernel return
+				// address, until an instruction EL0 may not run stopped it.
+				bits |= (1 << 7) | UXN;
 			} else {
 				bits |= PXN | UXN;
 			}
