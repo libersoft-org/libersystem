@@ -49,6 +49,9 @@ mod mem {
         pub fn allocate() -> Option<u64> { panic!("host fixture never creates hardware queues") }
         pub unsafe fn deallocate(_: u64) { panic!("the fixture's successful allocation is never rolled back") }
         pub unsafe fn retire(frames: &[u64]) { RETIRED.fetch_add(frames.len(), Ordering::SeqCst); }
+        // The fixture's frames are invented addresses with nothing behind them, so there is nothing to zero: that
+        // a buffer's frames are zeroed before it exists is the kernel suite's to prove, on real memory.
+        pub fn scrub(_: &[u64]) {}
         pub fn note_lost_pages(_: u64) {}
         pub fn lost_pages() -> u64 { 0 }
     }

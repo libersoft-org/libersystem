@@ -1271,6 +1271,13 @@ impl Catalog {
 			if gate == "qemu-virtio-iommu-x86_64" {
 				covers.push("bin.virtio_net".to_string());
 			}
+			// THE KERNEL CODE IT COMPILES ON A HOST: beside the DMA crate it names, its fixture copies the IOMMU's attach,
+			// queue and teardown and the DMA buffer's create and drop out of the kernel's sources and builds them against
+			// stubs (`check-iommu-completions.py`), so a kernel change - one the stubs no longer match among them - is a
+			// change this gate can catch.
+			if gate == "virtio-iommu-protocol" {
+				covers.push("kernel".to_string());
+			}
 			// THE DEMO IS THE SUBJECT AND THE STACK UNDER IT IS COVERED TOO: what the frames prove is
 			// the RASTERISER's antialiasing, the drawing API's blending and filtering and the frame
 			// loop's pacing, so a change to any of them is a change this gate can catch.
