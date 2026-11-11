@@ -61,12 +61,69 @@ if command -v systemd-run >/dev/null && systemd-run --quiet --scope -p MemoryMax
 	export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="systemd-run --quiet --scope -p MemoryMax=16G -p MemorySwapMax=0 --"
 fi
 
+# THE COMPILER'S OWN WORDS ARE KEPT, AND A COMPILE THAT DIED IS ASKED AGAIN WHERE NO DEAD COMPILE HAS BEEN.
+#
+# The compiler on this machine crashes now and then, and a crash prints no result line exactly as a mutation that does
+# not build does. Both were answered alike - one more attempt over the same target directory, with the compiler's
+# output thrown away - and in a sealed release run (2026-11-11) that attempt died as well: a ThinLTO thread of rustc
+# ended on SIGSEGV three seconds before the gate failed, over a mutation caught in the four sealed runs before it and
+# in a cold replay of the whole gate after it. A compile that dies part-way can leave the incremental state it was
+# writing such that the next compile over it faults too (`test-kernel.sh` met that in the kernel's), so a second
+# attempt over the same cache is not a second opinion. What each compile printed is kept now: one that ended because
+# the compiler died is run again in a target directory of its own, at most twice; one that did not build is answered
+# once more as before; and a gate that fails says what the last compile said.
+ERRORS="$WORK/.cargo-test.errors"
+RETRY_TARGET="$WORK/.retry-target"
+
+# Whether the last compile ended because the compiler failed rather than the code: on a signal, with the status a shell
+# gives a child that died on one (the wrapper runs the compiler as a child when cargo hands it a response file), or on
+# an internal compiler error - a known answer of rustc to an incremental state a dead compile left.
+compiler_died() {
+	grep -q "could not compile" "$ERRORS" &&
+		grep -qE '\((signal: [0-9]+|exit status: 1[3-5][0-9])|internal compiler error' "$ERRORS"
+}
+
+# What the last compile said, in one line: its first error, and how the compiler ended when it died.
+last_words() {
+	local error ended
+	error="$(grep -m1 -E '^error' "$ERRORS" || true)"
+	ended="$(grep -oE '\((signal: [^)]*|exit status: [0-9]+)\)' "$ERRORS" | tail -1 || true)"
+	printf '%s' "${error:-nothing on its error output}${ended:+ $ended}"
+}
+
+# `run_tests <manifest> [test]`: the crate's library tests, or the one named, and the result line they printed - an
+# empty line when there was none.
+run_tests() {
+	local manifest="$1" outcome="" attempt
+	local -a filter=() place=()
+	[[ -z "${2:-}" ]] || filter=("$2")
+	for attempt in 1 2 3; do
+		if ((attempt > 1)); then
+			[[ -z "$outcome" ]] || break
+			if compiler_died; then
+				place=(env "CARGO_TARGET_DIR=$RETRY_TARGET")
+			elif ((attempt == 2)); then
+				place=()
+			else
+				break
+			fi
+		fi
+		# `|| true` BECAUSE THE FAILURE IS THE POINT. This script runs under `set -e` and `pipefail`, and the command
+		# measured is one that MUST fail - so without this the shell kills the harness at the first successfully-planted
+		# defect, before it can record that the defect was caught. It did exactly that: the trace showed the mutation
+		# planted, the test failing, and the script ending there with no output at all.
+		outcome="$(cd "$WORK" && "${place[@]}" cargo test --quiet --manifest-path "$manifest" --lib "${filter[@]}" 2>"$ERRORS" | grep -E "^test result:" | tail -1 || true)"
+	done
+	printf '%s\n' "$outcome"
+}
+
 # The unmutated copy must PASS first. A copy that cannot pass is a gate whose every mutation "fails"
 # for a reason that has nothing to do with the mutation, which is the shape of a check that tests
 # nothing while reporting success.
-if ! (cd "$WORK" && cargo test --quiet --manifest-path "$DRIVERS" --lib >/dev/null 2>&1 && cargo test --quiet --manifest-path "$PROTOCOL" --lib >/dev/null 2>&1); then
-	fail "the unmutated copy does not pass its own tests - every mutation below would 'fail' for that reason instead"
-fi
+for manifest in "$DRIVERS" "$PROTOCOL"; do
+	[[ "$(run_tests "$manifest")" == *"test result: ok."* ]] ||
+		fail "the unmutated copy of $manifest does not pass its own tests - every mutation below would 'fail' for that reason instead: $(last_words)"
+done
 
 planted=0
 caught=0
@@ -112,17 +169,8 @@ PY
 	# no tests run, which is indistinguishable from a mutation that went uncaught unless the count is
 	# checked too.
 	local outcome
-	# `|| true` BECAUSE THE FAILURE IS THE POINT. This script runs under `set -e` and `pipefail`, and
-	# the command being measured is one that MUST fail - so without this the shell kills the harness
-	# at the first successfully-planted defect, before it can record that the defect was caught. It
-	# did exactly that: the trace showed the mutation planted, the test failing, and the script
-	# ending there with no output at all.
-	outcome="$(cd "$WORK" && cargo test --quiet --manifest-path "$manifest" --lib "$test" 2>/dev/null | grep -E "^test result:" | tail -1 || true)"
-	# NO RESULT LINE AT ALL IS ASKED ONCE MORE. The compiler on this machine crashes now and then, and a crash
-	# prints no result exactly as a mutation that does not build does; a second build tells the two apart.
-	if [[ -z "$outcome" ]]; then
-		outcome="$(cd "$WORK" && cargo test --quiet --manifest-path "$manifest" --lib "$test" 2>/dev/null | grep -E "^test result:" | tail -1 || true)"
-	fi
+	# NO RESULT LINE AT ALL IS ASKED AGAIN, and a compiler that died is asked where no dead compile has been (`run_tests`).
+	outcome="$(run_tests "$manifest" "$test")"
 	case "$outcome" in
 	*"0 passed; 0 failed"*)
 		restore "$file"
@@ -138,7 +186,7 @@ PY
 	*"FAILED."*) ;;
 	*)
 		restore "$file"
-		fail "$file did not build with this mutation, or $test ran nothing or was killed - a defect that does not compile is not one a test caught"
+		fail "$file did not build with this mutation, or $test ran nothing or was killed - a defect that does not compile is not one a test caught; the last compile said: $(last_words)"
 		;;
 	esac
 	caught=$((caught + 1))

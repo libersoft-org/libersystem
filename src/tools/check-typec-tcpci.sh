@@ -12,7 +12,8 @@
 #     malformed messages (an object count past the bytes, a reserved type, an extended message) not believed; Wait
 #     then Accept; Reject; a new Source_Capabilities with less power (a new request); a transition that overshoots and
 #     VBUS driven past the alarm during the 15 V contract (each: the sink path off before the Hard Reset, `source-fault`
-#     reported); a Hard Reset the partner sends, VBUS to vSafe0V and back (no detach, the contract made anew); no answer
+#     reported); a Hard Reset the partner sends, VBUS to vSafe0V and back (no detach, the contract made anew) - and the
+#     same read by the sink only with VBUS already gone (as a sink slower than tPSHardReset reads it); no answer
 #     to a Request (Hard Reset not before 24 ms, the hard-reset count kept through the reset); Accept without PS_RDY
 #     (Hard Reset not before 450 ms); a Hard Reset after which VBUS stays off (a detach once tSrcRecover and tSrcTurnOn
 #     have passed); a detach mid-negotiation;
@@ -124,6 +125,39 @@ await_line() {
 	fail "$case_name: $what (waited ${limit} s for a new line containing: $needle)"
 }
 
+# WHAT THE GUEST WAS DOING WHEN A PROBE WENT SILENT. A probe that printed no verdict - not even FAIL, which every
+# refusal and every deadline of its own prints - was stopped by something below it: the probe never ran on, the
+# development agent stopped relaying what it printed, or the machine stopped. A sealed release run met one on aarch64
+# (2026-11-11): launched, then not a word for ten minutes and nothing on the serial line, and the teardown took the
+# guest away with the answer. So before the teardown: whether the agent still answers, whether QEMU still runs the
+# machine or stopped it itself, and each core twice, five seconds apart, as QEMU's monitor sees it - halted or running,
+# and at which address, named in the kernel the guest booted where this instance keeps a copy of it. It changes no
+# verdict; it is kept as `guest-state.log`.
+guest_state() {
+	local out="$kept/guest-state.log" kernel="$state/kernel-$arch" round registers
+	local -a counters
+	{
+		echo "== the development agent"
+		./dev.sh ping --timeout 10 2>&1 || true
+		for round in 1 2; do
+			((round == 1)) || sleep 5
+			echo "== QEMU's machine and cores, round $round"
+			python3 src/harness/lab.py monitor info status 2>&1 || true
+			python3 src/harness/lab.py monitor info cpus 2>&1 || true
+			registers="$(python3 src/harness/lab.py monitor info registers -a 2>&1 || true)"
+			echo "$registers"
+			[[ -f "$kernel" ]] || continue
+			# `PC=` on aarch64, ` pc ` on riscv64, `RIP=` on x86_64 - whose medium is an ISO, so it is not named here.
+			mapfile -t counters < <(grep -o -i -E '(^| )(pc|rip)[= ] *[0-9a-f]{8,16}' <<<"$registers" |
+				grep -o -i -E '[0-9a-f]{8,16}$' | sed 's/^/0x/')
+			((${#counters[@]} > 0)) || continue
+			echo "== each core's counter in the booted kernel, round $round"
+			llvm-addr2line -f -C -e "$kernel" "${counters[@]}" 2>&1 || true
+		done
+	} >"$out" 2>&1
+	echo "typec-tcpci: the guest's state when the probe went silent: $out" >&2
+}
+
 # ONE PROBE RUN, its output kept; a run that does not say PASS, or says FAIL, fails the gate.
 probe() {
 	local out="$state/probe.log" result
@@ -132,6 +166,7 @@ probe() {
 	echo "$result" >>"$out"
 	if grep -q "typeccheck: FAIL" <<<"$result" || ! grep -q "typeccheck: \(PASS\|answer\|[0-9]* connector(s)\)" <<<"$result"; then
 		echo "$result" >&2
+		grep -q "typeccheck: FAIL" <<<"$result" || guest_state
 		fail "$case_name: typeccheck $* did not pass"
 	fi
 	grep -a "typeccheck: \(PASS\|answer\|[0-9]* connector(s)\)" <<<"$result" | tail -1
@@ -147,6 +182,10 @@ probe_started() {
 		grep -q "typeccheck: watching" "$out" 2>/dev/null && return 0
 		sleep 1
 	done
+	# The launch's session goes first, so the agent is asked on a session of its own.
+	kill "$started_pid" 2>/dev/null || true
+	wait "$started_pid" 2>/dev/null || true
+	guest_state
 	fail "$case_name: typeccheck $* never began watching (see $kept/$(basename "$out"))"
 }
 
@@ -156,7 +195,10 @@ probe_judged() {
 	local out="$state/probe-$1.log"
 	wait "$started_pid" || true
 	cp -f "$out" "$kept/"
-	grep -q "typeccheck: PASS" "$out" || fail "$case_name: $2 (see $kept/$(basename "$out"))"
+	if ! grep -q "typeccheck: PASS" "$out"; then
+		grep -q "typeccheck: FAIL" "$out" || guest_state
+		fail "$case_name: $2 (see $kept/$(basename "$out"))"
+	fi
 	judged="$(grep -a "typeccheck: PASS" "$out" | tail -1)"
 	echo "$judged"
 }
@@ -362,6 +404,23 @@ await_line "VBUS is back after the hard reset" "VBUS must come back" "$back_befo
 contracted 15000
 no_violations
 echo "typec-tcpci: $case_name: VBUS to vSafe0V and back, no detach, the contract made anew"
+
+# THE SAME HARD RESET, NOT YET SERVICED WHEN VBUS GOES. The partner takes VBUS down in the step it signals the hard
+# reset, so the sink's next read of ALERT finds both, as a sink slower than tPSHardReset does wherever it runs. A sealed
+# release run's riscv64 guest (2026-11-11) took VBUS's loss first and detached a partner that stayed; here, as above:
+# no detach, VBUS back, the contract made anew.
+case_name="partner-hard-reset-unserviced"
+back_before=$(seen "VBUS is back after the hard reset")
+detached_before=$(seen ": detached")
+probe_started unserviced steady 1 5
+tcpc_ok script hard-reset-unserviced >/dev/null
+tcpc_ok hard-reset >/dev/null
+probe_judged unserviced "the partner must stay attached through a Hard Reset read with VBUS already gone"
+await_line "VBUS is back after the hard reset" "VBUS must come back" "$back_before" 20
+(($(seen ": detached") == detached_before)) || fail "$case_name: a Hard Reset read with VBUS already gone is no detach"
+contracted 15000
+no_violations
+echo "typec-tcpci: $case_name: the Hard Reset and VBUS's loss read together, no detach, the contract made anew"
 
 case_name="no-answer"
 sent_before=$(seen "hard reset sent (1 of 2)")

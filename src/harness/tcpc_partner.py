@@ -172,7 +172,7 @@ PROFILES = {
 # `caps less`: the 15 V offer and above withdrawn.
 LESS = [fixed(5000, 3000), fixed(9000, 3000)]
 # The scripts `script NAME` arms for the next step they apply to.
-SCRIPTS = ('wait', 'reject', 'no-answer', 'no-ps-rdy', 'overshoot', 'vbus-stays-off', 'detach-mid', 'no-caps', 'back-on-cc-read')
+SCRIPTS = ('wait', 'reject', 'no-answer', 'no-ps-rdy', 'overshoot', 'vbus-stays-off', 'detach-mid', 'no-caps', 'back-on-cc-read', 'hard-reset-unserviced')
 
 
 class Scheduler:
@@ -813,6 +813,16 @@ class Source:
         seen = self.tcpc.deliver_hard_reset()
         self.say(f'hard reset sent to the sink{"" if seen else " - its controller does not receive hard resets"}')
         self.hard_reset()
+        # A SINK THAT HAS NOT SERVICED THE HARD RESET'S ALERT when tPSHardReset runs out - one its alert reaches late,
+        # which an emulated guest under load is and a busy machine can be. VBUS goes down in this same step, so the
+        # sink's next read of ALERT finds the hard reset and the power status together, wherever it runs: the order the
+        # sink takes them in is what this asks. A sink that took VBUS's loss first detached a partner that never went
+        # (a sealed release run's riscv64 guest, 2026-11-11).
+        if 'hard-reset-unserviced' in self.scripts:
+            self.scripts.discard('hard-reset-unserviced')
+            self.timers.cancel('vbus-off')
+            self.say('VBUS taken down before the sink could service the hard reset')
+            self.hard_reset_vbus_off(unserviced=True)
 
     def hard_reset(self):
         """THE SOURCE'S HARD RESET: VBUS to vSafe0V after tPSHardReset, back after tSrcRecover - or kept off."""
@@ -823,10 +833,11 @@ class Source:
         self.last_sink_id = None
         self.timers.at(T_PS_HARD_RESET, 'vbus-off', self.hard_reset_vbus_off)
 
-    def hard_reset_vbus_off(self):
+    def hard_reset_vbus_off(self, unserviced=False):
         # tPSHardReset IS NOT STRETCHED: a guest the emulated ports slow down may still be switching when it runs out, so
-        # there this is a note, and under KVM a violation.
-        late = self.violation if self.stretch == 1.0 else (lambda text: self.say(f'NOTE: {text}'))
+        # there this is a note, and under KVM a violation - but not where the script took VBUS down before the sink
+        # could have read anything.
+        late = self.violation if self.stretch == 1.0 and not unserviced else (lambda text: self.say(f'NOTE: {text}'))
         if self.tcpc.sinking:
             late('the sink path was on when the hard reset took VBUS down')
         if self.tcpc.power_control & CONTROL_AUTO_DISCHARGE:

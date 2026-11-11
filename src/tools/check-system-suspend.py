@@ -91,6 +91,18 @@ def check_core_progress(before, after):
 		require(after[cpu]['halts'] > before[cpu]['halts'], f'core {cpu} never returned to its idle loop after the transition')
 
 
+# THE WALL CLOCK AFTER THE WAKE, against the host's. What the guest prints is its RTC in WHOLE SECONDS, read from a
+# device QEMU starts at a whole second of the host's clock: the goldfish RTC is set, when QEMU creates it, from
+# `qemu_get_timedate`, which has no fraction - so it runs up to a second behind the host for the machine's life - and
+# the reading drops up to another. A correct reading is therefore less than two seconds behind the host's time at the
+# read, and never ahead of it. And the read happened after the command was sent and before its line arrived: this compared the
+# reading with the ARRIVAL alone, so the line's way out counted as clock error - a sealed release run's correct clock
+# failed it (2026-11-11: read as 1794390536, its line in at 1794390538.046). The window is the one the read happened
+# in; a clock that lost or doubled the eight-second sleep is outside it either way.
+def check_rtc(sent, arrived, rtc):
+	require(sent - 2 < rtc <= arrived, f'the post-wake RTC read {rtc}, outside what the host\'s clock read in whole seconds gives between the command ({sent:.3f}) and its line ({arrived:.3f})')
+
+
 def check_frame(before, after):
 	from PIL import ImageChops
 	require(before.size == after.size, 'the display geometry changed during the keyboard check')
@@ -118,6 +130,9 @@ def self_test():
 	caret = frame.copy()
 	caret.paste('white', (0, 0, 8, 16))
 	check_frame(frame, typed)
+	# The sealed run's own sample: sent before its echo (1794390537.360), the line in at .046 two seconds on.
+	sent, arrived, rtc = 1794390537.0, 1794390538.046149, 1794390536
+	check_rtc(sent, arrived, rtc)
 	cases = [
 		('missing stop', lambda: check_sleep([row for row in lines if row[1] != STOPPED], record)),
 		('missing core return', lambda: check_sleep([row for row in lines if row[1] != BACK], record)),
@@ -134,6 +149,10 @@ def self_test():
 		('fake refusal', lambda: check_refusal(refusal.replace(REFUSAL, 'firmware feature absent'))),
 		('refusal without recovery', lambda: check_refusal(refusal.replace(BACK, ''))),
 		('refusal in wrong step', lambda: check_refusal(refusal.replace('unwound at the entry', 'unwound at the drivers'))),
+		('RTC without the sleep', lambda: check_rtc(sent, arrived, rtc - WAKE_S)),
+		('RTC with the sleep twice', lambda: check_rtc(sent, arrived, rtc + WAKE_S)),
+		('RTC ahead of the host', lambda: check_rtc(sent, arrived, int(arrived) + 1)),
+		('RTC two seconds behind the command', lambda: check_rtc(sent, arrived, int(sent) - 2)),
 	]
 	for name, case in cases:
 		try:
@@ -141,7 +160,7 @@ def self_test():
 		except GateError:
 			continue
 		raise GateError(f'oracle accepted {name}')
-	note(f'oracle self-test PASS (LF/CRLF sleep, refusal, core progress and display positives; {len(cases)} rejected false outcomes)')
+	note(f'oracle self-test PASS (LF/CRLF sleep, refusal, core progress, display and RTC positives; {len(cases)} rejected false outcomes)')
 
 
 def all_cores(serial):
@@ -164,9 +183,11 @@ def after_wake(serial, qmp_path, work, label, before_cores):
 	waited = (rows[1][0] - rows[0][0]) * 1000
 	require(800 <= waited <= 1600 and 800 <= rows[1][2] - rows[0][2] <= 1600, f'the post-wake one-second timer took {waited:.0f} ms')
 	mark = len(serial.data)
+	sent = time.time()
 	serial.run('sleepcheck clocks', 300)
 	clocks = [(stamp, int(found.group(1))) for stamp, line in serial.lines_since(mark) if (found := CLOCKS.search(line))]
-	require(len(clocks) == 1 and abs(clocks[0][0] - clocks[0][1]) <= 2, 'the post-wake RTC differs from the host by over two seconds')
+	require(len(clocks) == 1, 'the post-wake clocks were not reported once')
+	check_rtc(sent, *clocks[0])
 	# QMP types on the emulated keyboard, exactly as the ordinary sleep gate does. Serial input
 	# alone cannot prove that a frame reaches the display. Clear the unsubmitted text afterwards.
 	before, after = [os.path.join(work, f'{label}-{part}.ppm') for part in ('before', 'after')]

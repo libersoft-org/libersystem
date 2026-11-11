@@ -1585,6 +1585,26 @@ class TcpcTest(unittest.TestCase):
         self.assertEqual(plain.partner.vbus_mv, 5000)
         self.assertEqual(plain.read(tcpc_partner.CC_STATUS, 1)[0] & 0xF, 2, "Rp 1.5 A")
 
+    def test_a_hard_reset_the_sink_has_not_serviced_is_read_with_vbus_gone(self):
+        rig = self.attached()
+        rig.received()
+        rig.write(tcpc_partner.COMMAND, tcpc_partner.COMMAND_SINK_VBUS)
+        rig.clear(0x7FF)
+        rig.partner.command(["script", "hard-reset-unserviced"])
+        rig.partner.command(["hard-reset"])
+        both = tcpc_partner.ALERT_RX_HARD_RESET | tcpc_partner.ALERT_POWER_STATUS
+        self.assertEqual(rig.alert() & both, both, "the hard reset and VBUS's loss, latched for one read")
+        self.assertEqual(rig.partner.vbus_mv, 0, "down in the same step, not after tPSHardReset")
+        self.assertEqual(rig.partner.violations, [], "the sink could not have acted: its sink path is a note")
+        rig.advance(0.75)
+        self.assertEqual(rig.partner.vbus_mv, 5000, "back after tSrcRecover")
+        # ONE-SHOT: the next hard reset takes VBUS down after tPSHardReset again.
+        rig.clear(0x7FF)
+        rig.write(tcpc_partner.RECEIVE_DETECT, tcpc_partner.DETECT_SOP | tcpc_partner.DETECT_HARD_RESET)
+        rig.partner.command(["hard-reset"])
+        self.assertEqual(rig.alert() & both, tcpc_partner.ALERT_RX_HARD_RESET)
+        self.assertEqual(rig.partner.vbus_mv, 5000)
+
     def test_the_alarms_fire_outside_the_thresholds_the_sink_set(self):
         rig = self.attached()
         rig.clear(0x7FF)

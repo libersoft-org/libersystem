@@ -18,6 +18,18 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BOOT="${BOOT_DIR:-$root/../.build/boot}"
 MAGIC='liberboot-manifest 1'
+
+# THE LOCK THE MEDIA ARE BUILT UNDER. `mkimage.sh` assembles `efiboot.img` and `esp.img` IN PLACE - it
+# removes the file, formats a new one and copies the loader, the kernel, the bootstrap set and the manifest
+# into it - holding `<product>.image.lock` beside them, and a runner calls it for every guest whose medium's
+# key is new. Read under no lock, a medium is whatever that assembly has reached by each read: in a sealed
+# release run this read a whole medium's kernel, list and manifest and then none of the six programs the list
+# names, an assembly having begun between the reads. So each medium is copied under a SHARED hold of the
+# same lock - an assembly in progress is waited out, and the next one waits for the copy - and every check
+# reads the copy.
+# shellcheck source=/dev/null
+source "$root/../product.conf"
+IMAGE_LOCK="$BOOT/$(echo "$PRODUCT_NAME" | tr '[:upper:]' '[:lower:]').image.lock"
 failures=0
 sources=0
 
@@ -93,26 +105,32 @@ check_staging_dir() {
 check_fat_medium() {
 	local image="$1"
 	local what="boot medium $(basename "$image")"
-	mdir -i "$image" ::/kernel >/dev/null 2>&1 || return 0
-	sources=$((sources + 1))
 	local tmp
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' RETURN
-	if ! mcopy -i "$image" ::/etc/boot.manifest "$tmp/boot.manifest" 2>/dev/null; then
+	# One whole generation, copied under the builder's lock (`IMAGE_LOCK`, above). A medium that is gone
+	# once the lock is held was removed by an assembly that did not finish, and is no source.
+	local medium="$tmp/medium.img"
+	(flock -s -w 300 9 && { [[ ! -f "$image" ]] || cp "$image" "$medium"; }) 9>>"$IMAGE_LOCK" ||
+		die "could not copy $image under $IMAGE_LOCK"
+	[[ -f "$medium" ]] || return 0
+	mdir -i "$medium" ::/kernel >/dev/null 2>&1 || return 0
+	sources=$((sources + 1))
+	if ! mcopy -i "$medium" ::/etc/boot.manifest "$tmp/boot.manifest" 2>/dev/null; then
 		fail "$what: carries a kernel and no etc/boot.manifest - the loader refuses to boot from it"
 		return
 	fi
 	[[ "$(head -n1 "$tmp/boot.manifest")" == "$MAGIC" ]] || fail "$what: etc/boot.manifest does not start with '$MAGIC'"
-	mcopy -i "$image" ::/kernel "$tmp/kernel" 2>/dev/null || die "cannot read ::/kernel out of $image"
+	mcopy -i "$medium" ::/kernel "$tmp/kernel" 2>/dev/null || die "cannot read ::/kernel out of $image"
 	check_file "$what" "$tmp/boot.manifest" "kernel" "$tmp/kernel"
 	# The bootstrap set, when this medium carries one. A medium with a list is a medium the loader
 	# will assemble from, so every program on it is read and every program must be recorded.
-	if mcopy -i "$image" ::/etc/bootstrap.list "$tmp/bootstrap.list" 2>/dev/null; then
+	if mcopy -i "$medium" ::/etc/bootstrap.list "$tmp/bootstrap.list" 2>/dev/null; then
 		check_file "$what" "$tmp/boot.manifest" "etc/bootstrap.list" "$tmp/bootstrap.list"
 		local path
 		while read -r path; do
 			[[ -n "$path" ]] || continue
-			if ! mcopy -i "$image" "::/$path" "$tmp/blob" 2>/dev/null; then
+			if ! mcopy -i "$medium" "::/$path" "$tmp/blob" 2>/dev/null; then
 				fail "$what: etc/bootstrap.list names '$path', which is not on the medium"
 				continue
 			fi

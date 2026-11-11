@@ -343,6 +343,13 @@ impl Port {
 	// contract was made. Cleared first, a change after the read raises the bit anew and the next round reads it. The
 	// receive's bit is cleared once its message is taken: clearing it is what hands the buffer to the next message. The
 	// overflow bit stays with it, cleared after the message as it always was - it says something of the same buffer.
+	//
+	// A HARD RESET RECEIVED IS OLDER THAN THE VBUS CHANGE READ BESIDE IT (2026-11-11). A source takes VBUS to vSafe0V
+	// tPSHardReset - 25 to 35 ms - after its signalling, so a sink that services the alert later than that finds both
+	// bits in one read. Told VBUS first, the engine saw an attached port lose VBUS and detached it, and the hard reset
+	// after it found nothing to reset: a sealed release run's riscv64 guest said "detached" and then "hard reset
+	// received" for a partner that never went. Beside a received hard reset the power status is told after it - and
+	// after the transmissions, which completed before it - and everywhere else the order is the one above.
 	fn service(&mut self) {
 		for _ in 0..ALERT_ROUNDS {
 			let alert = self.read16(tcpci::ALERT) & tcpci::ALERT_ALL;
@@ -358,9 +365,10 @@ impl Port {
 				self.cc_status = self.read8(tcpci::CC_STATUS);
 				events.push(Event::Cc(tcpci::cc(self.cc_status)));
 			}
-			if alert & tcpci::ALERT_POWER_STATUS != 0 {
-				let status = self.read8(tcpci::POWER_STATUS);
-				events.push(Event::Vbus(status & tcpci::POWER_VBUS_PRESENT != 0));
+			let hard_reset = alert & tcpci::ALERT_RX_HARD_RESET != 0;
+			let vbus = (alert & tcpci::ALERT_POWER_STATUS != 0).then(|| self.read8(tcpci::POWER_STATUS) & tcpci::POWER_VBUS_PRESENT != 0);
+			if let Some(present) = vbus.filter(|_| !hard_reset) {
+				events.push(Event::Vbus(present));
 			}
 			let (success, failed, discarded) = (alert & tcpci::ALERT_TX_SUCCESS != 0, alert & tcpci::ALERT_TX_FAILED != 0, alert & tcpci::ALERT_TX_DISCARDED != 0);
 			// BOTH AT ONCE REPORT A HARD RESET SENT, which the engine awaits nothing for.
@@ -373,8 +381,11 @@ impl Port {
 					events.push(Event::Transmitted(Transmitted::Failed));
 				}
 			}
-			if alert & tcpci::ALERT_RX_HARD_RESET != 0 {
+			if hard_reset {
 				events.push(Event::HardResetReceived);
+				if let Some(present) = vbus {
+					events.push(Event::Vbus(present));
+				}
 			}
 			if alert & tcpci::ALERT_RX_STATUS != 0 {
 				let mut buffer = [0u8; RECEIVE_BYTES];
