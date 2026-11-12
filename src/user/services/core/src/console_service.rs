@@ -295,6 +295,15 @@ const SERIAL_PENDING_MAX: usize = 32768;
 // What the serial mirror prints in place of output it had to drop (see above).
 const SERIAL_GAP_MARKER: &[u8] = b"\n[serial mirror: behind - older output dropped]\n";
 
+// AT MOST THIS MUCH OF ONE PROGRAM'S OUTPUT IN ONE SERVE (2026-11-12). A serve drains a terminal's queued output into
+// the grid before the single present, so a multi-line command paints in one flush - and it drained until the channel
+// was empty, which a program printing as fast as the console renders never lets it be: each message taken made room
+// for the next. A `sleepcheck flood` writing each line as one message held the console in that drain for all of its
+// 45 s, and every typed key and the serial mirror waited until it stopped (x86_64 `tickless-idle`). Once a serve has
+// rendered this much it ends: the rest stays queued, the channel stays ready, and the run loop's rotation serves every
+// other ready channel before this one again. A message counts at least one byte, so empty ones end a serve too.
+const OUTPUT_SERVE_BYTES: usize = 16 * 1024;
+
 // The catalogue connection this service follows the kernel console's UART through: minted for `console-bytes`
 // alone.
 const CAP_CONSOLE_BYTES: &[u8] = b"CONSOLEBYTES";
@@ -965,12 +974,17 @@ unsafe fn run(console: &mut Console) -> ! {
 				} else if r < display_idx {
 					let vi: usize = (r - 1) / 2;
 					if (r - 1) % 2 == 0 {
-						// Output bytes from VT vi's shell: drain the whole burst into the grid
-						// before the single present below, so a multi-line command (e.g. `help`)
-						// paints in one GPU flush instead of one full-frame flush per printed line.
-						loop {
+						// Output bytes from VT vi's shell: drain the burst into the grid before the
+						// single present below, so a multi-line command (e.g. `help`) paints in one GPU
+						// flush instead of one full-frame flush per printed line - at most
+						// `OUTPUT_SERVE_BYTES` of it, see there.
+						let mut served: usize = 0;
+						while served < OUTPUT_SERVE_BYTES {
 							match try_recv(console.vts[vi].client, &mut out) {
-								Polled::Message { len, .. } => render_output(console, vi, &out[..len]),
+								Polled::Message { len, .. } => {
+									render_output(console, vi, &out[..len]);
+									served += len.max(1);
+								}
 								Polled::Empty => break,
 								Polled::Closed => {
 									close_vt(console, vi);
@@ -987,24 +1001,29 @@ unsafe fn run(console: &mut Console) -> ! {
 					// its control channel, or feed the host's input through the line discipline.
 					let pj: usize = (r - pty_base) / 3;
 					match (r - pty_base) % 3 {
-						0 => loop {
-							// Drain the slave program's output burst before the single present below.
-							match try_recv(console.ptys[pj].client, &mut out) {
-								Polled::Message { len, .. } => {
-									// A host that stopped draining its own terminal loses the
-									// terminal, not the loop. See `pty_output`.
-									if !pty_output(console, pj, &out[..len]) {
+						0 => {
+							// Drain the slave program's output burst before the single present below - at
+							// most `OUTPUT_SERVE_BYTES` of it, see there.
+							let mut served: usize = 0;
+							while served < OUTPUT_SERVE_BYTES {
+								match try_recv(console.ptys[pj].client, &mut out) {
+									Polled::Message { len, .. } => {
+										// A host that stopped draining its own terminal loses the
+										// terminal, not the loop. See `pty_output`.
+										if !pty_output(console, pj, &out[..len]) {
+											close_pty(console, pj);
+											break;
+										}
+										served += len.max(1);
+									}
+									Polled::Empty => break,
+									Polled::Closed => {
 										close_pty(console, pj);
 										break;
 									}
 								}
-								Polled::Empty => break,
-								Polled::Closed => {
-									close_pty(console, pj);
-									break;
-								}
 							}
-						},
+						}
 						1 => handle_pty_control(console, pj),
 						_ => match recv_blocking(console.ptys[pj].master, &mut out) {
 							Received::Message { len, .. } => pty_master_input(console, pj, &out[..len]),

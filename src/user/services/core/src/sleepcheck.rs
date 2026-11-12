@@ -28,10 +28,23 @@ use rt::*;
 // The counter's period: a tenth of a second.
 const PERIOD_TICKS: u64 = TICKS_PER_SECOND / 10;
 
+// What every line begins with.
+const PREFIX: &str = "sleepcheck: ";
+
+// ONE MESSAGE A LINE: the prefix, the text and the newline written together. They were three writes, and the
+// terminal is shared - `sleepctl`, the shell and every other program print through the same console channel, a
+// message at a time - so another program's output could land between this line's text and its end. Where that output
+// ended in an unfinished line of its own, this line's newline finished THAT line, and the gate reading the counter
+// found a counter line cut with no end left to rejoin: `sleepctl`'s record of the sleep, its first line and the
+// second without its newline, landed after count 73's text, and count 73's newline ended the record's second line
+// (riscv64 `tickless-idle`, 2026-11-12). A line written whole has other programs' lines only before or after it; the
+// kernel's own lines, which reach the wire by another path, are the gate's to rejoin.
 fn say(text: &str) {
-	print(b"sleepcheck: ");
-	print(text.as_bytes());
-	print(b"\n");
+	let mut line: String = String::with_capacity(PREFIX.len() + text.len() + 1);
+	line.push_str(PREFIX);
+	line.push_str(text);
+	line.push('\n');
+	print(line.as_bytes());
 }
 
 fn usage() -> ! {

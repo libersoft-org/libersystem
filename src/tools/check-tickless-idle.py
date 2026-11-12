@@ -77,8 +77,9 @@ IDLE_MARGIN_MS = 300
 SLEEP_OFFERED = re.compile(rb'sleep: [^\r\n]* is (offered|not offered) by this firmware')
 # THE SHELL'S PROMPT, as it reads once the colours are stripped - for taking it out of a line it landed in.
 PROMPT_TEXT = re.compile(r'vol://[^\r\n>]*> ')
-# WITHOUT ITS PREFIX: the counter writes "sleepcheck: " and the rest of its line in two writes, and another program's
-# lines - `sleepctl`'s record of the last sleep, then its prompt - can land between them.
+# WITHOUT ITS PREFIX, which can be parted from the rest: the counter wrote "sleepcheck: ", its text and its newline as
+# three messages, and other programs' lines - `sleepctl`'s record of the last sleep, then its prompt - landed between
+# them, until it wrote each line whole (2026-11-12); the kernel's lines still can.
 # AND TO ITS END OF LINE, because the kernel can land inside it. The kernel writes its lines straight to the port while
 # the counter's go through the console path, so "boot-ms 55575", then "DeviceManager: resumed console-uart ...", then
 # "4" on a line of its own was count 53's boot clock, 555754 - read as 55575, a clock eight minutes behind. A counter
@@ -486,9 +487,10 @@ def suspend_to_idle(target, serial, scale):
 	slept = (resumed_stamp - entered_stamp) * 1000
 	if slept < IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS:
 		raise GateError(f'suspend to idle: the host measured {slept:.0f} ms between the kernel\'s lines, under the {IDLE_WAKE_S} s wake')
-	# A PROMPT THE SHELL PRINTED INTO A COUNTER LINE is taken out first: `sleepctl` ends at the serial shell while
-	# the counter writes in the background, and the two share the console - "sleepcheck: " then the prompt then
-	# "count 23 ..." is one counter line, not a missing value. A kernel line inside one is rejoined around.
+	# A PROMPT THE SHELL PRINTED BESIDE A COUNTER LINE is taken out first: `sleepctl` ends at the serial shell while
+	# the counter writes in the background, and the two share the console - the prompt then "sleepcheck: count 23 ..."
+	# is one counter line, and so was "sleepcheck: ", the prompt, then "count 23 ..." while the counter wrote its lines
+	# in three messages. A kernel line inside one is rejoined around.
 	rows = counter_rows(lines)
 	inside = [row for row in rows if entered_at < row[0] < resumed_at]
 	if inside:

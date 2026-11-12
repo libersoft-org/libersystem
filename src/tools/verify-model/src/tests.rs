@@ -3512,6 +3512,29 @@ fn declarations_conflict_on_a_shared_write_or_state_and_not_on_shared_reads() {
 	assert!(crate::resources::parse("lab:cold-x86_64").is_err(), "a declaration starts with guest or host");
 }
 
+// A GATE THAT READS EVERY TARGET'S STAGING DECLARES EVERY TARGET'S STAGING. Five host gates read the ports' stagings
+// beside x86_64's - the boot directory's `bootstrap-*` sets, each target's volume, its staged image - and declared
+// x86_64's alone, so the runner could bring a port's staging to the development profile, or a step could write it,
+// while one of them read it, and the gate would have judged whatever that build had reached by then. Found reading
+// `boot-manifest` after a sealed release run caught it racing the build of the x86_64 boot media (2026-11-11).
+#[test]
+fn a_gate_that_reads_every_targets_staging_never_runs_beside_a_port_rebuilt_under_it() {
+	let parse = |text: &str| crate::resources::parse(text).expect(text);
+	let mut failures = Vec::new();
+	for gate in ["boot-manifest", "driver-protocol-note", "dynamic-report", "foreign-audit-artifact", "foreign-audit-link"] {
+		let declared = crate::resources::declaration(gate).unwrap_or_else(|| panic!("gate '{gate}' declares nothing"));
+		for port in ["aarch64", "riscv64"] {
+			if !declared.conflicts_with(&parse(&format!("guest stage:{port}:r profile:development media"))) {
+				failures.push(format!("gate '{gate}' reads {port}'s staging and may run while it is brought to the development profile"));
+			}
+			if !declared.conflicts_with(&parse(&format!("host stage:{port}:w profile:shipping"))) {
+				failures.push(format!("gate '{gate}' reads {port}'s staging and may run while a step writes it"));
+			}
+		}
+	}
+	assert!(failures.is_empty(), "{failures:#?}");
+}
+
 // A PORT'S SUITE SPLIT ACROSS GUESTS: every selected test in exactly one part, the six heaviest each alone, the rest
 // dealt by their measured durations, each part an exact selection that discharges its own tests' keys; what required
 // the suite requires every part; and a step that discharges `suite.kernel` - the release's whole run - and x86_64's

@@ -216,7 +216,8 @@ pub const GATE_RESOURCES: [(&str, &str); 199] = [
 	// The shipped scenarios are validated against the real x86_64 staging since 2026-11-01, so a staging switch beside it
 	// is a read from under it (2026-11-03).
 	("boot-harness", "host stage:x86_64:r profile:shipping"),
-	("boot-manifest", "host stage:x86_64:r profile:shipping"),
+	// Every target's boot set (`bootstrap-*`), not x86_64's alone (2026-11-11).
+	("boot-manifest", "host stage:x86_64:r stage:aarch64:r stage:riscv64:r profile:shipping"),
 	("boot-volume-controllers", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
 	("boot-volume-controllers-aarch64", "guest stage:aarch64:r profile:shipping media volume:aarch64:harness:r"),
 	("boot-volume-controllers-riscv64", "guest stage:riscv64:r profile:shipping media volume:riscv64:harness:r"),
@@ -246,16 +247,20 @@ pub const GATE_RESOURCES: [(&str, &str); 199] = [
 	("dma-mode-x86_64", "guest stage:x86_64:w profile:shipping media volume:x86_64:enforcing-required:w"),
 	("driver-event-dispatch", "host"),
 	("driver-mutations", "host"),
-	("driver-protocol-note", "host stage:x86_64:r profile:shipping"),
+	// Every target's boot set and volume (2026-11-11).
+	("driver-protocol-note", "host stage:x86_64:r stage:aarch64:r stage:riscv64:r profile:shipping"),
 	("duplicate-edge", "host stage:x86_64:w stage:aarch64:w stage:riscv64:w profile:shipping traces"),
-	("dynamic-report", "host stage:x86_64:r profile:shipping"),
+	// Every target's staged image (2026-11-11).
+	("dynamic-report", "host stage:x86_64:r stage:aarch64:r stage:riscv64:r profile:shipping"),
 	("dynamic-report-regressions", "host stage:x86_64:r profile:shipping"),
 	("firmware-fixtures", "host"),
 	("firmware-tree-aarch64", "guest stage:aarch64:r profile:development media"),
 	("firmware-tree-riscv64", "guest stage:riscv64:r profile:development media"),
 	("font-declarations", "host stage:x86_64:r profile:shipping"),
-	("foreign-audit-artifact", "host stage:x86_64:r profile:shipping"),
-	("foreign-audit-link", "host stage:x86_64:r profile:shipping"),
+	// Every target's staged libraries (2026-11-11).
+	("foreign-audit-artifact", "host stage:x86_64:r stage:aarch64:r stage:riscv64:r profile:shipping"),
+	// Every target's staged runtime and libraries (2026-11-11).
+	("foreign-audit-link", "host stage:x86_64:r stage:aarch64:r stage:riscv64:r profile:shipping"),
 	("foreign-cxx-abi", "host stage:x86_64:r profile:shipping"),
 	("foreign-facilities", "host"),
 	("foreign-facilities-guest", "guest stage:x86_64:r profile:development media volume:x86_64:harness:r"),
