@@ -101,6 +101,19 @@ thread_trampoline:
 // `thread_bootstrap` (the Rust entry the trampoline above calls) is the portable
 // arch::common::context symbol - identical on every arch, so it lives there.
 
+// WHERE A PARKED THREAD RESUMES: the return address its `switch_context` frame holds, ra at 0 - which is
+// `thread_trampoline` for a thread that has never run. `saved_sp` is a published, nonzero saved stack pointer of a
+// thread no core is running; the scheduler's list of a boot that stopped reads it under that core's lock.
+pub fn resume_point(saved_sp: u64) -> u64 {
+	unsafe { (saved_sp as *const u64).read_volatile() }
+}
+
+// Where a thread that has never run resumes.
+pub fn trampoline_address() -> u64 {
+	let trampoline: unsafe extern "C" fn() = thread_trampoline;
+	trampoline as usize as u64
+}
+
 // Build the initial kernel stack for a new thread. The frame is laid out so the first
 // switch_context into it restores entry into s0 and arg into s1, then returns (ra)
 // into thread_trampoline. Returns the initial saved stack pointer.

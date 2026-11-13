@@ -105,6 +105,12 @@ pub struct Thread {
 	// THE FRAME ACCOUNT'S WINDOW THIS THREAD WAS LAST NAMED IN (`crate::perf`), so its process's
 	// name is written once per armed window and the drain's table can name every thread it saw.
 	perf_window: AtomicU64,
+	// HOW OFTEN A CORE SWITCHED TO THIS THREAD, and at which tick it last did - for the scheduler's list of a boot that
+	// stopped (`sched::dump_cores`). A thread queued for a whole boot window that never ran and one that ran and got
+	// nowhere look the same in a run queue, and they are different defects: the fifth aarch64 stall (2026-11-13) was a
+	// SystemManager thread queued on the boot core for 40000 ticks, and the list could not say which.
+	runs: AtomicU64,
+	last_ran: AtomicU64,
 }
 
 // A kernel thread's stack, in its own virtual range with an unmapped page below it.
@@ -373,6 +379,8 @@ impl Thread {
 			process,
 			run_link: SpinLock::new(None),
 			perf_window: AtomicU64::new(0),
+			runs: AtomicU64::new(0),
+			last_ran: AtomicU64::new(0),
 		})?;
 		// Forward-link the thread to its process so signal delivery can reach it - and refuse to
 		// build the thread at all if the process is already tearing down. A thread that cannot be
@@ -432,6 +440,23 @@ impl Thread {
 	// The frame account's window this thread was last named in.
 	pub fn perf_window(&self) -> &AtomicU64 {
 		&self.perf_window
+	}
+
+	// A core switched to this thread at `tick`. Called by the scheduler with the thread made current.
+	pub fn note_run(&self, tick: u64) {
+		self.runs.fetch_add(1, Ordering::Relaxed);
+		self.last_ran.store(tick, Ordering::Relaxed);
+	}
+
+	// How often a core switched to this thread, and the tick of the last time - (0, 0) for one that never ran.
+	pub fn run_record(&self) -> (u64, u64) {
+		(self.runs.load(Ordering::Relaxed), self.last_ran.load(Ordering::Relaxed))
+	}
+
+	// Whether the thread has been started - put on a run queue for the first time. A suspended thread
+	// (`sched::thread_create_suspended`) is on no run queue and in no wait, so only its process can name it.
+	pub fn is_started(&self) -> bool {
+		self.started.load(Ordering::Acquire) != 0
 	}
 
 	// Atomically claim the right to enqueue this thread for the first time. Returns

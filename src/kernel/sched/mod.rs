@@ -1237,7 +1237,7 @@ pub fn dump_blocked(reason: &str) {
 // joining it.
 pub fn dump_cores(reason: &str) {
 	const SHOWN: usize = 8;
-	crate::serial_println!("sched: cores ({reason}):");
+	crate::serial_println!("sched: cores ({reason}), at tick {}:", arch::apic::ticks());
 	for cpu in 0..crate::smp::cpu_count() {
 		let slot = cpu_sched(cpu);
 		let mut held = None;
@@ -1252,30 +1252,135 @@ pub fn dump_cores(reason: &str) {
 			crate::serial_println!("sched:   cpu {cpu}: its scheduler lock stayed held - nothing read");
 			continue;
 		};
-		let running = inner.current.as_ref().map(|thread| (thread.header().koid(), thread.process().header().koid(), ProcessLabel::of(thread)));
+		let running = inner.current.as_ref().map(|thread| (thread.header().koid(), thread.process().header().koid(), ProcessLabel::of(thread), thread.run_record()));
 		let length = inner.run_queue.len;
-		let mut queued: [Option<(u64, u64, ProcessLabel)>; SHOWN] = [const { None }; SHOWN];
+		let mut queued: [Option<(u64, u64, ProcessLabel, (u64, u64), Option<u64>)>; SHOWN] = [const { None }; SHOWN];
 		let mut next = inner.run_queue.head.clone();
 		// Bounded by the queue's own count, so a link that went wrong cannot keep this core here.
 		for entry in 0..length {
 			let Some(thread) = next else { break };
 			if let Some(place) = queued.get_mut(entry) {
-				*place = Some((thread.header().koid(), thread.process().header().koid(), ProcessLabel::of(&thread)));
+				// WHERE IT RESUMES, read while this core's lock keeps it off every core: a queued thread's saved stack
+				// pointer is published before it is queued, and zero only for one still on its way out of a core.
+				let saved = thread.kstack_ptr_load();
+				let resumes = (saved != 0).then(|| arch::context::resume_point(saved));
+				*place = Some((thread.header().koid(), thread.process().header().koid(), ProcessLabel::of(&thread), thread.run_record(), resumes));
 			}
 			next = thread.run_link().clone();
 		}
 		drop(next);
 		drop(inner);
 		match running {
-			Some((thread, process, label)) => crate::serial_println!("sched:   cpu {cpu} runs thread {thread} of process {process} ({}); {length} queued", label.as_str()),
+			Some((thread, process, label, (runs, last))) => crate::serial_println!("sched:   cpu {cpu} runs thread {thread} of process {process} ({}) - switched to {runs} time(s), last at tick {last}; {length} queued", label.as_str()),
 			None => crate::serial_println!("sched:   cpu {cpu} runs no thread; {length} queued"),
 		}
-		for (thread, process, label) in queued.iter().flatten() {
-			crate::serial_println!("sched:     queued: thread {thread} of process {process} ({})", label.as_str());
+		for (thread, process, label, (runs, last), resumes) in queued.iter().flatten() {
+			// NEVER RAN AND RAN-AND-GOT-NOWHERE, told apart: a thread queued for a whole window is either.
+			let ran = RunRecord(*runs, *last);
+			match resumes {
+				Some(at) if *at == arch::context::trampoline_address() => crate::serial_println!("sched:     queued: thread {thread} of process {process} ({}) - {ran}, resumes at {at:#x} (its first instruction)", label.as_str()),
+				Some(at) => crate::serial_println!("sched:     queued: thread {thread} of process {process} ({}) - {ran}, resumes at {at:#x}", label.as_str()),
+				None => crate::serial_println!("sched:     queued: thread {thread} of process {process} ({}) - {ran}, not parked yet", label.as_str()),
+			}
 		}
 		if length > SHOWN {
 			crate::serial_println!("sched:     and {} more", length - SHOWN);
 		}
+	}
+}
+
+// How a listed thread has run, said as a reader needs it: never, or how often and when last.
+struct RunRecord(u64, u64);
+
+impl core::fmt::Display for RunRecord {
+	fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		match self.0 {
+			0 => write!(out, "never ran"),
+			runs => write!(out, "switched to {runs} time(s), last at tick {}", self.1),
+		}
+	}
+}
+
+// THE THREADS NO LIST NAMES: created and never started. A process's first thread is made suspended and started as a
+// separate step (`thread_create_suspended`, `thread_start`), and until it is started it is on no run queue and in no
+// wait - so the cores' list and the parked threads' list both pass over it, and a boot whose next process was made
+// but never let run would show nothing at all beside the process that made it. Every Domain from the root down is
+// walked in fixed batches, nothing allocated. Answers how many it named.
+pub fn dump_unstarted(reason: &str) -> usize {
+	const SHOWN: usize = 16;
+	crate::serial_println!("sched: threads created and never started ({reason}):");
+	let mut named = 0;
+	unstarted_in(&root_domain(), 0, &mut |thread, process, label| {
+		if named < SHOWN {
+			crate::serial_println!("sched:   thread {thread} of process {process} ({})", label.as_str());
+		}
+		named += 1;
+	});
+	match named {
+		0 => crate::serial_println!("sched:   none"),
+		named if named > SHOWN => crate::serial_println!("sched:   and {} more", named - SHOWN),
+		_ => {}
+	}
+	named
+}
+
+// The koids of every thread created and never started, into `out`; how many there were (more than `out` holds is
+// counted, not written). The walk `dump_unstarted` prints, for the test that asks what it finds.
+#[cfg(test)]
+pub fn unstarted_threads(out: &mut [u64]) -> usize {
+	let mut count = 0;
+	unstarted_in(&root_domain(), 0, &mut |thread, _, _| {
+		if let Some(slot) = out.get_mut(count) {
+			*slot = thread;
+		}
+		count += 1;
+	});
+	count
+}
+
+// One Domain's processes and then its children's, to a bounded depth - a Domain tree deeper than any this system
+// builds is cut there rather than followed.
+fn unstarted_in(domain: &Arc<Domain>, depth: usize, found: &mut dyn FnMut(u64, u64, &ProcessLabel)) {
+	const DEEPEST: usize = 8;
+	let mut at = 0;
+	loop {
+		let mut batch: [Option<Arc<Process>>; 8] = [const { None }; 8];
+		let (written, next) = domain.processes_from(at, &mut batch);
+		for process in batch.iter().flatten() {
+			let mut from = 0;
+			loop {
+				let mut threads: [Option<Arc<Thread>>; 8] = [const { None }; 8];
+				let (count, after) = process.live_threads_from(from, &mut threads);
+				for thread in threads.iter().flatten() {
+					if !thread.is_started() {
+						found(thread.header().koid(), process.header().koid(), &ProcessLabel::of(thread));
+					}
+				}
+				if count == 0 && after == from {
+					break;
+				}
+				from = after;
+			}
+		}
+		if written == 0 && next == at {
+			break;
+		}
+		at = next;
+	}
+	if depth >= DEEPEST {
+		return;
+	}
+	let mut at = 0;
+	loop {
+		let mut children: [Option<Arc<Domain>>; 8] = [const { None }; 8];
+		let (written, next) = domain.children_from(at, &mut children);
+		for child in children.iter().flatten() {
+			unstarted_in(child, depth + 1, found);
+		}
+		if written == 0 && next == at {
+			break;
+		}
+		at = next;
 	}
 }
 
@@ -1756,6 +1861,8 @@ fn reschedule_as(disp: Disposition, why: u8) {
 			}
 			let old_sp = stash_prev(&mut guard, sched, prev, disp);
 			next.set_state(ThreadState::Running);
+			// COUNTED, so a list of a boot that stopped can tell a thread that never ran from one that got nowhere.
+			next.note_run(arch::apic::ticks());
 			let new_sp = next.kstack_ptr_load();
 			let new_cr3 = next.address_space().cr3();
 			// Track the incoming thread's parked syscall stack on this core, so a

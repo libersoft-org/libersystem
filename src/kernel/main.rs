@@ -582,6 +582,8 @@ fn watch_for_a_shell(now: u64) -> Option<u64> {
 	serial_println!("recovery: still no interactive shell a whole boot window after the window closed - what every parked thread waits on:");
 	// The cores first: a few lines whatever the boot, so the list after them is what a full console ring would cut.
 	sched::dump_cores("no shell a whole window after the boot window");
+	// Then the threads neither list can name - created and never let run.
+	sched::dump_unstarted("no shell a whole window after the boot window");
 	sched::dump_blocked("no shell a whole window after the boot window");
 	None
 }
@@ -1252,6 +1254,7 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 			serial_println!("recovery: and the chain reported nothing in the whole window - what every parked thread waits on:");
 			// The cores first - see `watch_for_a_shell`.
 			sched::dump_cores("the boot chain was silent for its whole window");
+			sched::dump_unstarted("the boot chain was silent for its whole window");
 			sched::dump_blocked("the boot chain was silent for its whole window");
 		}
 		// A LIVE CONTROL PLANE IS NOT A FAILED BOOT, and treating it as one reboots a working

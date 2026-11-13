@@ -406,3 +406,52 @@ fn scheduler_runs_across_cores() {
 	}
 	assert_eq!(CROSS.load(Ordering::SeqCst) as usize, other_cores);
 }
+
+crate::tagged_test!(a_listed_thread_says_whether_it_ran_and_where_it_resumes, [Scheduler, Kernel], id = "kernel.sched.a_listed_thread_says_whether_it_ran_and_where_it_resumes", covers = ["kernel"]);
+fn a_listed_thread_says_whether_it_ran_and_where_it_resumes() {
+	// WHAT THE LIST OF A BOOT THAT STOPPED SAYS ABOUT A THREAD, checked against a thread whose history is known.
+	//
+	// The fifth aarch64 stall (2026-11-13) left SystemManager's one thread queued on the boot core for a whole window
+	// with nothing parked anywhere, and the list could not say whether that thread had never run or had run and got
+	// nowhere - two different defects. Now each listed thread says how often a core switched to it and where it would
+	// resume, and a thread created and never started, which no run queue and no wait holds, is named by a walk of
+	// every Domain. Each half is asked here of a thread that is first only created - in a CHILD Domain, which a walk
+	// of the root's own processes would pass over - and then started and run.
+	use crate::object::KernelObject;
+	use crate::object::address_space::AddressSpace;
+	use crate::object::domain::Domain;
+	use crate::object::process::Process;
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static STOP: AtomicBool = AtomicBool::new(false);
+	extern "C" fn yielder(_arg: u64) {
+		while !STOP.load(Ordering::SeqCst) {
+			sched::yield_now();
+		}
+	}
+	STOP.store(false, Ordering::SeqCst);
+	let domain = Domain::new_child(&sched::root_domain(), 64 << 20, 64, 8).expect("a child Domain");
+	let process = Process::new(AddressSpace::kernel(), domain).expect("a test process");
+	let thread = sched::thread_create_suspended(process, yielder, 0).expect("a suspended thread");
+	let koid = thread.header().koid();
+	let mut found = [0u64; 64];
+
+	assert_eq!(thread.run_record(), (0, 0), "a thread no core has switched to says it never ran");
+	assert_eq!(arch::context::resume_point(thread.kstack_ptr_load()), arch::context::trampoline_address(), "and it resumes at its first instruction");
+	let listed = sched::unstarted_threads(&mut found);
+	assert!(found[..listed.min(found.len())].contains(&koid), "a thread created and never started, in a child Domain, is named by the walk ({listed} named)");
+
+	let before = arch::apic::ticks();
+	assert!(sched::thread_start(thread.clone()), "started");
+	let listed = sched::unstarted_threads(&mut found);
+	assert!(!found[..listed.min(found.len())].contains(&koid), "and once started it is no longer named as never started");
+	// It yields on every pass, so the bounded drain hands it the core and takes it back at the deadline - queued again,
+	// parked inside its yield.
+	sched::run_until_idle_until(arch::apic::ticks() + 3);
+	let (runs, last) = thread.run_record();
+	assert!(runs > 0, "a thread the drain ran says a core switched to it");
+	assert!(last >= before, "at a tick of this run: {last}, the test began at {before}");
+	assert_ne!(arch::context::resume_point(thread.kstack_ptr_load()), arch::context::trampoline_address(), "and a thread that ran resumes where it stopped, not at its first instruction");
+
+	STOP.store(true, Ordering::SeqCst);
+	sched::run_until_idle();
+}
