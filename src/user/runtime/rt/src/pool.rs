@@ -26,6 +26,19 @@
 //! last finisher's one report - so the caller, past either, has seen every item. None of this leans
 //! on the kernel's channel locks, which would stop holding the day a channel became lock-free.
 //!
+//! TWO HANDSHAKES ARE A STORE AND THEN A LOAD ON EACH SIDE, and each side has a full fence between the
+//! two (2026-11-12): a worker says it is parked and then looks for mail while the caller posts mail
+//! and then looks whether it is parked; a worker says it is inside and then reads whether its call is
+//! open while the caller closes the call and then reads whether the worker is inside. Each holds only
+//! if at least one side sees the other's store, and a sequentially consistent store followed by a
+//! sequentially consistent load is not enough where it counts: on aarch64 those are `stlr` and `ldar`,
+//! which the architecture keeps in order and the emulator these guests run under does not - two
+//! threads each storing a flag with `stlr` and loading the other's with `ldar` both read zero in 22238
+//! of 1048576 rounds there, and in none with a `dmb ish` between. The parked side also read its mail
+//! RELAXED, which no processor is bound to keep behind the store. A worker that saw an open call the
+//! caller had already closed ran the call's items on a dispatch that was gone; one that slept through
+//! mail cost only its share of the work.
+//!
 //! A CALL WAITS FOR ITS ITEMS AND NOT FOR EVERY WORKER IT WOKE. A worker whose core halted can be
 //! slow to come back - under a hypervisor, far slower than the work it was woken for - and one that
 //! arrives after the last item was claimed has nothing to do. So each worker's slot says which call
@@ -325,8 +338,10 @@ fn next_call(slot: &Slot, orders: u64, message: &mut [u8; MESSAGE], mut linger_u
 			return call;
 		}
 		// PARKED IS SAID BEFORE THE MAIL IS LOOKED AT, and a caller posts before it looks at this: one
-		// of the two sees the other, so no call is posted to a worker that then sleeps through it.
+		// of the two sees the other, so no call is posted to a worker that then sleeps through it. The
+		// fence is what keeps the look behind the saying - see the module's note on the two handshakes.
 		slot.parked.store(true, Ordering::SeqCst);
+		fence(Ordering::SeqCst);
 		if let Some(call) = take(slot) {
 			slot.parked.store(false, Ordering::SeqCst);
 			return call;
@@ -370,8 +385,10 @@ extern "C" fn worker(orders: u64) -> ! {
 		let mut reported = false;
 		// IN BEFORE LOOKING, so a pool that closes the call after this load sees this worker inside and
 		// waits for it, and one that closed it before is seen here as closed - which is also what makes
-		// stale mail harmless: a call that closed before its worker looked is skipped whole.
+		// stale mail harmless: a call that closed before its worker looked is skipped whole. The fence keeps
+		// the look behind the saying - see the module's note on the two handshakes.
 		slot.inside.store(true, Ordering::SeqCst);
+		fence(Ordering::SeqCst);
 		if slot.open.load(Ordering::SeqCst) == call {
 			fence(Ordering::Acquire);
 			// SAFETY: an open call's words are the ones `Pool::for_each` wrote before posting it, whose
@@ -526,6 +543,8 @@ impl Pool {
 		for index in &self.lent[..helpers] {
 			let slot = &SLOTS[*index as usize];
 			slot.mail.store(call, Ordering::SeqCst);
+			// The look kept behind the post - see the module's note on the two handshakes.
+			fence(Ordering::SeqCst);
 			if slot.parked.load(Ordering::SeqCst) {
 				let _ = send_blocking(slot.orders.load(Ordering::Acquire), &[RING], 0);
 			}
@@ -556,6 +575,8 @@ impl Pool {
 			slot.open.store(0, Ordering::SeqCst);
 			let _ = slot.mail.compare_exchange(call, 0, Ordering::SeqCst, Ordering::Relaxed);
 		}
+		// Every close before any look at `inside` - see the module's note on the two handshakes.
+		fence(Ordering::SeqCst);
 		for index in &self.lent[..helpers] {
 			let slot = &SLOTS[*index as usize];
 			let _ = poll(u64::MAX, || (!slot.inside.load(Ordering::SeqCst)).then_some(()));

@@ -315,6 +315,35 @@ def counter_rows(lines):
 	return rows
 
 
+def clock_levels(offsets):
+	"""Offsets: boot-time minus monotonic, one per count, in count order. (split, level before, level after): the
+	one sleep lies between counts `split` and `split + 1`, and its size is the difference of the two levels."""
+	# A LEVEL, NOT A STEP BETWEEN TWO SAMPLES. Compared count to count, one sample read across a preemption is a step
+	# up and a step back down; under a sealed release's load on riscv64 that was 113 ms, and it failed the check
+	# beside a sleep measured to the millisecond (2026-11-07). A preempted read only ever shows boot-time late, so a
+	# level is the lowest offset over its counts: the sleep is the split where the level after it stands highest
+	# above the level before it, the first such split, and its size is the difference of the two levels. Exactly
+	# one: no stretch of LEVEL_COUNTS or more counts on either side holds a level of its own. A count frozen between
+	# its two reads is the same late read, by the whole transaction: its monotonic clock from before the freeze and
+	# its boot-time clock from after the thaw (the hibernation gate's counter, riscv64, 2026-11-12).
+	#
+	# THE FIRST SPLIT WITHIN THE NOISE OF THE BEST, not the best: the two clocks are printed to the millisecond, so a
+	# split later in the run can stand a millisecond higher than the true one only because its suffix missed a
+	# rounding - and taking it put the sleep inside the level after it.
+	if len(offsets) < 2:
+		raise GateError('the counter has no two counts to put a sleep between')
+	lowest_before = list(itertools.accumulate(offsets, min))
+	lowest_after = list(itertools.accumulate(reversed(offsets), min))[::-1]
+	rises = [lowest_after[split + 1] - lowest_before[split] for split in range(len(offsets) - 1)]
+	at = next(split for split, rise in enumerate(rises) if rise >= max(rises) - CLOCK_READ_JITTER_MS)
+	before, after = lowest_before[at], lowest_after[at + 1]
+	held_before = [min(offsets[start:at + 1]) - before for start in range(1, at + 2 - LEVEL_COUNTS)]
+	held_after = [min(offsets[start:]) - after for start in range(at + 2, len(offsets) + 1 - LEVEL_COUNTS)]
+	if any(abs(level) > CLOCK_READ_JITTER_MS for level in held_before + held_after):
+		raise GateError('the boot-time clock left the monotonic one at more than one point')
+	return at, before, after
+
+
 def sleep_clock_gap(rows, entered, resumed, reported_ms, margin_ms=IDLE_MARGIN_MS, frozen=None):
 	"""Rows: (line index, host timestamp, count, mono ms, boot ms); boundaries: (index, stamp, tick);
 	frozen: (flush tick, thaw tick), the window the counter could not sample in."""
@@ -328,29 +357,9 @@ def sleep_clock_gap(rows, entered, resumed, reported_ms, margin_ms=IDLE_MARGIN_M
 	# behind: counts sampled before the freeze arrived after `sleep: resumed`, so "the last line before the entry and
 	# the first after the resume" were two samples from before the sleep, and the ports' check read a 0 ms step
 	# between them in every run while the kernel's clocks were right. So: the counts in their own order, and the one
-	# place where boot-minus-monotonic moved to a new level and held it.
-	#
-	# A LEVEL, NOT A STEP BETWEEN TWO SAMPLES. Compared count to count, one sample read across a preemption is a step
-	# up and a step back down; under a sealed release's load on riscv64 that was 113 ms, and it failed the check
-	# beside a sleep measured to the millisecond (2026-11-07). A preempted read only ever shows boot-time late, so a
-	# level is the lowest offset over its counts: the sleep is the split where the level after it stands highest
-	# above the level before it, the first such split, and its size is the difference of the two levels. Exactly
-	# one: no stretch of LEVEL_COUNTS or more counts on either side holds a level of its own.
-	#
-	# THE FIRST SPLIT WITHIN THE NOISE OF THE BEST, not the best: the two clocks are printed to the millisecond, so a
-	# split later in the run can stand a millisecond higher than the true one only because its suffix missed a
-	# rounding - and taking it put the sleep inside the level after it.
+	# place where boot-minus-monotonic moved to a new level and held it - `clock_levels`.
 	ordered = sorted(rows, key=lambda row: row[2])
-	offsets = [row[4] - row[3] for row in ordered]
-	lowest_before = list(itertools.accumulate(offsets, min))
-	lowest_after = list(itertools.accumulate(reversed(offsets), min))[::-1]
-	rises = [lowest_after[split + 1] - lowest_before[split] for split in range(len(offsets) - 1)]
-	at = next(split for split, rise in enumerate(rises) if rise >= max(rises) - CLOCK_READ_JITTER_MS)
-	before, after = lowest_before[at], lowest_after[at + 1]
-	held_before = [min(offsets[start:at + 1]) - before for start in range(1, at + 2 - LEVEL_COUNTS)]
-	held_after = [min(offsets[start:]) - after for start in range(at + 2, len(offsets) + 1 - LEVEL_COUNTS)]
-	if any(abs(level) > CLOCK_READ_JITTER_MS for level in held_before + held_after):
-		raise GateError('the boot-time clock left the monotonic one at more than one point')
+	at, before, after = clock_levels([row[4] - row[3] for row in ordered])
 	left, right = ordered[at], ordered[at + 1]
 	# WHAT THE WIRE STILL PROVES, which is one direction: a sample that counts the sleep was taken after it, so it
 	# cannot have reached the line before the kernel said it resumed. (A sample from before can arrive any time.)

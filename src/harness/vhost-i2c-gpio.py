@@ -1629,6 +1629,15 @@ class TcpcTest(unittest.TestCase):
             self.assertEqual(rig.partner.response_timeouts == 0, answered, f"stretch {stretch}")
             self.assertEqual(bool(rig.alert() & tcpc_partner.ALERT_RX_HARD_RESET), not answered)
 
+    def test_a_second_partner_is_never_plugged_over_the_first(self):
+        # ONE CABLE: a partner plugged in while another is would be a change no port sees - CC never open - and the sink
+        # reads it as whatever its supply did. The gate unplugs first; asked otherwise, the partner refuses.
+        rig = self.attached()
+        self.assertTrue(rig.partner.command(["attach", "charger20"]).startswith("error"))
+        self.assertEqual((rig.partner.profile, rig.partner.revision, rig.partner.vbus_mv), ("charger31", tcpc_partner.REVISION_3, 5000))
+        self.assertEqual(rig.partner.command(["detach"]), "ok detached")
+        self.assertEqual(rig.partner.command(["attach", "charger20"]), "ok attached charger20")
+
     def test_nothing_is_acknowledged_until_the_sink_receives_and_the_capabilities_are_sent_again(self):
         rig = TcpcRig()
         rig.write(tcpc_partner.COMMAND, tcpc_partner.COMMAND_ENABLE_VBUS_DETECT)

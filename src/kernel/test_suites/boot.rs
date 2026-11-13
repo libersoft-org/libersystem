@@ -985,6 +985,83 @@ fn a_silent_boot_window_lists_what_every_parked_thread_waits_on() {
 	fault::clear_crash_notify();
 }
 
+tagged_test!(a_boot_still_without_a_shell_a_window_later_lists_what_is_parked, [Process], id = "kernel.boot.a_boot_still_without_a_shell_a_window_later_lists_what_is_parked", covers = ["kernel"]);
+fn a_boot_still_without_a_shell_a_window_later_lists_what_is_parked() {
+	// A CHAIN THAT SPOKE AND THEN STOPPED SHORT OF ITS SHELL: the window closes on "up without an attached shell" with
+	// nothing listed, and a whole window later, still without a shell, the boot lists what every parked thread waits
+	// on - once. A shell that attaches before then drops the watch, and a chain that never spoke had its list at the
+	// window and is not watched again. The watch is asked at ticks the test names, so nothing here waits on a clock.
+	use object::KernelObject;
+	extern "C" fn resident_body(_arg: u64) {
+		// Parked on its own process koid until `terminate` wakes it - see the clean-start test.
+		let Some(thread) = sched::current_thread() else { return };
+		let process = thread.process().clone();
+		let koid = process.header().koid();
+		while !process.is_terminated() {
+			sched::block_on(koid, sched::NO_DEADLINE);
+		}
+	}
+	let (crash_tx, crash_rx) = object::channel::Channel::create();
+	fault::set_crash_notify(crash_tx);
+	// A CONSOLE WHOSE OTHER END IS GONE: registered, and not listening, so no round ends on a shell.
+	let (console_far, console_near) = object::channel::Channel::create();
+	console_input::attach(console_far);
+	drop(console_near);
+	assert!(!console_input::shell_listening(), "the stand-in console must not count as a shell");
+	// (whether the chain speaks, whether a shell attaches before the watch is due)
+	for (says, attaches) in [(true, false), (true, true), (false, false)] {
+		let mut resident: Option<alloc::sync::Arc<object::process::Process>> = None;
+		let before = sched::blocked_dumps();
+		let up = supervise(&crash_rx, 3, 8, |_, _| {
+			let process = sched::spawn(resident_body, 0).process().clone();
+			resident = Some(process.clone());
+			let (reports, peer) = object::channel::Channel::create();
+			if says {
+				peer.send(object::channel::Message::new(b"log_service online".to_vec(), alloc::vec::Vec::new())).expect("the stand-in's report should queue");
+			}
+			Some((reports, process))
+		});
+		assert!(up, "a manager still running when the window closes is a system up without an attached shell");
+		let at_window = sched::blocked_dumps() - before;
+		let due = SHELL_WATCH.load(core::sync::atomic::Ordering::Relaxed);
+		if !says {
+			assert_eq!(at_window, 1, "a chain that said nothing has its list at the window");
+			assert_eq!(due, 0, "and is not watched for a second one");
+			assert_eq!(watch_for_a_shell(u64::MAX), None, "no watch, nothing due");
+			assert_eq!(sched::blocked_dumps() - before, 1, "so one list, not two");
+		} else if attaches {
+			assert_eq!(at_window, 0, "a chain that spoke has no list at the window");
+			assert_ne!(due, 0, "a chain that spoke and has no shell is watched");
+			// A SHELL ATTACHES: a console whose other end is held.
+			let (far, near) = object::channel::Channel::create();
+			console_input::attach(far);
+			assert!(console_input::shell_listening(), "a console with its other end held is a shell");
+			assert_eq!(watch_for_a_shell(due), None, "a listening shell drops the watch");
+			assert_eq!(SHELL_WATCH.load(core::sync::atomic::Ordering::Relaxed), 0, "and the watch is gone");
+			assert_eq!(sched::blocked_dumps() - before, 0, "a boot whose shell attached lists nothing");
+			// The stand-in console again, not listening, for the round after.
+			drop(near);
+			let (far, near) = object::channel::Channel::create();
+			console_input::attach(far);
+			drop(near);
+		} else {
+			assert_eq!(at_window, 0, "a chain that spoke has no list at the window");
+			assert_ne!(due, 0, "a chain that spoke and has no shell is watched");
+			assert_eq!(watch_for_a_shell(due - 1), Some(due), "before its tick the watch names it, for the halt");
+			assert_eq!(sched::blocked_dumps() - before, 0, "and lists nothing yet");
+			assert_eq!(watch_for_a_shell(due), None, "at its tick the watch is done");
+			assert_eq!(sched::blocked_dumps() - before, 1, "and has listed what is parked");
+			assert_eq!(watch_for_a_shell(due + 1000), None, "after it, nothing more is due");
+			assert_eq!(sched::blocked_dumps() - before, 1, "so the list comes once");
+		}
+		if let Some(process) = resident.take() {
+			process.terminate();
+		}
+		sched::run_until_idle();
+	}
+	fault::clear_crash_notify();
+}
+
 tagged_test!(embedded_root_still_classifies_block_providers, [Boot, Storage], id = "kernel.boot.embedded_root_still_classifies_block_providers", covers = ["bin.storage_service", "liberfs"]);
 fn embedded_root_still_classifies_block_providers() {
 	let package = pkg::Package::parse(init_package_bytes().expect("init package present")).expect("init package parses");

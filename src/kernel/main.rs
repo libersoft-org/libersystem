@@ -553,6 +553,39 @@ fn serial_console_pump() {
 	firmware::deliver();
 }
 
+// THE TICK AT WHICH A BOOT THAT WENT UP WITHOUT A SHELL SAYS WHAT IS PARKED, if it still has none; zero for no watch.
+//
+// THE FOURTH AARCH64 STALL (2026-11-12) said nothing about itself. Its chain reported up to DeviceService, the next
+// service never printed a line, the window closed without a shell - and because the chain HAD spoken, the window's
+// list of parked threads stayed quiet, as `supervise` keeps it for a console that merely attaches late. The guest then
+// said nothing in the twenty-three minutes its gate still waited. A console that attaches late attaches within moments
+// of the window; a boot that has none a whole window later is a chain that stopped, and the list is what says where.
+// `supervise` sets the watch when it returns up without a shell after a chain that spoke, and clears it when a shell
+// is listening; `console_shell_loop` asks `watch_for_a_shell` on every pass and halts no later than the tick it names.
+static SHELL_WATCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// The watch at `now`: the tick it is due at while it still waits, or None once nothing is left to wait for - a shell is
+// listening (the watch is dropped), what is parked has been listed (once), or there was no watch.
+fn watch_for_a_shell(now: u64) -> Option<u64> {
+	let due = SHELL_WATCH.load(Ordering::Relaxed);
+	if due == 0 {
+		return None;
+	}
+	if console_input::shell_listening() {
+		SHELL_WATCH.store(0, Ordering::Relaxed);
+		return None;
+	}
+	if now < due {
+		return Some(due);
+	}
+	SHELL_WATCH.store(0, Ordering::Relaxed);
+	serial_println!("recovery: still no interactive shell a whole boot window after the window closed - what every parked thread waits on:");
+	// The cores first: a few lines whatever the boot, so the list after them is what a full console ring would cut.
+	sched::dump_cores("no shell a whole window after the boot window");
+	sched::dump_blocked("no shell a whole window after the boot window");
+	None
+}
+
 // Drive the interactive userspace shell. The boot chain has already started it as
 // its last component and the shell has registered a console channel; this pumps
 // serial keystrokes to it a byte at a time, running the cooperative schedule after
@@ -600,6 +633,9 @@ pub(crate) fn console_shell_loop() {
 		if listening && take_serial_byte() == Some(false) {
 			break;
 		}
+		// A BOOT STILL WITHOUT A SHELL A WHOLE WINDOW AFTER ITS WINDOW LISTS WHAT IS PARKED - see `SHELL_WATCH`. Asked
+		// on every pass, and the halt below wakes no later than the tick it names.
+		let watch: Option<u64> = watch_for_a_shell(arch::apic::ticks());
 		// BOUNDED, AND THE BOUND IS WHAT MAKES THE HOUSEKEEPING BELOW REACHABLE (added 2026-09-02).
 		//
 		// This called the unbounded `run_until_idle`, whose body is `while !run_queue.is_empty() {
@@ -644,10 +680,10 @@ pub(crate) fn console_shell_loop() {
 		// runnable threads on the queue, and halting on top of them would park work that is ready to
 		// run until the next interrupt - trading the defect this bound fixes for a worse one. The
 		// loop re-enters instead, which is the same thing it does after any other unfinished pass.
-		// No bound of its own: the boot processor wakes for the earliest deadline, the housekeeping
-		// bound and held input or output, and an interrupt ends it before any of them.
+		// No bound of its own but the shell watch's: the boot processor wakes for the earliest deadline,
+		// the housekeeping bound and held input or output, and an interrupt ends it before any of them.
 		if settled {
-			crate::idle::halt(None, sched::runnable);
+			crate::idle::halt(watch, sched::runnable);
 		}
 	}
 }
@@ -1191,6 +1227,8 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 			// This is the measurement, in the log, on every boot: a budget being approached is
 			// visible before it is exceeded.
 			serial_println!("recovery: the chain settled in {} of {} tick(s) of this target's boot window", arch::apic::ticks().saturating_sub(started), window_ticks);
+			// A shell is listening: there is nothing left to watch for.
+			SHELL_WATCH.store(0, Ordering::Relaxed);
 			return true;
 		}
 		if gone {
@@ -1212,6 +1250,8 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		// and only here: no other boot changes, and the next one that stops this way says where.
 		if !heard {
 			serial_println!("recovery: and the chain reported nothing in the whole window - what every parked thread waits on:");
+			// The cores first - see `watch_for_a_shell`.
+			sched::dump_cores("the boot chain was silent for its whole window");
 			sched::dump_blocked("the boot chain was silent for its whole window");
 		}
 		// A LIVE CONTROL PLANE IS NOT A FAILED BOOT, and treating it as one reboots a working
@@ -1238,6 +1278,9 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		// handshake whose ninth reader does not exist.
 		if !process.is_terminated() && !crash_seen(crash_rx, koid) {
 			serial_println!("recovery: SystemManager (koid {}) is running, so the system is up without an attached shell", koid);
+			// AND WATCHED FOR ONE WHOLE WINDOW MORE, if the chain had spoken - see `watch_for_a_shell`. A chain
+			// that said nothing has had its list above.
+			SHELL_WATCH.store(if heard { deadline.saturating_add(window_ticks) } else { 0 }, Ordering::Relaxed);
 			return true;
 		}
 		serial_println!("recovery: and SystemManager is gone with it (attempt {} of {})", attempt + 1, max_restarts + 1);

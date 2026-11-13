@@ -1187,15 +1187,30 @@ pub fn dump_blocked(reason: &str) {
 	BLOCKED_DUMPS.fetch_add(1, Ordering::Relaxed);
 	crate::serial_println!("sched: blocked threads ({reason}):");
 	let mut total = 0usize;
+	// ALLOC-OK: a diagnostic - a test, a debug path, a panic, or a boot that never reached its shell.
+	let mut waits: Vec<(u64, u64, u64, ProcessLabel, ThreadState)> = Vec::new();
 	for bucket in WAIT_BUCKETS.iter() {
 		// Copied out under the lock, printed after it: a serial write with a wake-path lock held
 		// would be a stall every core could see.
-		// ALLOC-OK: a diagnostic - a test, a debug path, a panic, or a boot whose chain never spoke.
+		// ALLOC-OK: a diagnostic - a test, a debug path, a panic, or a boot that never reached its shell.
 		let entries: Vec<(u64, u64, u64, ProcessLabel, ThreadState)> = bucket.lock().iter().map(|w| (w.thread.header().koid(), w.koid, w.thread.process().header().koid(), ProcessLabel::of(&w.thread), w.thread.state())).collect();
-		for (thread, waits_on, process, label, state) in entries {
-			crate::serial_println!("sched:   thread {thread} of process {process} ({}) waits on koid {waits_on} ({state:?})", label.as_str());
-			total += 1;
+		// ALLOC-OK: as above, and outside the bucket's lock.
+		waits.extend(entries);
+	}
+	// ONE LINE A THREAD, every koid it waits on in it (2026-11-12). A line a koid was 210 lines on an x86_64 boot
+	// stopped short of its shell - one thread alone waits on some seventy - and once a driver holds the console's UART
+	// the kernel's output reaches the wire through a 16 KiB ring the driver empties: printed in one go, the list
+	// overran it, and the end of the list and everything after it was dropped. A thread a line is a third of that.
+	waits.sort_unstable_by_key(|wait| wait.0);
+	for group in waits.chunk_by(|a, b| a.0 == b.0) {
+		let (thread, _, process, label, state) = &group[0];
+		// ALLOC-OK: as above.
+		let mut koids = alloc::string::String::new();
+		for (at, wait) in group.iter().enumerate() {
+			let _ = core::fmt::Write::write_fmt(&mut koids, format_args!("{}{}", if at == 0 { "" } else { ", " }, wait.1));
 		}
+		crate::serial_println!("sched:   thread {thread} of process {process} ({}) waits on {} {koids} ({state:?})", label.as_str(), if group.len() == 1 { "koid" } else { "koids" });
+		total += 1;
 	}
 	// The timed list is the other place a thread can be parked, and a thread in BOTH is waiting for
 	// whichever comes first - so it is named twice on purpose rather than deduplicated into a
@@ -1208,6 +1223,59 @@ pub fn dump_blocked(reason: &str) {
 	}
 	if total == 0 {
 		crate::serial_println!("sched:   none");
+	}
+}
+
+// WHAT EVERY CORE IS DOING, beside what every parked thread waits on (2026-11-12): the thread each core runs and the
+// threads queued behind it. A thread made runnable on a core that never ran it is in no wait bucket and on no timed
+// list, so `dump_blocked` cannot name it - and it is the thread a lost wake leaves behind.
+//
+// NOTHING IS ALLOCATED UNDER A CORE'S SCHEDULER LOCK - `RunQueue` says why that lock may not ask the heap for
+// anything - so the queue is copied into a fixed table and its length says how many did not fit; the walk holds
+// clones of threads the queue itself keeps alive, so none is freed under the lock either. And the lock is TRIED, a
+// bounded number of times: a core that holds its own for good is itself the answer, and the dump says so rather than
+// joining it.
+pub fn dump_cores(reason: &str) {
+	const SHOWN: usize = 8;
+	crate::serial_println!("sched: cores ({reason}):");
+	for cpu in 0..crate::smp::cpu_count() {
+		let slot = cpu_sched(cpu);
+		let mut held = None;
+		for _ in 0..100_000 {
+			held = slot.inner.try_lock();
+			if held.is_some() {
+				break;
+			}
+			core::hint::spin_loop();
+		}
+		let Some(inner) = held else {
+			crate::serial_println!("sched:   cpu {cpu}: its scheduler lock stayed held - nothing read");
+			continue;
+		};
+		let running = inner.current.as_ref().map(|thread| (thread.header().koid(), thread.process().header().koid(), ProcessLabel::of(thread)));
+		let length = inner.run_queue.len;
+		let mut queued: [Option<(u64, u64, ProcessLabel)>; SHOWN] = [const { None }; SHOWN];
+		let mut next = inner.run_queue.head.clone();
+		// Bounded by the queue's own count, so a link that went wrong cannot keep this core here.
+		for entry in 0..length {
+			let Some(thread) = next else { break };
+			if let Some(place) = queued.get_mut(entry) {
+				*place = Some((thread.header().koid(), thread.process().header().koid(), ProcessLabel::of(&thread)));
+			}
+			next = thread.run_link().clone();
+		}
+		drop(next);
+		drop(inner);
+		match running {
+			Some((thread, process, label)) => crate::serial_println!("sched:   cpu {cpu} runs thread {thread} of process {process} ({}); {length} queued", label.as_str()),
+			None => crate::serial_println!("sched:   cpu {cpu} runs no thread; {length} queued"),
+		}
+		for (thread, process, label) in queued.iter().flatten() {
+			crate::serial_println!("sched:     queued: thread {thread} of process {process} ({})", label.as_str());
+		}
+		if length > SHOWN {
+			crate::serial_println!("sched:     and {} more", length - SHOWN);
+		}
 	}
 }
 

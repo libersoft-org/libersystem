@@ -231,9 +231,9 @@ class Guest:
 		shutil.rmtree(self.state, ignore_errors=True)
 
 
-# THE COUNTER ACROSS THE TIME OFF, read from its file once it has ended: one unbroken run of values from 1, whose widest
-# step of the boot-time clock is the time off, at least `off_ms`, and across which the boot-time clock moved by EXACTLY
-# the sleep the kernel reported more than the monotonic clock did - to the RTC's second. Not a bound on the monotonic
+# THE COUNTER ACROSS THE TIME OFF, read from its file once it has ended: one unbroken run of values from 1, with one
+# place where the boot-time clock left the monotonic one - the time off, at least `off_ms` - and left it by EXACTLY
+# the sleep the kernel reported, to the RTC's second (`across_the_time_off`). Not a bound on the monotonic
 # step itself: under emulation the transaction around the time off takes it tens of seconds, and the counter's own
 # output, waiting on the volume behind its redirection, can hold the counter longer than that before the freeze.
 COUNT = re.compile(r'sleepcheck: count (\d+) mono-ms (\d+) boot-ms (\d+)')
@@ -257,13 +257,59 @@ def counter_goes_on(guest, name, off_ms, slept_ms):
 	rows = counter_rows(guest, name)
 	if not rows or [row[0] for row in rows] != list(range(1, len(rows) + 1)):
 		raise GateError('the counter did not run one unbroken sequence from 1 - it skipped, repeated or started again')
-	gap = max(range(1, len(rows)), key=lambda at: rows[at][2] - rows[at - 1][2])
-	mono, boot = rows[gap][1] - rows[gap - 1][1], rows[gap][2] - rows[gap - 1][2]
+	return across_the_time_off(rows, off_ms, slept_ms)
+
+
+def across_the_time_off(rows, off_ms, slept_ms):
+	"""Rows: (count, mono ms, boot ms), one unbroken run in count order. (count before, count after, mono, boot)."""
+	# THE LEVELS OF BOOT-TIME MINUS MONOTONIC, NOT THE WIDEST STEP. `sleepcheck` reads the two clocks one after the
+	# other, and the freeze can fall between the reads: in a sealed release run on riscv64 (2026-11-12) count 501 read
+	# its monotonic clock before the freeze and its boot-time clock after the thaw, twenty seconds of the transaction
+	# later. Its step from count 500 was the widest, and compared to the monotonic clock's 128 ms it was the sleep and
+	# those twenty seconds - while every count from 502 on stood exactly the reported sleep above every count before
+	# 501. The tickless gate's reading: the sleep is where the lowest offset moved to a new level and held it.
+	at, before, after = tickless.clock_levels([boot - mono for _, mono, boot in rows])
+	left, right = rows[at], rows[at + 1]
+	mono = right[1] - left[1]
+	boot = mono + after - before
 	if boot < off_ms:
-		raise GateError(f'the boot-time clock moved {boot} ms at its widest step, under the {off_ms} ms off')
-	if abs((boot - mono) - slept_ms) > 1000:
-		raise GateError(f'across the time off the boot-time clock moved {boot} ms and the monotonic clock {mono} ms - not {slept_ms} ms apart, the sleep the kernel reported')
-	return rows[gap - 1][0], rows[gap][0], mono, boot
+		raise GateError(f'the boot-time clock moved {boot} ms across the time off (counts {left[0]} and {right[0]}), under the {off_ms} ms off')
+	if abs((after - before) - slept_ms) > 1000:
+		raise GateError(f'across the time off (counts {left[0]} and {right[0]}) the boot-time clock left the monotonic one by {after - before} ms - not by {slept_ms} ms, the sleep the kernel reported')
+	return left[0], right[0], mono, boot
+
+
+def self_test():
+	slept = 998000
+	quiet = [(count, 100 * count, 100 * count) for count in range(1, 11)]
+	after = [(count, 100 * count + 20000, 100 * count + 20000 + slept) for count in range(11, 21)]
+	# THE PLAIN CASE: every count's two clocks read together.
+	if across_the_time_off(quiet + after, 400000, slept)[:2] != (10, 11):
+		raise GateError('the clock oracle did not find the pair either side of the time off')
+	# THE SEALED RELEASE'S CASE (riscv64, 2026-11-12): the last count before the time off read its monotonic clock
+	# before the freeze and its boot-time clock after the thaw, twenty seconds of the transaction later.
+	# The freeze is inside count 10, so the pair is 9 and 10, and the sleep between them is its size alone.
+	torn = quiet[:-1] + [(10, 1000, 1000 + 20050 + slept)] + after
+	before, after_count, mono, boot = across_the_time_off(torn, 400000, slept)
+	if (before, after_count) != (9, 10) or boot - mono != slept:
+		raise GateError('the clock oracle took a count read across the freeze for part of the sleep')
+	# AND A READ PREEMPTED AWAY FROM THE SLEEP: boot-time 600 ms late on one count, with no sleep at all.
+	preempted = quiet[:4] + [(5, 500, 1100)] + quiet[5:] + after
+	if across_the_time_off(preempted, 400000, slept)[:2] != (10, 11):
+		raise GateError('the clock oracle took a preempted read for part of the sleep')
+	cases = [
+		('a step of the wrong size', quiet + [(count, mono, boot + 2000) for count, mono, boot in after], 400000),
+		('a boot-time step under the time off', quiet + after, slept + 100000),
+		# A SECOND LEVEL, each within the RTC's second of the sleep - so the one-level rule alone refuses them.
+		('a level held before the time off', quiet[:6] + [(count, mono, boot + 700) for count, mono, boot in quiet[6:]] + after, 400000),
+		('a level held after the time off', quiet + after[:5] + [(count, mono, boot + 700) for count, mono, boot in after[5:]], 400000),
+	]
+	for name, rows, off_ms in cases:
+		try:
+			across_the_time_off(rows, off_ms, slept)
+		except GateError:
+			continue
+		raise GateError(f'the clock oracle accepted {name}')
 
 
 # A HIBERNATION ASKED: the image written - its key sealed through the TPM, or in the clear with the warning - and the
@@ -382,6 +428,15 @@ def run(target, work):
 
 def main():
 	args = sys.argv[1:]
+	# THE ORACLE FIRST, on the host: a gate whose reading of the counter is wrong fails before it boots anything.
+	try:
+		self_test()
+	except GateError as error:
+		print(f'check-hibernate-ports: FAIL - the self-test: {error}', file=sys.stderr, flush=True)
+		return 1
+	if args == ['--self-test']:
+		note('self-test PASS')
+		return 0
 	skip_build = '--no-build' in args
 	targets = [a for a in args if not a.startswith('--')] or list(TARGETS)
 	for target in targets:

@@ -1496,7 +1496,13 @@ qemu_attach_virt_interactive() {
 		-chardev "file,id=vcon,path=$vcon_out"
 	)
 	qemu_append_audio arr
-	arr+=(-device "virtio-sound-pci,audiodev=snd0")
+	# THE SOUND CARD TAKES THE SAME OPTIONS AS THE DEVICES ABOVE (2026-11-12). It was added bare, so behind a
+	# port's IOMMU it offered no `iommu_platform` and QEMU did its DMA on physical addresses - while the kernel had
+	# put it in a translated domain and its driver programmed the IOVAs it was given. QEMU read the available ring
+	# from whatever guest page sat at the IOVA's number, found a head past the ring ("Guest says index 65026 is
+	# available") and stopped serving the device on every aarch64 boot; a smaller number there would have had it
+	# write the device's answers into that page.
+	arr+=(-device "virtio-sound-pci,audiodev=snd0${legacy:+,$legacy}")
 }
 
 # PER-RUN SCRATCH, SWEPT BY OWNERSHIP.

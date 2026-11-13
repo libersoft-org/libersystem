@@ -910,6 +910,12 @@ class Source:
     def command(self, words):
         what = words[0]
         if what == 'attach':
+            # ONE CABLE. `attach` over an attached partner swapped the source in one step - CC never open, VBUS
+            # dropped and raised - which no port meets: the sink read it as its supply leaving the alarm window, a
+            # Hard Reset the partner "stayed attached" through, and never said the new source's revision (the
+            # `charger20` case after `back-mid-service`, riscv64, 2026-11-12). Unplugged first, or refused.
+            if self.cc_attached:
+                return f'error a partner is attached as {self.profile} - detach it first'
             self.attach(words[1], flipped=len(words) > 2 and words[2] == 'flipped')
             return f'ok attached {words[1]}'
         if what == 'detach':

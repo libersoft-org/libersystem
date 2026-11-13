@@ -476,6 +476,11 @@ await_line ": detached" "the sink must see its partner go" "$detached_before" 20
 grep -a -q -F "plugged back in as charger31 the moment the sink read CC" "$fixture/tcpc.log" || fail "$case_name: the partner was not plugged back in as the sink read CC - the case did not happen"
 contracted 15000
 no_violations
+# UNPLUGGED AT ITS END, as every case ends: the next case plugs its own charger into a free port. This one was left
+# plugged in, and the `charger20` case's attach swapped the source under a 15 V contract in one step - which the
+# sink read as its supply leaving the alarm window, so it said nothing of the new source's revision (riscv64,
+# 2026-11-12). The partner now refuses an attach over an attached partner.
+detach
 echo "typec-tcpci: $case_name: unplugged and back while the sink serviced its alert - seen, and the contract made anew"
 
 # ------------------------------------------------------------------ the other partners
